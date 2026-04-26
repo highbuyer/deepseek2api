@@ -1,0 +1,321 @@
+From 13bcc9502c0343232f5fda64524b9fe1d2c04320 Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Sun, 26 Apr 2026 15:06:10 +0000
+Subject: [PATCH] feat: add debug logging mode for tool call troubleshooting
+
+- Add DEBUG env variable support (DEBUG=1 or DEBUG=true to enable)
+- Add src/utils/log.js: structured logger with debug/info/warn/error levels
+- Add logging to openai-bridge: model selection, prompt injection, tool call parsing results
+- Add logging to deepseek-proxy: upstream requests, token refresh, PoW challenge
+- Add logging to openai-tool-parser: XML match results, parse failure details
+- Add logging to openai-routes: request entry, auth, error handling
+- Update .env.example with DEBUG option
+
+When DEBUG is off (default), only info/warn/error are shown.
+When DEBUG is on, full request flow is traced for diagnosing tool call failures.
+---
+ .env.example                       |  1 +
+ src/config.js                      |  4 ++++
+ src/routes/openai-routes.js        |  9 +++++++++
+ src/services/deepseek-proxy.js     | 12 ++++++++++++
+ src/services/openai-bridge.js      | 17 +++++++++++++++++
+ src/services/openai-tool-parser.js | 12 ++++++++++--
+ src/utils/log.js                   | 24 ++++++++++++++++++++++++
+ 7 files changed, 77 insertions(+), 2 deletions(-)
+ create mode 100644 src/utils/log.js
+
+diff --git a/.env.example b/.env.example
+index 5cab5b4..a48167b 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1,3 +1,4 @@
+ PORT=3000
+ APP_ADMIN_USERNAME=
+ APP_ADMIN_PASSWORD=
++DEBUG=false
+diff --git a/src/config.js b/src/config.js
+index b093b0f..f0595f8 100644
+--- a/src/config.js
++++ b/src/config.js
+@@ -15,8 +15,12 @@ mkdirSync(dataDirectory, { recursive: true });
+ const adminUsername = process.env.APP_ADMIN_USERNAME ?? "";
+ const adminPassword = process.env.APP_ADMIN_PASSWORD ?? "";
+ 
++const debugEnv = process.env.DEBUG ?? "";
++const debugEnabled = debugEnv === "1" || debugEnv === "true" || debugEnv.includes("deepseek2api");
++
+ export const config = Object.freeze({
+   port: Number(process.env.PORT ?? 3000),
++  debug: debugEnabled,
+   dataFile: join(dataDirectory, "app.json"),
+   sessionCookieName: "ds_reverse_session",
+   sessionTtlMs: 1000 * 60 * 60 * 24 * 7,
+diff --git a/src/routes/openai-routes.js b/src/routes/openai-routes.js
+index 8a6f696..50b336c 100644
+--- a/src/routes/openai-routes.js
++++ b/src/routes/openai-routes.js
+@@ -10,6 +10,7 @@ import {
+ } from "../services/openai-responses.js";
+ import { withOwnerRequestLimit } from "../services/request-limit-service.js";
+ import { parseJsonBody, readRequestBody, sendError, sendJson } from "../utils/http.js";
++import { log } from "../utils/log.js";
+ 
+ function getBearerToken(request) {
+   const value = request.headers.authorization ?? "";
+@@ -22,16 +23,19 @@ function resolveLimitStatus(error) {
+ 
+ function handleOpenAiError(response, error) {
+   if (error.code === "USER_DISABLED" || error.code === "REQUEST_LIMIT") {
++    log.warn("route", `Request rejected: code=${error.code} msg=${error.message}`);
+     sendError(response, resolveLimitStatus(error), error.message);
+     return true;
+   }
+ 
+   if (error instanceof SyntaxError) {
++    log.warn("route", "Invalid JSON body");
+     sendError(response, 400, "Invalid JSON body");
+     return true;
+   }
+ 
+   if (error.statusCode) {
++    log.warn("route", `Error ${error.statusCode}: ${error.message}`);
+     sendError(response, error.statusCode, error.message);
+     return true;
+   }
+@@ -53,11 +57,13 @@ async function handleChatCompletionsRequest(request, response, apiKeyRecord) {
+     const body = parseJsonBody(await readRequestBody(request)) ?? {};
+     const account = takeRoundRobinAccount(apiKeyRecord);
+     if (!account) {
++      log.warn("route", "No available account for chat completions");
+       sendError(response, 404, "Account not found");
+       return;
+     }
+ 
+     const deleteAfterFinish = isIncognitoEnabledForOwner(apiKeyRecord.ownerId);
++    log.info("route", `[chat] stream=${!!body.stream} model=${body.model || "default"} toolCalls=${apiKeyRecord.toolCallsEnabled} accountId=${account.id}`);
+     if (body.stream) {
+       await streamOpenAiResponse({
+         response,
+@@ -84,11 +90,13 @@ async function handleResponsesCreateRequest(request, response, apiKeyRecord) {
+     const body = parseJsonBody(await readRequestBody(request)) ?? {};
+     const account = takeRoundRobinAccount(apiKeyRecord);
+     if (!account) {
++      log.warn("route", "No available account for responses");
+       sendError(response, 404, "Account not found");
+       return;
+     }
+ 
+     const deleteAfterFinish = isIncognitoEnabledForOwner(apiKeyRecord.ownerId);
++    log.info("route", `[responses] stream=${!!body.stream} model=${body.model || "default"} toolCalls=${apiKeyRecord.toolCallsEnabled} accountId=${account.id}`);
+     if (body.stream) {
+       await streamResponsesResponse({
+         response,
+@@ -130,6 +138,7 @@ export async function handleOpenAiRequest(request, response, url) {
+   const apiKeyRecord = apiKey ? getApiKeyRecord(apiKey) : null;
+ 
+   if (!apiKeyRecord) {
++    log.warn("route", `Unauthorized request to ${url.pathname}`);
+     sendError(response, 401, "Invalid API key");
+     return true;
+   }
+diff --git a/src/services/deepseek-proxy.js b/src/services/deepseek-proxy.js
+index 3b3c02d..43f9f4b 100644
+--- a/src/services/deepseek-proxy.js
++++ b/src/services/deepseek-proxy.js
+@@ -1,6 +1,7 @@
+ import { config } from "../config.js";
+ import { solvePowChallenge } from "./pow-solver.js";
+ import { createBaseHeaders, refreshAccountToken } from "./deepseek-auth.js";
++import { log } from "../utils/log.js";
+ 
+ function buildTargetUrl(path, query) {
+   const url = new URL(path, config.deepseekBaseUrl);
+@@ -42,8 +43,10 @@ async function createPowHeader(account, path) {
+ 
+ async function performRequest({ account, method, path, query, body, headers }) {
+   const finalHeaders = createBaseHeaders(account.token, headers);
++  log.debug("proxy", `${method} ${path} accountId=${account.id}`);
+ 
+   if (config.powProtectedPaths.has(path)) {
++    log.debug("proxy", `Solving PoW challenge for ${path}`);
+     finalHeaders["x-ds-pow-response"] = await createPowHeader(account, path);
+   }
+ 
+@@ -66,6 +69,9 @@ async function maybeRefreshAccount(response, account) {
+   const shouldRefresh = payload?.code === 40002 || payload?.code === 40003;
+ 
+   if (!shouldRefresh) {
++    if (response.status !== 200) {
++      log.warn("proxy", `Upstream ${response.status}: ${payloadText.slice(0, 200)}`);
++    }
+     return {
+       refreshedAccount: account,
+       response: new Response(buffer, {
+@@ -75,19 +81,23 @@ async function maybeRefreshAccount(response, account) {
+     };
+   }
+ 
++  log.info("proxy", `Token expired (code=${payload.code}), refreshing for accountId=${account.id}`);
+   const refreshedAccount = await refreshAccountToken(account);
+   return { refreshedAccount, response: null };
+ }
+ 
+ export async function proxyDeepseekRequest(options) {
+   const { account } = options;
++  log.debug("proxy", `Starting request: ${options.method} ${options.path}`);
+   const initialResponse = await performRequest(options);
+   const firstPass = await maybeRefreshAccount(initialResponse, account);
+ 
+   if (firstPass.response) {
++    log.debug("proxy", `First pass ok: ${options.method} ${options.path} status=${firstPass.response.status}`);
+     return firstPass;
+   }
+ 
++  log.info("proxy", `Retrying after token refresh: ${options.method} ${options.path}`);
+   const retriedResponse = await performRequest({
+     ...options,
+     account: firstPass.refreshedAccount
+@@ -95,8 +105,10 @@ export async function proxyDeepseekRequest(options) {
+ 
+   const secondPass = await maybeRefreshAccount(retriedResponse, firstPass.refreshedAccount);
+   if (!secondPass.response) {
++    log.error("proxy", `Token refresh failed for accountId=${account.id}`);
+     throw new Error("DeepSeek token refresh failed");
+   }
+ 
++  log.debug("proxy", `Retry ok: ${options.method} ${options.path} status=${secondPass.response.status}`);
+   return secondPass;
+ }
+diff --git a/src/services/openai-bridge.js b/src/services/openai-bridge.js
+index f85ac00..704d430 100644
+--- a/src/services/openai-bridge.js
++++ b/src/services/openai-bridge.js
+@@ -6,6 +6,7 @@ import { createToolSieve, extractToolAwareOutput } from "./openai-tool-sieve.js"
+ import { buildOpenAiPrompt } from "./openai-tool-prompt.js";
+ import { ensureToolChoiceSatisfied, hasChatToolingRequest } from "./openai-tool-policy.js";
+ import { createOpenAiError } from "./openai-error.js";
++import { log } from "../utils/log.js";
+ 
+ function createCompletionId() {
+   return `chatcmpl_${randomUUID()}`;
+@@ -27,16 +28,22 @@ function resolveCompletionRequest(body, toolCallsEnabled) {
+   assertNoLegacySearchOptions(body);
+ 
+   if (!toolCallsEnabled && hasChatToolingRequest(body)) {
++    log.warn("bridge", "Tool calls rejected: toolCallsEnabled=false but request has tools/tool_choice/tool history");
+     throw createOpenAiError(400, "Tool calls are disabled for this API key");
+   }
+ 
+   const model = resolveOpenAiModel(body?.model);
++  const toolNames = (body?.tools ?? []).map(t => t?.function?.name ?? t?.name).filter(Boolean);
++  log.debug("bridge", `Model: ${model.id}, toolCallsEnabled: ${toolCallsEnabled}, tools: [${toolNames.join(",")}], tool_choice: ${JSON.stringify(body?.tool_choice)}`);
++
+   const promptRequest = buildOpenAiPrompt({
+     messages: body?.messages ?? [],
+     toolChoice: toolCallsEnabled ? body?.tool_choice : undefined,
+     tools: toolCallsEnabled ? body?.tools ?? [] : []
+   });
+ 
++  log.debug("bridge", `Prompt length: ${promptRequest.prompt.length} chars, toolChoicePolicy.mode: ${promptRequest.toolChoicePolicy.mode}, allowedToolNames: [${promptRequest.toolNames.join(",")}]`);
++
+   return {
+     model,
+     prompt: promptRequest.prompt,
+@@ -50,6 +57,13 @@ function buildChatCompletionPayload(completionId, requestOptions, content) {
+     ? extractToolAwareOutput(content, requestOptions.toolNames)
+     : { content, toolCalls: [] };
+ 
++  log.debug("bridge", `Content length: ${content.length}, parsed toolCalls: ${parsed.toolCalls.length}, parsed content length: ${parsed.content.length}`);
++  if (parsed.toolCalls.length) {
++    log.debug("bridge", `Parsed tool calls:`, parsed.toolCalls.map(c => ({ name: c.name, argsLen: c.argumentsText.length })));
++  } else if (requestOptions.toolNames.length) {
++    log.warn("bridge", `No tool calls parsed from model output (expected tools: [${requestOptions.toolNames.join(",")}]). Raw content (first 500 chars): ${content.slice(0, 500)}`);
++  }
++
+   ensureToolChoiceSatisfied(requestOptions.toolChoicePolicy, parsed.toolCalls);
+ 
+   if (parsed.toolCalls.length) {
+@@ -115,11 +129,13 @@ export async function collectOpenAiResponse({
+   toolCallsEnabled = false
+ }) {
+   const requestOptions = resolveCompletionRequest(body, toolCallsEnabled);
++  log.info("bridge", `[collect] model=${requestOptions.model.id}, stream=false, accountId=${account.id}, deleteAfter=${deleteAfterFinish}`);
+   const { content } = await collectCompletionContent({
+     account,
+     deleteAfterFinish,
+     requestOptions
+   });
++  log.debug("bridge", `[collect] Raw content length: ${content.length}`);
+ 
+   return buildChatCompletionPayload(createCompletionId(), requestOptions, content);
+ }
+@@ -134,6 +150,7 @@ export async function streamOpenAiResponse(options) {
+   } = options;
+   const completionId = createCompletionId();
+   const requestOptions = resolveCompletionRequest(body, toolCallsEnabled);
++  log.info("bridge", `[stream] model=${requestOptions.model.id}, stream=true, accountId=${account.id}, deleteAfter=${deleteAfterFinish}, toolNames=[${requestOptions.toolNames.join(",")}]`);
+   const toolSieve = requestOptions.toolNames.length
+     ? createToolSieve(requestOptions.toolNames)
+     : null;
+diff --git a/src/services/openai-tool-parser.js b/src/services/openai-tool-parser.js
+index 26017bb..0c405bf 100644
+--- a/src/services/openai-tool-parser.js
++++ b/src/services/openai-tool-parser.js
+@@ -1,4 +1,5 @@
+ import { randomUUID } from "node:crypto";
++import { log } from "../utils/log.js";
+ 
+ const TOOL_BLOCK_PATTERN = /<(?:[a-z0-9_:-]+:)?(tool_call|function_call|invoke)\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1>/gi;
+ const TOOL_SELFCLOSE_PATTERN = /<(?:[a-z0-9_:-]+:)?invoke\b([^>]*)\/>/gi;
+@@ -197,9 +198,16 @@ export function parseToolCallsFromText(text, allowedToolNames = []) {
+     return [];
+   }
+ 
+-  if (!stripFencedCodeBlocks(source).match(/<(tool_calls|tool_call|function_call|invoke|tool_use)\b/i)) {
++  const stripped = stripFencedCodeBlocks(source);
++  if (!stripped.match(/<(tool_calls|tool_call|function_call|invoke|tool_use)\b/i)) {
++    log.debug("parser", `No tool XML tags found in output (length=${source.length})`);
+     return [];
+   }
+ 
+-  return filterAllowedToolCalls(parseMarkupToolCalls(source), allowedToolNames);
++  const calls = filterAllowedToolCalls(parseMarkupToolCalls(source), allowedToolNames);
++  log.debug("parser", `Parsed ${calls.length} tool call(s) from text (allowed: [${allowedToolNames.join(",")}])`);
++  if (!calls.length) {
++    log.warn("parser", `XML tool tags found but no valid calls parsed. Stripped content (first 500): ${stripped.slice(0, 500)}`);
++  }
++  return calls;
+ }
+diff --git a/src/utils/log.js b/src/utils/log.js
+new file mode 100644
+index 0000000..8f2cc24
+--- /dev/null
++++ b/src/utils/log.js
+@@ -0,0 +1,24 @@
++import { config } from "../config.js";
++
++const LEVELS = Object.freeze({ debug: 0, info: 1, warn: 2, error: 3 });
++
++function timestamp() {
++  return new Date().toISOString();
++}
++
++function emit(level, tag, ...args) {
++  if (!config.debug && level === "debug") {
++    return;
++  }
++
++  const prefix = `[${timestamp()}] [${level.toUpperCase()}] [${tag}]`;
++  const logger = level === "error" ? console.error : level === "warn" ? console.warn : console.log;
++  logger(prefix, ...args);
++}
++
++export const log = Object.freeze({
++  debug: (tag, ...args) => emit("debug", tag, ...args),
++  info: (tag, ...args) => emit("info", tag, ...args),
++  warn: (tag, ...args) => emit("warn", tag, ...args),
++  error: (tag, ...args) => emit("error", tag, ...args)
++});
+-- 
+2.47.3
+
