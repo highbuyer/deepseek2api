@@ -1,8 +1,9 @@
 import { createDeepseekDeltaDecoder, createSseParser } from "../utils/deepseek-sse.js";
 import { createChatSession, deleteChatSession } from "./chat-session-service.js";
 import { proxyDeepseekRequest } from "./deepseek-proxy.js";
+import { log } from "../utils/log.js";
 
-const THINK_OPEN_TAG = "<think>";
+const THINK_OPEN_TAG = "VSION>";
 const THINK_CLOSE_TAG = "</think>";
 
 function startCompletion({ account, requestOptions, sessionId }) {
@@ -61,13 +62,16 @@ function createThinkingTagger() {
 
 async function consumeTaggedStream(stream, onText) {
   if (!stream) {
+    log.warn("runner", "No stream body received from upstream");
     return;
   }
 
   const decoder = new TextDecoder();
   const deltaDecoder = createDeepseekDeltaDecoder();
   const tagger = createThinkingTagger();
-  const parser = createSseParser(({ data }) => {
+  let chunkCount = 0;
+  const parser = createSseParser(({ data, event }) => {
+    chunkCount++;
     const text = tagger.push(deltaDecoder.consume(data));
     if (text) {
       onText(text);
@@ -83,6 +87,8 @@ async function consumeTaggedStream(stream, onText) {
   if (suffix) {
     onText(suffix);
   }
+
+  log.debug("runner", `Stream consumed: ${chunkCount} SSE events`);
 }
 
 async function withCompletionSession({ account, deleteAfterFinish, onComplete }) {
@@ -109,6 +115,10 @@ export async function collectCompletionContent({ account, deleteAfterFinish = fa
         content += text;
       });
 
+      if (!content.length) {
+        log.warn("runner", `Empty response from DeepSeek (model=${requestOptions.model.id}, prompt=${requestOptions.prompt.length} chars)`);
+      }
+
       return { content };
     }
   });
@@ -120,7 +130,15 @@ export async function streamCompletionContent({ account, deleteAfterFinish = fal
     deleteAfterFinish,
     onComplete: async (sessionId) => {
       const { response } = await startCompletion({ account, requestOptions, sessionId });
-      await consumeTaggedStream(response.body, onText);
+      let hasContent = false;
+      await consumeTaggedStream(response.body, (text) => {
+        hasContent = true;
+        onText(text);
+      });
+
+      if (!hasContent) {
+        log.warn("runner", `Empty stream from DeepSeek (model=${requestOptions.model.id}, prompt=${requestOptions.prompt.length} chars)`);
+      }
     }
   });
 }

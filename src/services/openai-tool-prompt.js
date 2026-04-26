@@ -1,5 +1,7 @@
 import { buildPromptFromMessages } from "../utils/prompt.js";
 import { getToolFunction, getToolName, resolveToolChoicePolicy } from "./openai-tool-policy.js";
+import { config } from "../config.js";
+import { log } from "../utils/log.js";
 
 function toStringSafe(value) {
   if (typeof value === "string") {
@@ -146,10 +148,35 @@ function formatToolSchema(tool) {
     return "";
   }
 
+  const fullDesc = toStringSafe(definition?.description).trim() || "No description available";
+  const truncatedDesc = fullDesc.length > config.maxToolDescChars
+    ? fullDesc.slice(0, config.maxToolDescChars) + "..."
+    : fullDesc;
+
+  const params = definition?.parameters;
+  let paramSummary = "";
+  if (params && typeof params === "object") {
+    const required = Array.isArray(params.required) ? params.required : [];
+    const props = params.properties ?? {};
+    const propNames = Object.keys(props);
+    if (propNames.length <= 8) {
+      paramSummary = JSON.stringify(props);
+    } else {
+      const summary = {};
+      propNames.forEach((key) => {
+        const p = props[key];
+        summary[key] = p?.type
+          ? (p.description && p.description.length <= 40 ? { type: p.type, description: p.description } : { type: p.type })
+          : p;
+      });
+      paramSummary = JSON.stringify(summary);
+    }
+  }
+
   return [
     `Tool: ${name}`,
-    `Description: ${toStringSafe(definition?.description).trim() || "No description available"}`,
-    `Parameters: ${toJsonText(definition?.parameters)}`
+    `Description: ${truncatedDesc}`,
+    `Parameters: ${paramSummary || "{}"}`
   ].join("\n");
 }
 
@@ -240,8 +267,17 @@ export function buildOpenAiPrompt({ messages, toolChoice, tools }) {
   const normalizedMessages = normalizeMessagesForPrompt(messages);
   const promptMessages = injectToolPrompt(normalizedMessages, tools ?? [], policy);
 
+  let prompt = buildPromptFromMessages(promptMessages);
+
+  if (prompt.length > config.maxPromptChars) {
+    log.warn("prompt", `Prompt too long: ${prompt.length} chars (limit: ${config.maxPromptChars}), truncating from the beginning`);
+    prompt = prompt.slice(prompt.length - config.maxPromptChars);
+  }
+
+  log.debug("prompt", `Final prompt length: ${prompt.length} chars, toolNames: [${policy.allowedToolNames.join(",")}]`);
+
   return {
-    prompt: buildPromptFromMessages(promptMessages),
+    prompt,
     toolChoicePolicy: policy,
     toolNames: policy.allowedToolNames
   };

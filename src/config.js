@@ -18,9 +18,14 @@ const adminPassword = process.env.APP_ADMIN_PASSWORD ?? "";
 const debugEnv = process.env.DEBUG ?? "";
 const debugEnabled = debugEnv === "1" || debugEnv === "true" || debugEnv.includes("deepseek2api");
 
+const maxPromptChars = Number(process.env.MAX_PROMPT_CHARS ?? 32000);
+const maxToolDescChars = Number(process.env.MAX_TOOL_DESC_CHARS ?? 200);
+
 export const config = Object.freeze({
   port: Number(process.env.PORT ?? 3000),
   debug: debugEnabled,
+  maxPromptChars,
+  maxToolDescChars,
   dataFile: join(dataDirectory, "app.json"),
   sessionCookieName: "ds_reverse_session",
   sessionTtlMs: 1000 * 60 * 60 * 24 * 7,
