@@ -15,8 +15,12 @@ mkdirSync(dataDirectory, { recursive: true });
 const adminUsername = process.env.APP_ADMIN_USERNAME ?? "";
 const adminPassword = process.env.APP_ADMIN_PASSWORD ?? "";
 
+const debugEnv = process.env.DEBUG ?? "";
+const debugEnabled = debugEnv === "1" || debugEnv === "true" || debugEnv.includes("deepseek2api");
+
 export const config = Object.freeze({
   port: Number(process.env.PORT ?? 3000),
+  debug: debugEnabled,
   dataFile: join(dataDirectory, "app.json"),
   sessionCookieName: "ds_reverse_session",
   sessionTtlMs: 1000 * 60 * 60 * 24 * 7,

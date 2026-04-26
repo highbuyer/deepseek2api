@@ -6,6 +6,7 @@ import { createToolSieve, extractToolAwareOutput } from "./openai-tool-sieve.js"
 import { buildOpenAiPrompt } from "./openai-tool-prompt.js";
 import { ensureToolChoiceSatisfied, hasChatToolingRequest } from "./openai-tool-policy.js";
 import { createOpenAiError } from "./openai-error.js";
+import { log } from "../utils/log.js";
 
 function createCompletionId() {
   return `chatcmpl_${randomUUID()}`;
@@ -27,15 +28,21 @@ function resolveCompletionRequest(body, toolCallsEnabled) {
   assertNoLegacySearchOptions(body);
 
   if (!toolCallsEnabled && hasChatToolingRequest(body)) {
+    log.warn("bridge", "Tool calls rejected: toolCallsEnabled=false but request has tools/tool_choice/tool history");
     throw createOpenAiError(400, "Tool calls are disabled for this API key");
   }
 
   const model = resolveOpenAiModel(body?.model);
+  const toolNames = (body?.tools ?? []).map(t => t?.function?.name ?? t?.name).filter(Boolean);
+  log.debug("bridge", `Model: ${model.id}, toolCallsEnabled: ${toolCallsEnabled}, tools: [${toolNames.join(",")}], tool_choice: ${JSON.stringify(body?.tool_choice)}`);
+
   const promptRequest = buildOpenAiPrompt({
     messages: body?.messages ?? [],
     toolChoice: toolCallsEnabled ? body?.tool_choice : undefined,
     tools: toolCallsEnabled ? body?.tools ?? [] : []
   });
+
+  log.debug("bridge", `Prompt length: ${promptRequest.prompt.length} chars, toolChoicePolicy.mode: ${promptRequest.toolChoicePolicy.mode}, allowedToolNames: [${promptRequest.toolNames.join(",")}]`);
 
   return {
     model,
@@ -49,6 +56,13 @@ function buildChatCompletionPayload(completionId, requestOptions, content) {
   const parsed = requestOptions.toolNames.length
     ? extractToolAwareOutput(content, requestOptions.toolNames)
     : { content, toolCalls: [] };
+
+  log.debug("bridge", `Content length: ${content.length}, parsed toolCalls: ${parsed.toolCalls.length}, parsed content length: ${parsed.content.length}`);
+  if (parsed.toolCalls.length) {
+    log.debug("bridge", `Parsed tool calls:`, parsed.toolCalls.map(c => ({ name: c.name, argsLen: c.argumentsText.length })));
+  } else if (requestOptions.toolNames.length) {
+    log.warn("bridge", `No tool calls parsed from model output (expected tools: [${requestOptions.toolNames.join(",")}]). Raw content (first 500 chars): ${content.slice(0, 500)}`);
+  }
 
   ensureToolChoiceSatisfied(requestOptions.toolChoicePolicy, parsed.toolCalls);
 
@@ -115,11 +129,13 @@ export async function collectOpenAiResponse({
   toolCallsEnabled = false
 }) {
   const requestOptions = resolveCompletionRequest(body, toolCallsEnabled);
+  log.info("bridge", `[collect] model=${requestOptions.model.id}, stream=false, accountId=${account.id}, deleteAfter=${deleteAfterFinish}`);
   const { content } = await collectCompletionContent({
     account,
     deleteAfterFinish,
     requestOptions
   });
+  log.debug("bridge", `[collect] Raw content length: ${content.length}`);
 
   return buildChatCompletionPayload(createCompletionId(), requestOptions, content);
 }
@@ -134,6 +150,7 @@ export async function streamOpenAiResponse(options) {
   } = options;
   const completionId = createCompletionId();
   const requestOptions = resolveCompletionRequest(body, toolCallsEnabled);
+  log.info("bridge", `[stream] model=${requestOptions.model.id}, stream=true, accountId=${account.id}, deleteAfter=${deleteAfterFinish}, toolNames=[${requestOptions.toolNames.join(",")}]`);
   const toolSieve = requestOptions.toolNames.length
     ? createToolSieve(requestOptions.toolNames)
     : null;

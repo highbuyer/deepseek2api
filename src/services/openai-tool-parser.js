@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { log } from "../utils/log.js";
 
 const TOOL_BLOCK_PATTERN = /<(?:[a-z0-9_:-]+:)?(tool_call|function_call|invoke)\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1>/gi;
 const TOOL_SELFCLOSE_PATTERN = /<(?:[a-z0-9_:-]+:)?invoke\b([^>]*)\/>/gi;
@@ -197,9 +198,16 @@ export function parseToolCallsFromText(text, allowedToolNames = []) {
     return [];
   }
 
-  if (!stripFencedCodeBlocks(source).match(/<(tool_calls|tool_call|function_call|invoke|tool_use)\b/i)) {
+  const stripped = stripFencedCodeBlocks(source);
+  if (!stripped.match(/<(tool_calls|tool_call|function_call|invoke|tool_use)\b/i)) {
+    log.debug("parser", `No tool XML tags found in output (length=${source.length})`);
     return [];
   }
 
-  return filterAllowedToolCalls(parseMarkupToolCalls(source), allowedToolNames);
+  const calls = filterAllowedToolCalls(parseMarkupToolCalls(source), allowedToolNames);
+  log.debug("parser", `Parsed ${calls.length} tool call(s) from text (allowed: [${allowedToolNames.join(",")}])`);
+  if (!calls.length) {
+    log.warn("parser", `XML tool tags found but no valid calls parsed. Stripped content (first 500): ${stripped.slice(0, 500)}`);
+  }
+  return calls;
 }
