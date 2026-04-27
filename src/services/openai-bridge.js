@@ -177,6 +177,7 @@ export async function streamOpenAiResponse(options) {
     }
 
     sawToolCall = true;
+    log.debug("bridge", `[stream] Tool calls detected: ${calls.map(c => c.name).join(",")}`);
     writeSseChunk(response, buildChunkPayload(
       completionId,
       requestOptions.model.id,
@@ -241,5 +242,12 @@ export async function streamOpenAiResponse(options) {
     {},
     sawToolCall ? "tool_calls" : "stop"
   ));
+
+  if (requestOptions.toolNames.length && !sawToolCall) {
+    log.warn("bridge", `[stream] No tool calls detected in stream (expected tools: [${requestOptions.toolNames.join(",")}])`);
+  } else if (sawToolCall) {
+    log.info("bridge", `[stream] Completed with ${toolCallIndex} tool call(s)`);
+  }
+
   response.end("data: [DONE]\n\n");
 }
