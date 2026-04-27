@@ -57,7 +57,7 @@ function buildChatCompletionPayload(completionId, requestOptions, content) {
     ? extractToolAwareOutput(content, requestOptions.toolNames)
     : { content, toolCalls: [] };
 
-  log.debug("bridge", `Content length: ${content.length}, parsed toolCalls: ${parsed.toolCalls.length}, parsed content length: ${parsed.content.length}`);
+  log.debug("bridge", `[collect] Content length: ${content.length}, parsed toolCalls: ${parsed.toolCalls.length}, parsed content length: ${parsed.content.length}`);
   if (parsed.toolCalls.length) {
     log.debug("bridge", `Parsed tool calls:`, parsed.toolCalls.map(c => ({ name: c.name, argsLen: c.argumentsText.length })));
   } else if (requestOptions.toolNames.length) {

@@ -1,4 +1,5 @@
 import { parseToolCallsFromText } from "./openai-tool-parser.js";
+import { log } from "../utils/log.js";
 
 const TOOL_CAPTURE_PAIRS = Object.freeze([
   { open: "<tool_calls", close: "</tool_calls>" },
@@ -74,14 +75,19 @@ function consumeCapturedToolBlock(captured, allowedToolNames) {
 
     const closeIndex = lower.lastIndexOf(pair.close);
     if (closeIndex < openIndex) {
+      log.debug("sieve", `[consume] Incomplete block: <${pair.open}> found but no </${pair.close}>, waiting for more data`);
       return { ready: false };
     }
 
     const closeEnd = closeIndex + pair.close.length;
+    const block = captured.slice(openIndex, closeEnd);
+    log.debug("sieve", `[consume] Complete block captured: <${pair.open}>...</${pair.close}>, block length=${block.length}, preview="${block.slice(0, 200)}"`);
+    const calls = parseToolCallsFromText(block, allowedToolNames);
+    log.debug("sieve", `[consume] Parsed ${calls.length} tool call(s) from captured block`);
     return {
       ready: true,
       prefix: captured.slice(0, openIndex),
-      calls: parseToolCallsFromText(captured.slice(openIndex, closeEnd), allowedToolNames),
+      calls,
       suffix: captured.slice(closeEnd)
     };
   }
@@ -138,6 +144,7 @@ export function createToolSieve(allowedToolNames = []) {
 
       const start = findToolSegmentStart(state, state.pending);
       if (start >= 0) {
+        log.debug("sieve", `[drain] Tool segment start detected at offset ${start}, entering capture mode`);
         pushTextEvent(state, events, state.pending.slice(0, start));
         state.capture = state.pending.slice(start);
         state.pending = "";
