@@ -1,37 +1,36 @@
 import { randomUUID } from "node:crypto";
 import { log } from "../utils/log.js";
 
-/* ── Single tool-call block patterns (original) ── */
-const TOOL_BLOCK_PATTERN = /<(?:[a-z0-9_:-]+:)?(tool_call|function_call|invoke)\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1>/gi;
+/* ── Single tool-call block patterns ── */
+const TOOL_BLOCK_PATTERN = /<(?:[a-z0-9_:-]+:)?(tool_call|function_call|invoke)\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1\s*>/gi;
 const TOOL_SELFCLOSE_PATTERN = /<(?:[a-z0-9_:-]+:)?invoke\b([^>]*)\/>/gi;
 
 /* ── Container patterns: <tool_calls>...</tool_calls> (plural) ── */
-const TOOL_CALLS_CONTAINER_PATTERN = /<(?:[a-z0-9_:-]+:)?(tool_calls|function_calls)\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1>/gi;
+const TOOL_CALLS_CONTAINER_PATTERN = /<(?:[a-z0-9_:-]+:)?(tool_calls|function_calls)\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1\s*>/gi;
 
-/* ── Sub-element patterns inside a container ── */
+/* ── Sub-element patterns ── */
 const TOOL_NAME_PATTERNS = Object.freeze([
   /<(?:[a-z0-9_:-]+:)?tool_name\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?tool_name>/i,
   /<(?:[a-z0-9_:-]+:)?function_name\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?function_name>/i,
   /<(?:[a-z0-9_:-]+:)?name\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?name>/i,
   /<(?:[a-z0-9_:-]+:)?function\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?function>/i
 ]);
+
+/* ── Args patterns: <parameters>, <arguments>, <input> etc. (JSON body) ── */
 const TOOL_ARGS_PATTERNS = Object.freeze([
+  /<(?:[a-z0-9_:-]+:)?parameters\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?parameters>/i,
   /<(?:[a-z0-9_:-]+:)?input\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?input>/i,
   /<(?:[a-z0-9_:-]+:)?arguments\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?arguments>/i,
   /<(?:[a-z0-9_:-]+:)?argument\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?argument>/i,
-  /<(?:[a-z0-9_:-]+:)?parameters\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?parameters>/i,
-  /<(?:[a-z0-9_:-]+:)?parameter\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?parameter>/i,
   /<(?:[a-z0-9_:-]+:)?args\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?args>/i,
   /<(?:[a-z0-9_:-]+:)?params\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?params>/i
 ]);
 
-/* ── Pattern for individual <tool_call name="..."> blocks inside container ── */
-const INNER_TOOL_CALL_PATTERN = /<(?:[a-z0-9_:-]+:)?(tool_call|function_call|invoke)\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1>/gi;
-const TOOL_ATTR_PATTERN = /(name|function|tool)\s*=\s*"([^"]+)"/i;
-const TOOL_KV_PATTERN = /<(?:[a-z0-9_:-]+:)?([a-z0-9_.-]+)\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1>/gi;
+/* ── <parameter name="key">value</parameter> pattern (singular with name attr) ── */
+const PARAMETER_NAME_ATTR_PATTERN = /<(?:[a-z0-9_:-]+:)?parameter\b[^>]*\bname\s*=\s*"([^"]+)"[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?parameter>/gi;
 
-/* ── Pattern to split container inner into individual tool entries ── */
-const TOOL_ENTRY_SPLIT_PATTERN = /<tool_name>|<function_name>|<name>/i;
+const TOOL_ATTR_PATTERN = /(name|function|tool)\s*=\s*"([^"]+)"/i;
+const TOOL_KV_PATTERN = /<(?:[a-z0-9_:-]+:)?([a-z0-9_.-]+)\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1\s*>/gi;
 
 function toStringSafe(value) {
   if (typeof value === "string") {
@@ -115,6 +114,45 @@ function findAllTagValues(text, patterns) {
   return results;
 }
 
+/**
+ * Parse <parameter name="key">value</parameter> elements into a JSON object.
+ * Handles the format the model sometimes uses:
+ *   <parameter name="command">ls -la</parameter>
+ *   <parameter name="timeout">5</parameter>
+ *   → {"command": "ls -la", "timeout": "5"}
+ */
+function parseParameterNameAttrs(text) {
+  const source = toStringSafe(text);
+  const output = {};
+  let found = false;
+
+  for (const match of source.matchAll(PARAMETER_NAME_ATTR_PATTERN)) {
+    const key = toStringSafe(match[1]).trim();
+    const value = decodeXmlText(match[2]);
+    if (!key) continue;
+
+    found = true;
+    // Try to parse value as JSON (for nested objects, numbers, booleans)
+    const jsonValue = parseJsonObject(value);
+    if (jsonValue) {
+      output[key] = jsonValue;
+    } else {
+      // Try number / boolean
+      if (/^-?\d+(\.\d+)?$/.test(value.trim())) {
+        output[key] = Number(value.trim());
+      } else if (value.trim() === "true") {
+        output[key] = true;
+      } else if (value.trim() === "false") {
+        output[key] = false;
+      } else {
+        output[key] = value;
+      }
+    }
+  }
+
+  return found ? output : null;
+}
+
 function appendMarkupValue(output, key, value) {
   if (!Object.hasOwn(output, key)) {
     output[key] = value;
@@ -187,49 +225,77 @@ function buildParsedToolCall(name, argumentsText) {
   };
 }
 
-function parseMarkupBlock(attrs, inner) {
-  log.debug("parser", `[parseMarkupBlock] attrs="${attrs.slice(0, 100)}", inner length=${inner.length}, inner preview="${inner.slice(0, 200)}"`);
+/**
+ * Parse a single tool_call block's inner content.
+ * Handles multiple argument formats:
+ * 1. JSON body: <tool_call name="x">{"key":"val"}</tool_call
+ * 2. <parameters>{"key":"val"}</parameters> (JSON body)
+ * 3. <parameter name="key">value</parameter> (named attrs)
+ * 4. Markup KV: <key>value</key> children
+ */
+function parseToolCallInner(attrs, inner) {
+  log.debug("parser", `[parseToolCallInner] attrs="${attrs.slice(0, 100)}", inner length=${inner.length}, inner preview="${inner.slice(0, 200)}"`);
 
+  // 1. Entire inner is a JSON object with .name
   const jsonTool = parseJsonObject(inner);
   if (jsonTool?.name) {
-    log.debug("parser", `[parseMarkupBlock] Parsed as JSON tool: name=${jsonTool.name}`);
-    return buildParsedToolCall(jsonTool.name, JSON.stringify(jsonTool.input ?? {}));
+    log.debug("parser", `[parseToolCallInner] Parsed as JSON tool: name=${jsonTool.name}`);
+    return buildParsedToolCall(jsonTool.name, JSON.stringify(jsonTool.input ?? jsonTool.arguments ?? {}));
   }
 
+  // 2. Get tool name from attribute or <tool_name> sub-tag
   const attrName = attrs.match(TOOL_ATTR_PATTERN)?.[2] ?? "";
   const name = attrName.trim() || findTagValue(inner, TOOL_NAME_PATTERNS).trim();
-  log.debug("parser", `[parseMarkupBlock] attrName="${attrName}", resolved name="${name}"`);
+  log.debug("parser", `[parseToolCallInner] attrName="${attrName}", resolved name="${name}"`);
 
   if (!name) {
-    log.debug("parser", `[parseMarkupBlock] No tool name found, returning null`);
+    log.debug("parser", `[parseToolCallInner] No tool name found, returning null`);
     return null;
   }
 
-  const argsRaw = findTagValue(inner, TOOL_ARGS_PATTERNS);
-  const parsedInput = argsRaw ? parseMarkupInput(argsRaw) : parseMarkupObject(inner);
-  const argumentsText = JSON.stringify(parsedInput && Object.keys(parsedInput).length ? parsedInput : {});
+  // 3. Try <parameter name="key">value</parameter> format FIRST
+  //    (before <parameters>JSON</parameters> because <parameter> with name attr
+  //     gets matched by TOOL_KV_PATTERN as a generic tag, losing the name attribute)
+  const namedParams = parseParameterNameAttrs(inner);
+  if (namedParams && Object.keys(namedParams).length > 0) {
+    const argumentsText = JSON.stringify(namedParams);
+    log.debug("parser", `[parseToolCallInner] name="${name}", parsed via <parameter name="..."> format, argumentsText="${argumentsText.slice(0, 100)}"`);
+    return buildParsedToolCall(name, argumentsText);
+  }
 
-  log.debug("parser", `[parseMarkupBlock] name="${name}", argsRaw="${(argsRaw || "").slice(0, 100)}", argumentsText="${argumentsText.slice(0, 100)}"`);
+  // 4. Try <parameters>JSON</parameters> or <arguments>JSON</arguments> format
+  const argsRaw = findTagValue(inner, TOOL_ARGS_PATTERNS);
+  if (argsRaw) {
+    const parsedInput = parseMarkupInput(argsRaw);
+    const argumentsText = JSON.stringify(parsedInput && Object.keys(parsedInput).length ? parsedInput : {});
+    log.debug("parser", `[parseToolCallInner] name="${name}", argsRaw="${argsRaw.slice(0, 100)}", argumentsText="${argumentsText.slice(0, 100)}"`);
+    return buildParsedToolCall(name, argumentsText);
+  }
+
+  // 5. Fallback: parse inner as generic markup KV
+  const markupObject = parseMarkupObject(inner);
+  const argumentsText = JSON.stringify(markupObject && Object.keys(markupObject).length ? markupObject : {});
+  log.debug("parser", `[parseToolCallInner] name="${name}", fallback markup, argumentsText="${argumentsText.slice(0, 100)}"`);
   return buildParsedToolCall(name, argumentsText);
 }
 
 /**
- * Parse individual <tool_call name="..."> or <invoke name="..."> blocks.
- * (Original logic, unchanged)
+ * Parse standalone <tool_call name="..."> blocks that are NOT inside a <tool_calls> container.
+ * Only parses blocks that are direct children of the source text.
  */
-function parseSingularToolBlocks(text) {
+function parseStandaloneSingularBlocks(text) {
   const output = [];
   const source = toStringSafe(text).trim();
 
   for (const match of source.matchAll(TOOL_BLOCK_PATTERN)) {
-    const parsed = parseMarkupBlock(toStringSafe(match[2]).trim(), toStringSafe(match[3]).trim());
+    const parsed = parseToolCallInner(toStringSafe(match[2]).trim(), toStringSafe(match[3]).trim());
     if (parsed) {
       output.push(parsed);
     }
   }
 
   for (const match of source.matchAll(TOOL_SELFCLOSE_PATTERN)) {
-    const parsed = parseMarkupBlock(toStringSafe(match[1]).trim(), "");
+    const parsed = parseToolCallInner(toStringSafe(match[1]).trim(), "");
     if (parsed) {
       output.push(parsed);
     }
@@ -240,25 +306,11 @@ function parseSingularToolBlocks(text) {
 
 /**
  * Parse <tool_calls> container format.
- * The model outputs:
- *   <tool_calls>
- *     <tool_name>terminal</tool_name>
- *     <parameters>{"command":"ls"}</parameters>
- *   </tool_calls>
- *
- * Or with multiple tools:
- *   <tool_calls>
- *     <tool_name>tool1</tool_name>
- *     <parameters>{...}</parameters>
- *     <tool_name>tool2</tool_name>
- *     <parameters>{...}</parameters>
- *   </tool_calls>
- *
- * Or with nested <tool_call name="..."> inside:
- *   <tool_calls>
- *     <tool_call name="tool1">...</tool_call
- *     <tool_call name="tool2">...</tool_call
- *   </tool_calls>
+ * Supports:
+ *   Format A: <tool_call name="..."> nested inside container
+ *   Format B: <tool_name>+<parameters> flat pairs inside container
+ *   Format C: <tool_name>+<parameter name="..."> named params inside container
+ *   Format D: Single JSON with .name inside container
  */
 function parseContainerToolBlocks(text) {
   const output = [];
@@ -271,29 +323,36 @@ function parseContainerToolBlocks(text) {
 
     log.debug("parser", `[parseContainer] Found <${containerTag}> container, inner length=${inner.length}, inner preview="${inner.slice(0, 300)}"`);
 
-    // First: check if inner has nested <tool_call name="..."> blocks
-    const innerCalls = parseSingularToolBlocks(inner);
+    // Strategy A: nested <tool_call name="..."> blocks inside container
+    const innerCalls = parseStandaloneSingularBlocks(inner);
     if (innerCalls.length) {
       log.debug("parser", `[parseContainer] Found ${innerCalls.length} nested <tool_call/> block(s) inside <${containerTag}>`);
       output.push(...innerCalls);
       continue;
     }
 
-    // Second: check if inner is a single JSON object with .name
-    const jsonTool = parseJsonObject(inner);
-    if (jsonTool?.name) {
-      log.debug("parser", `[parseContainer] Found JSON tool inside <${containerTag}>: name=${jsonTool.name}`);
-      output.push(buildParsedToolCall(jsonTool.name, JSON.stringify(jsonTool.input ?? {})));
-      continue;
-    }
-
-    // Third: extract <tool_name> + <parameters> pairs directly from inner
-    // Handle multiple tools inside one container
+    // Strategy B: <tool_name>+<parameters> flat pairs
     const names = findAllTagValues(inner, TOOL_NAME_PATTERNS);
-    const args = findAllTagValues(inner, TOOL_ARGS_PATTERNS);
-
     if (names.length) {
-      log.debug("parser", `[parseContainer] Found ${names.length} <tool_name> tag(s): [${names.join(", ")}], ${args.length} <parameters> tag(s)`);
+      // Check for <parameter name="..."> named params first
+      const namedParams = parseParameterNameAttrs(inner);
+      if (namedParams && Object.keys(namedParams).length > 0) {
+        // Format C: <tool_name>X</tool_name> + <parameter name="key">value</parameter>
+        // If multiple tool_names, we need to split the params per tool
+        // For now, if only one tool_name, assign all named params to it
+        if (names.length === 1) {
+          const toolName = names[0].trim();
+          const argumentsText = JSON.stringify(namedParams);
+          log.debug("parser", `[parseContainer] Format C: name="${toolName}", <parameter name="..."> args="${argumentsText.slice(0, 100)}"`);
+          output.push(buildParsedToolCall(toolName, argumentsText));
+          continue;
+        }
+        // Multiple tools with named params is ambiguous, fall through
+      }
+
+      // Format B: <tool_name>+<parameters> pairs
+      const args = findAllTagValues(inner, TOOL_ARGS_PATTERNS);
+      log.debug("parser", `[parseContainer] Format B: ${names.length} <tool_name> tag(s): [${names.join(", ")}], ${args.length} <parameters> tag(s)`);
 
       for (let i = 0; i < names.length; i++) {
         const toolName = names[i].trim();
@@ -301,7 +360,6 @@ function parseContainerToolBlocks(text) {
 
         if (!toolName) continue;
 
-        // Try to parse args as JSON, fallback to markup
         let parsedArgs;
         const jsonArgs = parseJsonObject(toolArgs);
         if (jsonArgs) {
@@ -316,14 +374,29 @@ function parseContainerToolBlocks(text) {
       continue;
     }
 
-    // Fourth: try name from attribute + <parameters> as body
+    // Strategy C: inner is a single JSON object with .name
+    const jsonTool = parseJsonObject(inner);
+    if (jsonTool?.name) {
+      log.debug("parser", `[parseContainer] Found JSON tool inside <${containerTag}>: name=${jsonTool.name}`);
+      output.push(buildParsedToolCall(jsonTool.name, JSON.stringify(jsonTool.input ?? jsonTool.arguments ?? {})));
+      continue;
+    }
+
+    // Strategy D: name from container tag attribute + body as args
     const attrName = attrs.match(TOOL_ATTR_PATTERN)?.[2] ?? "";
     if (attrName.trim()) {
-      const argsRaw = findTagValue(inner, TOOL_ARGS_PATTERNS);
-      const parsedInput = argsRaw ? parseMarkupInput(argsRaw) : parseMarkupObject(inner);
-      const argumentsText = JSON.stringify(parsedInput && Object.keys(parsedInput).length ? parsedInput : {});
-      log.debug("parser", `[parseContainer] Using attr name="${attrName}" from <${containerTag}> tag`);
-      output.push(buildParsedToolCall(attrName.trim(), argumentsText));
+      const namedParams = parseParameterNameAttrs(inner);
+      if (namedParams && Object.keys(namedParams).length > 0) {
+        const argumentsText = JSON.stringify(namedParams);
+        log.debug("parser", `[parseContainer] Strategy D: attr name="${attrName}", <parameter name="..."> args="${argumentsText.slice(0, 100)}"`);
+        output.push(buildParsedToolCall(attrName.trim(), argumentsText));
+      } else {
+        const argsRaw = findTagValue(inner, TOOL_ARGS_PATTERNS);
+        const parsedInput = argsRaw ? parseMarkupInput(argsRaw) : parseMarkupObject(inner);
+        const argumentsText = JSON.stringify(parsedInput && Object.keys(parsedInput).length ? parsedInput : {});
+        log.debug("parser", `[parseContainer] Strategy D: attr name="${attrName}", argumentsText="${argumentsText.slice(0, 100)}"`);
+        output.push(buildParsedToolCall(attrName.trim(), argumentsText));
+      }
       continue;
     }
 
@@ -334,31 +407,33 @@ function parseContainerToolBlocks(text) {
 }
 
 /**
- * Main parser: try both singular blocks and container blocks.
+ * Main parser: Parse tool calls from text.
+ *
+ * Key logic: If there are <tool_calls> container blocks, we ONLY parse those
+ * (because standalone <tool_call name="..."> blocks inside the container will
+ * be parsed by the container handler, and parsing them again would cause duplicates).
+ *
+ * If there are NO container blocks, then parse standalone <tool_call name="..."> blocks.
  */
 function parseMarkupToolCalls(text) {
-  const output = [];
   const source = toStringSafe(text).trim();
 
-  // Pass 1: singular <tool_call name="..."> blocks
-  const singularCalls = parseSingularToolBlocks(source);
-  if (singularCalls.length) {
-    log.debug("parser", `[parseMarkupToolCalls] Pass 1 (singular blocks): found ${singularCalls.length} call(s)`);
-    output.push(...singularCalls);
+  // Check if source contains container blocks
+  const hasContainer = TOOL_CALLS_CONTAINER_PATTERN.test(source);
+  // Reset lastIndex after test
+  TOOL_CALLS_CONTAINER_PATTERN.lastIndex = 0;
+
+  if (hasContainer) {
+    // Only parse container blocks (they will handle nested <tool_call/> inside)
+    const containerCalls = parseContainerToolBlocks(source);
+    log.debug("parser", `[parseMarkupToolCalls] Container mode: found ${containerCalls.length} call(s)`);
+    return containerCalls;
   }
 
-  // Pass 2: container <tool_calls>...</tool_calls> blocks
-  const containerCalls = parseContainerToolBlocks(source);
-  if (containerCalls.length) {
-    log.debug("parser", `[parseMarkupToolCalls] Pass 2 (container blocks): found ${containerCalls.length} call(s)`);
-    output.push(...containerCalls);
-  }
-
-  if (!output.length) {
-    log.debug("parser", `[parseMarkupToolCalls] No tool calls found in either pass. Source length=${source.length}, source preview="${source.slice(0, 300)}"`);
-  }
-
-  return output;
+  // No containers: parse standalone singular blocks
+  const standaloneCalls = parseStandaloneSingularBlocks(source);
+  log.debug("parser", `[parseMarkupToolCalls] Standalone mode: found ${standaloneCalls.length} call(s)`);
+  return standaloneCalls;
 }
 
 function filterAllowedToolCalls(calls, allowedToolNames) {
