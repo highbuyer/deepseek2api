@@ -36,20 +36,24 @@ const KNOWN_STRUCTURAL_TAGS = new Set([
   "parameters", "parameter", "input", "arguments", "argument", "args", "params",
   "command", "query", "body", "data", "result", "response", "content", "value",
   "description", "type", "key", "url", "path", "file", "text", "message",
-  "output", "error", "code", "script", "shell", "timeout", "limit"
+  "output", "error", "code", "timeout", "limit"
 ]);
 
 /* ── Argument-carrying tag names (skip in named-block scanning) ── */
+/* Also includes name-indicator tags that shouldn't be treated as wrappers */
 const ARGUMENT_CARRYING_TAGS = new Set([
-  "parameter", "parameters", "argument", "arguments", "input", "args", "params"
+  "parameter", "parameters", "argument", "arguments", "input", "args", "params",
+  "tool_name", "function_name"
 ]);
 
 const TOOL_ATTR_PATTERN = /(name|function|tool)\s*=\s*"([^"]+)"/i;
 const TOOL_KV_PATTERN = /<(?:[a-z0-9_:-]+:)?([a-z0-9_.-]+)\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1\s*>/gi;
 const ANY_TAG_PATTERN = /<([a-z0-9_:-]+)\b[^>]*>/gi;
 
-/* ── Malformed tag pattern: <tool_name="ReadFile"> should be <tool_name name="ReadFile"> ── */
-const MALFORMED_ATTR_EQUALS = /<((?:[a-z0-9_:-]+:)?(?:tool_name|function_name|name|tool|function|call))="([^"]+)"/gi;
+/* ── Malformed tag pattern: <tool_name="ReadFile"> should be <tool_name name="ReadFile">
+    Also handles <tool_name="ReadFile</tool_name> (missing >) → <tool_name name="ReadFile"></tool_name>
+    Uses [^"<>\s]+ to stop at < or > or whitespace, preventing over-matching ── */
+const MALFORMED_ATTR_EQUALS = /<((?:[a-z0-9_:-]+:)?(?:tool_name|function_name|name|tool|function|call))="([^"<>\s]+)"?\s*(>)?/gi;
 
 function toStringSafe(value) {
   if (typeof value === "string") {
@@ -234,10 +238,31 @@ function findToolNameTags(text, allowedToolNames) {
     // Found a tool-name tag! Extract its full content.
     const openTag = match[0];
     const openPos = match.index;
-    const closeTag = `</${match[1]}`;
-    const closePos = source.indexOf(closeTag, openPos + openTag.length);
+    // Case-insensitive search for closing tag
+    const closeTagLower = `</${tagName}`;
+    let closePos = -1;
+    const sourceLower = source.toLowerCase();
+    let searchFrom = openPos + openTag.length;
+    while (searchFrom < sourceLower.length) {
+      const idx = sourceLower.indexOf(closeTagLower, searchFrom);
+      if (idx < 0) break;
+      // Verify this is actually a closing tag (followed by > or whitespace)
+      const afterTag = sourceLower.slice(idx + closeTagLower.length, idx + closeTagLower.length + 1);
+      if (afterTag === ">" || afterTag === " " || afterTag === "\n" || afterTag === "\r" || afterTag === "\t") {
+        closePos = idx;
+        break;
+      }
+      searchFrom = idx + 1;
+    }
 
-    if (closePos < 0) continue;
+    if (closePos < 0) {
+      // No closing tag found — still extract tool name, use rest of content as body
+      const body = source.slice(openPos + openTag.length);
+      const originalName = allowedToolNames.find(n => toStringSafe(n).trim().toLowerCase() === tagName) || tagName;
+      log.debug("parser", `[findToolNameTags] Tag <${match[1]}> has no closing tag, using rest-of-content as body (length=${body.length})`);
+      results.push({ name: originalName, body: body.trim() });
+      continue;
+    }
 
     // Find the actual end of the closing tag
     const closeEnd = source.indexOf(">", closePos) + 1;
@@ -249,6 +274,7 @@ function findToolNameTags(text, allowedToolNames) {
     results.push({ name: originalName, body: body.trim() });
   }
 
+  log.debug("parser", `[findToolNameTags] Found ${results.length} tool-name tag(s): [${results.map(r => r.name).join(", ")}]`);
   return results;
 }
 
@@ -480,8 +506,16 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
 
     log.debug("parser", `[parseContainer] Found <${containerTag}> container, inner length=${inner.length}, inner preview="${inner.slice(0, 300)}"`);
 
+    // Pre-process: flatten nested containers (e.g. <tool_calls><tool_calls>...)</tool_calls></tool_calls>)
+    let flatInner = inner;
+    const nestedContainer = /^(?:[a-z0-9_:-]+:)?(tool_calls|function_calls)\b[^>]*>([\s\S]*?)<\/\1\s*>$/i.exec(inner.trim());
+    if (nestedContainer) {
+      flatInner = nestedContainer[2].trim();
+      log.debug("parser", `[parseContainer] Flattened nested <${nestedContainer[1]}> container, new inner length=${flatInner.length}`);
+    }
+
     // Strategy A: nested <tool_call name="..."> blocks inside container
-    const innerCalls = parseStandaloneSingularBlocks(inner, allowedToolNames);
+    const innerCalls = parseStandaloneSingularBlocks(flatInner, allowedToolNames);
     if (innerCalls.length) {
       log.debug("parser", `[parseContainer] Strategy A: found ${innerCalls.length} nested <tool_call/invoke> block(s)`);
       output.push(...innerCalls);
@@ -490,7 +524,7 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
 
     // Strategy A2: <tool name="Shell"> or <tool_name name="TodoWrite"> blocks
     // Any tag with name= attribute matching an allowed tool name
-    const namedBlocks = findNamedToolBlocks(inner, allowedToolNames);
+    const namedBlocks = findNamedToolBlocks(flatInner, allowedToolNames);
     if (namedBlocks.length) {
       log.debug("parser", `[parseContainer] Strategy A2: found ${namedBlocks.length} named block(s): [${namedBlocks.map(b => b.name).join(", ")}]`);
       for (const { name, body } of namedBlocks) {
@@ -502,9 +536,9 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
     }
 
     // Strategy B: <tool_name>+<parameters> flat pairs
-    const names = findAllTagValues(inner, TOOL_NAME_PATTERNS);
+    const names = findAllTagValues(flatInner, TOOL_NAME_PATTERNS);
     if (names.length) {
-      const namedParams = parseParameterNameAttrs(inner);
+      const namedParams = parseParameterNameAttrs(flatInner);
       if (namedParams && Object.keys(namedParams).length > 0 && names.length === 1) {
         const toolName = names[0].trim();
         const argumentsText = JSON.stringify(namedParams);
@@ -513,7 +547,7 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
         continue;
       }
 
-      const args = findAllTagValues(inner, TOOL_ARGS_PATTERNS);
+      const args = findAllTagValues(flatInner, TOOL_ARGS_PATTERNS);
       log.debug("parser", `[parseContainer] Strategy B: ${names.length} <tool_name> tag(s), ${args.length} <parameters> tag(s)`);
 
       for (let i = 0; i < names.length; i++) {
@@ -530,8 +564,8 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
       continue;
     }
 
-    // Strategy C: "tag-name-as-tool-name" — <terminal><parameters>...</parameters></terminal>
-    const toolNameTags = findToolNameTags(inner, allowedToolNames);
+    // Strategy C: "tag-name-as-tool-name" — <Glob><parameters>...</parameters></Glob>
+    const toolNameTags = findToolNameTags(flatInner, allowedToolNames);
     if (toolNameTags.length) {
       log.debug("parser", `[parseContainer] Strategy C: found ${toolNameTags.length} tool-name tag(s): [${toolNameTags.map(t => t.name).join(", ")}]`);
       for (const { name, body } of toolNameTags) {
@@ -543,7 +577,7 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
     }
 
     // Strategy D: inner is a single JSON object with .name
-    const jsonTool = parseJsonObject(inner);
+    const jsonTool = parseJsonObject(flatInner);
     if (jsonTool?.name) {
       log.debug("parser", `[parseContainer] Strategy D: JSON tool name=${jsonTool.name}`);
       output.push(buildParsedToolCall(jsonTool.name, JSON.stringify(jsonTool.input ?? jsonTool.arguments ?? {})));
@@ -553,13 +587,13 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
     // Strategy E: name from container tag attribute
     const attrName = attrs.match(TOOL_ATTR_PATTERN)?.[2] ?? "";
     if (attrName.trim()) {
-      const argumentsText = parseToolCallArguments(inner);
+      const argumentsText = parseToolCallArguments(flatInner);
       log.debug("parser", `[parseContainer] Strategy E: attr name="${attrName}", argumentsText="${argumentsText.slice(0, 100)}"`);
       output.push(buildParsedToolCall(attrName.trim(), argumentsText));
       continue;
     }
 
-    log.warn("parser", `[parseContainer] <${containerTag}> container found but no tool calls could be extracted. Inner (first 300): "${inner.slice(0, 300)}"`);
+    log.warn("parser", `[parseContainer] <${containerTag}> container found but no tool calls could be extracted. FlatInner (first 300): "${flatInner.slice(0, 300)}"`);
   }
 
   return output;
@@ -615,9 +649,10 @@ export function parseToolCallsFromText(text, allowedToolNames = []) {
   }
 
   // Step 1.5: Fix malformed tags like <tool_name="ReadFile"> → <tool_name name="ReadFile">
-  const fixed = source.replace(MALFORMED_ATTR_EQUALS, '<$1 name="$2"');
+  // Also fixes missing >: <tool_name="ReadFile"</tool_name> → <tool_name name="ReadFile"></tool_name>
+  const fixed = source.replace(MALFORMED_ATTR_EQUALS, '<$1 name="$2">');
   if (fixed !== source) {
-    log.debug("parser", `Preprocessed malformed tags (e.g. <tool_name=\"...\"> → <tool_name name=\"...\">)`);
+    log.debug("parser", `Preprocessed malformed tags (e.g. <tool_name="..."> → <tool_name name="...">)`);
   }
 
   // Step 2: Quick check for any tool-related XML tags
