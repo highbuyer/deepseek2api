@@ -730,3 +730,114 @@ describe("Strategy I: Raw diff/patch format detection", () => {
     assert.equal(calls.length, 0);
   });
 });
+
+/* ═══════════════════════════════════════════════════
+   Case-insensitive tool name matching
+   (Fixes: Rg vs rg case mismatch from debug log)
+   ═══════════════════════════════════════════════════ */
+
+describe("Case-insensitive tool name matching", () => {
+  it("matches 'Rg' against allowed name 'rg' (case-insensitive)", () => {
+    const text = `<tool_calls>
+   
+    <tool_name>Rg</tool_name>
+    <parameters><![CDATA[{"pattern":"XMLHttpRequest","path":"/home/test/env.js","output_mode":"count"}]]></parameters>
+   
+</tool_calls>`;
+    const call = parseOne(text);
+    assert.equal(call.name, "rg"); // Normalized to allowed list casing
+    assert.equal(call.input.pattern, "XMLHttpRequest");
+  });
+
+  it("matches 'glob' against allowed name 'Glob' (case-insensitive)", () => {
+    const text = `<tool_calls>
+<tool_name>glob</tool_name>
+<parameters>{"pattern":"*.py"}</parameters>
+</tool_calls>`;
+    const call = parseOne(text);
+    assert.equal(call.name, "Glob"); // Normalized to allowed list casing
+  });
+
+  it("matches <tool_name>Rg</tool_name> inside <tool_call name='Rg'> via attribute", () => {
+    const text = `<tool_call name="Rg">
+<parameter name="pattern">test</parameter>
+</tool_call_name>`;
+    const call = parseOne(text);
+    assert.equal(call.name, "rg"); // Normalized to allowed list casing
+    assert.equal(call.input.pattern, "test");
+  });
+
+  it("filters case-insensitively in filterAllowedToolCalls", () => {
+    const text = `<tool_calls>
+<tool_name>Rg</tool_name>
+<parameters>{"pattern":"test"}</parameters>
+</tool_calls>`;
+    const calls = parseToolCallsFromText(text, ALL_TOOLS);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].name, "rg"); // Normalized
+  });
+
+  it("matches <tool name='Rg'> via findNamedToolBlocks (case-insensitive)", () => {
+    const text = `<tool name="Rg">
+<parameters>{"pattern":"test"}</parameters>
+</tool>`;
+    const call = parseOne(text);
+    assert.equal(call.name, "rg"); // Normalized
+  });
+});
+
+/* ═══════════════════════════════════════════════════
+   <tool name="X"> inside container normalization
+   (Fixes: <tool name="ReadFile"> blocks not parsed in containers)
+   ═══════════════════════════════════════════════════ */
+
+describe("<tool name='X'> inside container normalization", () => {
+  it("parses multiple <tool name='ReadFile'> blocks inside <tool_calls>", () => {
+    const text = `<tool_calls>
+   
+    <tool name="ReadFile">
+      <parameters>{"path":"/home/test/douyin.py"}</parameters>
+    </tool>
+    <tool name="ReadFile">
+      <parameters>{"path":"/home/test/env.js"}</parameters>
+    </tool>
+    <tool name="ReadFile">
+      <parameters>{"path":"/home/test/jiazai.js"}</parameters>
+    </tool>
+</tool_calls>`;
+    const calls = parseToolCallsFromText(text, ALL_TOOLS);
+    assert.equal(calls.length, 3);
+    assert.equal(calls[0].name, "ReadFile");
+    assert.equal(calls[0].input.path, "/home/test/douyin.py");
+    assert.equal(calls[1].name, "ReadFile");
+    assert.equal(calls[1].input.path, "/home/test/env.js");
+    assert.equal(calls[2].name, "ReadFile");
+    assert.equal(calls[2].input.path, "/home/test/jiazai.js");
+  });
+
+  it("parses <tool name='Shell'> with parameters inside <tool_calls>", () => {
+    const text = `<tool_calls>
+    <tool name="Shell">
+      <parameters><![CDATA[{"command":"ls -la"}]]></parameters>
+    </tool>
+</tool_calls>`;
+    const call = parseOne(text);
+    assert.equal(call.name, "Shell");
+    assert.equal(call.input.command, "ls -la");
+  });
+
+  it("parses mixed <tool_call name='X'> and <tool name='Y'> inside container", () => {
+    const text = `<tool_calls>
+    <tool_call name="Shell">
+      <parameter name="command">ls</parameter>
+    </tool_call_name>
+    <tool name="ReadFile">
+      <parameters>{"path":"./test.py"}</parameters>
+    </tool>
+</tool_calls>`;
+    const calls = parseToolCallsFromText(text, ALL_TOOLS);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].name, "Shell");
+    assert.equal(calls[1].name, "ReadFile");
+  });
+});

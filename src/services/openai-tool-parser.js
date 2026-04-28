@@ -108,6 +108,36 @@ function toStringSafe(value) {
 }
 
 /**
+ * Look up a tool name in the allowed list using case-insensitive matching.
+ * Returns the original-cased name from allowedToolNames, or null if not found.
+ * This handles cases where the model outputs "Rg" but the allowed list has "rg".
+ */
+function findAllowedName(name, allowedToolNames) {
+  const lower = toStringSafe(name).trim().toLowerCase();
+  if (!lower) return null;
+  return allowedToolNames.find(n => toStringSafe(n).trim().toLowerCase() === lower) ?? null;
+}
+
+/**
+ * Build a case-insensitive lookup Set from allowedToolNames.
+ * Returns { set: Set<string>, lookup: (name: string) => string|null }
+ * where set contains lowercase names for O(1) checks and lookup returns
+ * the original-cased name from the allowed list.
+ */
+function buildAllowedLookup(allowedToolNames) {
+  const map = new Map();
+  for (const n of (allowedToolNames ?? [])) {
+    const trimmed = toStringSafe(n).trim();
+    if (trimmed) map.set(trimmed.toLowerCase(), trimmed);
+  }
+  return {
+    has: (name) => map.has(toStringSafe(name).trim().toLowerCase()),
+    get: (name) => map.get(toStringSafe(name).trim().toLowerCase()) ?? null,
+    size: map.size
+  };
+}
+
+/**
  * Strip null characters (\x00) and other control chars that corrupt XML parsing.
  * Keeps newline, tab, carriage return.
  */
@@ -361,7 +391,7 @@ function findAllTagValuesImpl(text, patterns, skipNameAttr) {
 function findNamedToolBlocks(text, allowedToolNames) {
   if (!allowedToolNames?.length) return [];
 
-  const allowed = new Set(allowedToolNames.map(n => toStringSafe(n).trim()).filter(Boolean));
+  const allowed = buildAllowedLookup(allowedToolNames);
   const source = toStringSafe(text);
   const results = [];
 
@@ -380,12 +410,16 @@ function findNamedToolBlocks(text, allowedToolNames) {
     // Skip argument-carrying tags (parameter, parameters, etc.)
     if (ARGUMENT_CARRYING_TAGS.has(tagName)) continue;
 
-    // Check for name= attribute matching an allowed tool name
+    // Check for name= attribute matching an allowed tool name (case-insensitive)
     const nameMatch = attrs.match(TOOL_ATTR_PATTERN);
     if (!nameMatch) continue;
 
-    const toolName = nameMatch[2]?.trim();
-    if (!toolName || !allowed.has(toolName)) continue;
+    const rawName = nameMatch[2]?.trim();
+    if (!rawName) continue;
+
+    // Case-insensitive lookup — normalize to the allowed list's original casing
+    const toolName = allowed.get(rawName);
+    if (!toolName) continue;
 
     results.push({ name: toolName, body: body.trim(), attrs: attrs.trim() });
   }
@@ -629,12 +663,16 @@ function parseToolCallInner(attrs, inner, allowedToolNames = []) {
   let name = "";
   if (attrName.trim()) {
     name = attrName.trim();
+    // Normalize to allowed list casing if possible (case-insensitive match)
+    const allowedName = findAllowedName(name, allowedToolNames);
+    if (allowedName) name = allowedName;
   } else {
     const allNames = findAllTagValues(inner, TOOL_NAME_PATTERNS);
-    const allowedSet = new Set(allowedToolNames.map(n => toStringSafe(n).trim()).filter(Boolean));
-    if (allowedSet.size > 0) {
-      // Prefer the first name that's in the allowed list
-      name = allNames.find(n => allowedSet.has(n.trim()))?.trim() ?? allNames[0]?.trim() ?? "";
+    const allowedLookup = buildAllowedLookup(allowedToolNames);
+    if (allowedLookup.size > 0) {
+      // Prefer the first name that's in the allowed list (case-insensitive)
+      const matched = allNames.find(n => allowedLookup.has(n.trim()));
+      name = matched ? (allowedLookup.get(matched.trim()) ?? matched.trim()) : (allNames[0]?.trim() ?? "");
     } else {
       name = allNames[0]?.trim() ?? "";
     }
@@ -826,7 +864,7 @@ function closeUnclosedArgTags(text) {
  */
 function inferToolNameFromParams(params, allowedToolNames) {
   if (!params || !allowedToolNames?.length) return null;
-  const allowed = new Set(allowedToolNames.map(n => toStringSafe(n).trim()).filter(Boolean));
+  const allowedLookup = buildAllowedLookup(allowedToolNames);
   const paramNames = new Set(Object.keys(params).map(k => k.toLowerCase()));
 
   // Parameter name → candidate tool names (ordered by specificity)
@@ -844,9 +882,10 @@ function inferToolNameFromParams(params, allowedToolNames) {
   for (const { param, tools } of HINTS) {
     if (paramNames.has(param)) {
       for (const toolName of tools) {
-        if (allowed.has(toolName)) {
-          log.debug("parser", `[inferToolNameFromParams] Param "${param}" → tool "${toolName}"`);
-          return toolName;
+        if (allowedLookup.has(toolName)) {
+          const resolved = allowedLookup.get(toolName);
+          log.debug("parser", `[inferToolNameFromParams] Param "${param}" → tool "${resolved}"`);
+          return resolved;
         }
       }
     }
@@ -944,7 +983,7 @@ function closeUnclosedToolWrapperTags(text) {
 function parseKeyValueToolFormat(text, allowedToolNames = []) {
   if (!allowedToolNames?.length) return [];
 
-  const allowed = new Set(allowedToolNames.map(n => toStringSafe(n).trim()).filter(Boolean));
+  const allowedLookup = buildAllowedLookup(allowedToolNames);
   const source = toStringSafe(text).trim();
 
   // Skip if content looks like XML (starts with <) — not a KV format
@@ -970,8 +1009,8 @@ function parseKeyValueToolFormat(text, allowedToolNames = []) {
       if (colonIdx < 0) {
         // No colon — could be a bare tool name
         const candidate = line.trim();
-        if (allowed.has(candidate) && !toolName) {
-          toolName = candidate;
+        if (allowedLookup.has(candidate) && !toolName) {
+          toolName = allowedLookup.get(candidate);
         }
         continue;
       }
@@ -982,8 +1021,8 @@ function parseKeyValueToolFormat(text, allowedToolNames = []) {
       if (TOOL_NAME_KEYS.has(key)) {
         // This line specifies the tool name
         const candidate = value.trim();
-        if (candidate && !toolName) {
-          toolName = candidate;
+        if (candidate && !toolName && allowedLookup.has(candidate)) {
+          toolName = allowedLookup.get(candidate);
         }
       } else if (key) {
         // This is an argument line
@@ -995,21 +1034,22 @@ function parseKeyValueToolFormat(text, allowedToolNames = []) {
     if (!toolName && lines.length > 0) {
       const firstLine = lines[0].trim();
       // Check if first line is just a tool name (no colon, or the part before colon is not a known key)
-      if (allowed.has(firstLine)) {
-        toolName = firstLine;
+      if (allowedLookup.has(firstLine)) {
+        toolName = allowedLookup.get(firstLine);
       } else {
         // Try the value part of the first line if it looks like "Key: ToolName"
         const colonIdx = firstLine.indexOf(":");
         if (colonIdx >= 0) {
           const possibleName = firstLine.slice(colonIdx + 1).trim();
-          if (allowed.has(possibleName)) {
-            toolName = possibleName;
+          if (allowedLookup.has(possibleName)) {
+            toolName = allowedLookup.get(possibleName);
           }
         }
       }
     }
 
-    if (toolName && allowed.has(toolName)) {
+    if (toolName && allowedLookup.has(toolName)) {
+      toolName = allowedLookup.get(toolName) ?? toolName;
       const argumentsText = Object.keys(args).length > 0 ? JSON.stringify(args) : "{}";
       log.debug("parser", `[parseKeyValueToolFormat] Found tool: name="${toolName}", argumentsText="${argumentsText.slice(0, 100)}"`);
       results.push({ name: toolName, argumentsText });
@@ -1019,9 +1059,10 @@ function parseKeyValueToolFormat(text, allowedToolNames = []) {
   }
 
   // Fallback: if no blocks parsed but the entire content is a single allowed tool name
-  if (!results.length && allowed.has(source)) {
-    log.debug("parser", `[parseKeyValueToolFormat] Entire content is a bare tool name: "${source}"`);
-    results.push({ name: source, argumentsText: "{}" });
+  if (!results.length && allowedLookup.has(source)) {
+    const resolvedName = allowedLookup.get(source);
+    log.debug("parser", `[parseKeyValueToolFormat] Entire content is a bare tool name: "${resolvedName}"`);
+    results.push({ name: resolvedName, argumentsText: "{}" });
   }
 
   return results;
@@ -1113,6 +1154,29 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
     // e.g. <tool name="Shell"><parameters>...</parameters>  ← no </tool>
     flatInner = closeUnclosedToolWrapperTags(flatInner);
 
+    // Pre-process: normalize <tool name="X"> to <tool_call name="X"> inside containers
+    // The model sometimes outputs <tool name="ReadFile"> instead of <tool_call name="ReadFile">.
+    // When there are multiple <tool name="X"> blocks, TOOL_BLOCK_PATTERNS can match
+    // a phantom <tool> without attrs that wraps the named blocks, causing parse failures.
+    // By rewriting to <tool_call name="X">...</tool_call_name>, we avoid this conflict.
+    const beforeToolNormalize = flatInner;
+    flatInner = flatInner.replace(
+      /<tool\s+((?:name|function|tool)\s*=\s*"[^"]+")(?:[^>]*)>/gi,
+      (full, nameAttr) => {
+        return `<tool_call ${nameAttr}>`;
+      }
+    );
+    // Also rewrite the corresponding closing tags: </tool> that close a named <tool> block
+    // → </tool_call_name>. We detect this by counting named <tool> opens and matching closes.
+    if (flatInner !== beforeToolNormalize) {
+      // Each <tool_call name="X"> we just created needs </tool_call_name> instead of </tool>
+      // But we must be careful: only rewrite </tool> tags that correspond to the renamed blocks.
+      // Strategy: rewrite all </tool> to </tool_call_name> since we renamed all named <tool> opens.
+      // Any remaining bare <tool> without attrs would use </tool> which is fine.
+      flatInner = flatInner.replace(/<\/tool\s*>/gi, '</tool_call_name>');
+      log.debug("parser", `[parseContainer] Normalized <tool name="X"> → <tool_call name="X"> inside container`);
+    }
+
     // Strategy A: nested <tool_call name="..."> blocks inside container
     const innerCalls = parseStandaloneSingularBlocks(flatInner, allowedToolNames);
     if (innerCalls.length) {
@@ -1137,13 +1201,15 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
     // Strategy B: <tool_name>+<parameters> flat pairs
     const names = findAllTagValues(flatInner, TOOL_NAME_PATTERNS);
     if (names.length) {
-      // Filter ghost tool names: prefer ones in allowed list
-      const allowedSet = new Set(allowedToolNames.map(n => toStringSafe(n).trim()).filter(Boolean));
+      // Filter ghost tool names: prefer ones in allowed list (case-insensitive)
+      const allowedLookup = buildAllowedLookup(allowedToolNames);
       let effectiveNames = names;
-      if (allowedSet.size > 0 && names.length > 1) {
-        const allowedNames = names.filter(n => allowedSet.has(n.trim()));
+      if (allowedLookup.size > 0 && names.length > 1) {
+        const allowedNames = names.filter(n => allowedLookup.has(n.trim()));
         if (allowedNames.length > 0) effectiveNames = allowedNames;
       }
+      // Normalize names to allowed list casing
+      effectiveNames = effectiveNames.map(n => allowedLookup.get(n.trim()) ?? n);
 
       const namedParams = parseParameterNameAttrs(flatInner);
       if (namedParams && Object.keys(namedParams).length > 0 && effectiveNames.length === 1) {
@@ -1383,8 +1449,8 @@ function parseMarkupToolCalls(text, allowedToolNames = []) {
 function tryParseRawPatchFormat(text, allowedToolNames) {
   if (!allowedToolNames?.length) return null;
 
-  const allowed = new Set(allowedToolNames.map(n => toStringSafe(n).trim()).filter(Boolean));
-  if (!allowed.has("ApplyPatch")) return null;
+  const allowedLookup = buildAllowedLookup(allowedToolNames);
+  if (!allowedLookup.has("ApplyPatch")) return null;
 
   const source = toStringSafe(text).trim();
   if (!source) return null;
@@ -1447,10 +1513,22 @@ function filterAllowedToolCalls(calls, allowedToolNames) {
     return calls;
   }
 
-  const allowed = new Set(allowedToolNames.map((name) => toStringSafe(name).trim()).filter(Boolean));
-  const filtered = calls.filter((call) => allowed.has(call.name));
-  if (filtered.length !== calls.length) {
-    const rejected = calls.filter((call) => !allowed.has(call.name)).map((call) => call.name);
+  const allowedLookup = buildAllowedLookup(allowedToolNames);
+  const filtered = [];
+  const rejected = [];
+
+  for (const call of calls) {
+    // Case-insensitive match — normalize name to allowed list's original casing
+    const allowedName = allowedLookup.get(call.name);
+    if (allowedName) {
+      call.name = allowedName; // Normalize casing
+      filtered.push(call);
+    } else {
+      rejected.push(call.name);
+    }
+  }
+
+  if (rejected.length) {
     log.warn("parser", `Filtered out ${rejected.length} tool call(s) not in allowed list: [${rejected.join(", ")}] (allowed: [${allowedToolNames.join(",")}])`);
   }
   return filtered;
