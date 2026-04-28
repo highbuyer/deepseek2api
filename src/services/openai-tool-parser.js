@@ -1368,6 +1368,80 @@ function parseMarkupToolCalls(text, allowedToolNames = []) {
   return standaloneCalls;
 }
 
+/**
+ * Strategy I: Detect raw diff/patch format in model output.
+ * When the model outputs patch content directly (without XML tool call tags),
+ * detect it and wrap as an ApplyPatch tool call.
+ *
+ * Supported formats:
+ * 1. Claude-style patch: "*** Begin Patch" ... "*** End Patch"
+ * 2. Unified diff: "--- a/file" + "+++ b/file" + "@@ ... @@"
+ * 3. Simple diff markers: lines starting with "-" and "+" in a plausible patch context
+ *
+ * Returns a parsed tool call object if detected, or null otherwise.
+ */
+function tryParseRawPatchFormat(text, allowedToolNames) {
+  if (!allowedToolNames?.length) return null;
+
+  const allowed = new Set(allowedToolNames.map(n => toStringSafe(n).trim()).filter(Boolean));
+  if (!allowed.has("ApplyPatch")) return null;
+
+  const source = toStringSafe(text).trim();
+  if (!source) return null;
+
+  // Pattern 1: Claude-style patch format
+  //   *** Begin Patch
+  //   *** Modify File: src/foo.js
+  //   @@ ... @@
+  //   -old line
+  //   +new line
+  //   *** End Patch
+  if (source.includes("*** Begin Patch") || source.includes("*** Add File") || source.includes("*** Delete File") || source.includes("*** Modify File")) {
+    log.debug("parser", `[tryParseRawPatchFormat] Detected Claude-style patch format (*** Begin/Modify/Add/Delete)`);
+    // The patch content is the entire source — the model outputted it as-is
+    const patchContent = source;
+    const argumentsText = JSON.stringify({ patch: patchContent });
+    return buildParsedToolCall("ApplyPatch", argumentsText);
+  }
+
+  // Pattern 2: Unified diff format
+  //   --- a/file.js
+  //   +++ b/file.js
+  //   @@ -10,5 +10,6 @@
+  //    context line
+  //   -old line
+  //   +new line
+  const hasDiffHeader = /^---\s+[ab]?\//m.test(source) && /^\+\+\+\s+[ab]?\//m.test(source);
+  const hasHunkHeader = /^@@\s+-\d+/m.test(source);
+  if (hasDiffHeader && hasHunkHeader) {
+    log.debug("parser", `[tryParseRawPatchFormat] Detected unified diff format (---/+++ headers + @@ hunks)`);
+    const argumentsText = JSON.stringify({ patch: source });
+    return buildParsedToolCall("ApplyPatch", argumentsText);
+  }
+
+  // Pattern 3: Partial patch content with diff markers
+  // Sometimes the model outputs the patch without proper headers, just
+  // lines with -/+ prefixes in a code-block-like structure, preceded by
+  // text mentioning "patch" or "edit"
+  const hasPatchKeyword = /\b(patch|diff|edit file|modify file|apply patch)\b/i.test(source.slice(0, 500));
+  const lines = source.split("\n");
+  let removedLines = 0;
+  let addedLines = 0;
+  for (const line of lines) {
+    if (/^-[^-]/.test(line)) removedLines++;
+    if (/^\+[^+]/.test(line)) addedLines++;
+  }
+  // Heuristic: if there are both removals and additions, and at least 3 diff lines total,
+  // and the text mentions "patch" or similar, treat it as a patch
+  if (hasPatchKeyword && removedLines >= 1 && addedLines >= 1 && (removedLines + addedLines) >= 3) {
+    log.debug("parser", `[tryParseRawPatchFormat] Detected informal diff format (${removedLines} removals, ${addedLines} additions, patch keyword present)`);
+    const argumentsText = JSON.stringify({ patch: source });
+    return buildParsedToolCall("ApplyPatch", argumentsText);
+  }
+
+  return null;
+}
+
 function filterAllowedToolCalls(calls, allowedToolNames) {
   if (!allowedToolNames?.length) {
     return calls;
@@ -1435,6 +1509,24 @@ export function parseToolCallsFromText(text, allowedToolNames = []) {
     return stripped.match(new RegExp(`<${escaped}\\b`, "i"));
   });
   if (!hasStandardToolTag && !hasToolNameTag) {
+    // Strategy I: Detect raw diff/patch format for ApplyPatch tool.
+    // The model sometimes outputs patch content directly without XML tags:
+    //   *** Begin Patch
+    //   *** Modify File: src/foo.js
+    //   @@ ... @@
+    //   -old line
+    //   +new line
+    //   *** End Patch
+    // Or standard unified diff format:
+    //   --- a/file.js
+    //   +++ b/file.js
+    //   @@ ... @@
+    const patchCall = tryParseRawPatchFormat(fixed, allowedToolNames);
+    if (patchCall) {
+      log.info("parser", `[Strategy I] Detected raw patch format, wrapping as ApplyPatch tool call (${fixed.length} chars)`);
+      return [patchCall];
+    }
+
     log.debug("parser", `No tool XML tags found in output (length=${fixed.length})`);
     return [];
   }

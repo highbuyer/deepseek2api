@@ -7,7 +7,8 @@ const TOOL_CAPTURE_PAIRS = Object.freeze([
   { open: "<tool_call", close: "</tool_call>" },
   { open: "<function_call", close: "</function_call>" },
   { open: "<invoke", close: "</invoke>" },
-  { open: "<tool_use", close: "</tool_use>" }
+  { open: "<tool_use", close: "</tool_use>" },
+  { open: "<apply_patch", close: "</apply_patch>" }
 ]);
 
 function isInsideCodeFence(state, prefix) {
@@ -121,6 +122,8 @@ export function createToolSieve(allowedToolNames = []) {
       capturePairs.push({ open: `<${lower}`, close: `</${lower}>` });
     }
   }
+
+  log.debug("sieve", `[createToolSieve] Capture pairs: [${capturePairs.map(p => p.open).join(", ")}] (from tools: [${(allowedToolNames ?? []).join(", ")}])`);
 
   const state = {
     allowedToolNames,

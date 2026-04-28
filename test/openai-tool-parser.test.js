@@ -621,4 +621,112 @@ describe("Sieve: tool-name-specific capture", () => {
     sieve.flush();
     assert.ok(sieve.emittedText.includes("Hello world"));
   });
+
+  it("detects <apply_patch> tag variant in streaming sieve", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    const events1 = sieve.push("Applying patch:\n");
+    const events2 = sieve.push("<apply_patch>\n");
+    const events3 = sieve.push("<parameters>{\"patch\":\"*** Begin Patch\"}</parameters>\n");
+    const events4 = sieve.push("</apply_patch>");
+    const flushEvents = sieve.flush();
+    
+    const allEvents = [...events1, ...events2, ...events3, ...events4, ...flushEvents];
+    const toolCallEvents = allEvents.filter(e => e.type === "tool_calls");
+    assert.equal(toolCallEvents.length, 1, `Expected 1 tool_call event, got ${toolCallEvents.length}`);
+    assert.equal(toolCallEvents[0].calls[0].name, "ApplyPatch");
+  });
+});
+
+/* ═══════════════════════════════════════════════════
+   Strategy I: Raw diff/patch format detection
+   (For when the model outputs patch content without XML tags)
+   ═══════════════════════════════════════════════════ */
+
+describe("Strategy I: Raw diff/patch format detection", () => {
+  it("detects Claude-style *** Begin Patch format", () => {
+    const text = `I'll apply the patch now:
+
+*** Begin Patch
+*** Modify File: src/foo.js
+@@ -10,5 +10,6 @@
+ context line
+-old line
++new line
++another new line
+*** End Patch`;
+    const call = parseOne(text);
+    assert.equal(call.name, "ApplyPatch");
+    assert.ok(call.input.patch);
+    assert.ok(call.input.patch.includes("*** Begin Patch"));
+  });
+
+  it("detects unified diff format (--- a/ and +++ b/)", () => {
+    const text = `Here is the diff:
+
+--- a/src/foo.js
++++ b/src/foo.js
+@@ -10,5 +10,6 @@
+ context line
+-old line
++new line`;
+    const call = parseOne(text);
+    assert.equal(call.name, "ApplyPatch");
+    assert.ok(call.input.patch.includes("--- a/src/foo.js"));
+  });
+
+  it("detects *** Add File format", () => {
+    const text = `Adding a new file:
+
+*** Add File: src/newfile.js
++const x = 1;
++console.log(x);
+*** End Patch`;
+    const call = parseOne(text);
+    assert.equal(call.name, "ApplyPatch");
+    assert.ok(call.input.patch.includes("*** Add File"));
+  });
+
+  it("detects *** Delete File format", () => {
+    const text = `Deleting the file:
+
+*** Delete File: src/oldfile.js
+*** End Patch`;
+    const call = parseOne(text);
+    assert.equal(call.name, "ApplyPatch");
+  });
+
+  it("detects informal diff with patch keyword", () => {
+    const text = `I'll apply this patch to the file:
+
+-old line
++new line
+-another old line
++another new line
++third new line`;
+    const call = parseOne(text);
+    assert.equal(call.name, "ApplyPatch");
+    assert.ok(call.input.patch.includes("-old line"));
+    assert.ok(call.input.patch.includes("+new line"));
+  });
+
+  it("does not detect diff without patch keyword or structured markers", () => {
+    const text = `Here's what I found:
+- The first issue is performance
+- The second issue is readability
++ We can improve by caching
++ And using better variable names`;
+    // This should NOT be detected as a patch - it's regular text with list items
+    const calls = parseToolCallsFromText(text, ALL_TOOLS);
+    assert.equal(calls.length, 0);
+  });
+
+  it("does not detect patch when ApplyPatch is not in allowed tools", () => {
+    const text = `*** Begin Patch
+*** Modify File: src/foo.js
+-old line
++new line
+*** End Patch`;
+    const calls = parseToolCallsFromText(text, ["Shell", "ReadFile"]);
+    assert.equal(calls.length, 0);
+  });
 });

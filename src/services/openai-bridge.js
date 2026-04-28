@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { collectCompletionContent, streamCompletionContent } from "./openai-completion-runner.js";
 import { assertNoLegacySearchOptions, resolveOpenAiModel } from "./openai-request.js";
 import { createToolSieve, extractToolAwareOutput } from "./openai-tool-sieve.js";
+import { parseToolCallsFromText } from "./openai-tool-parser.js";
 import { buildOpenAiPrompt } from "./openai-tool-prompt.js";
 import { ensureToolChoiceSatisfied, hasChatToolingRequest } from "./openai-tool-policy.js";
 import { createOpenAiError } from "./openai-error.js";
@@ -244,8 +245,32 @@ export async function streamOpenAiResponse(options) {
   ));
 
   if (requestOptions.toolNames.length && !sawToolCall) {
-    const emittedPreview = toolSieve?.emittedText?.slice(0, 500) ?? "(no sieve)";
-    log.warn("bridge", `[stream] No tool calls detected in stream (expected tools: [${requestOptions.toolNames.join(",")}]). Emitted text preview (first 500 chars): "${emittedPreview}"`);
+    const emittedText = toolSieve?.emittedText ?? "";
+    const emittedPreview = emittedText.slice(0, 500) || "(empty)";
+
+    // Fallback: try full-text parsing on the complete emitted text.
+    // The sieve only detects XML-tag-based tool calls during streaming,
+    // but the full parser has additional strategies (tag-name-as-tool-name,
+    // KV format, parameter inference, diff/patch detection, etc.)
+    if (emittedText.length > 0) {
+      log.debug("bridge", `[stream] Fallback: attempting full-text parse on ${emittedText.length} chars of emitted text`);
+      const fallbackCalls = parseToolCallsFromText(emittedText, requestOptions.toolNames);
+      if (fallbackCalls.length) {
+        log.info("bridge", `[stream] Fallback parse succeeded: found ${fallbackCalls.length} tool call(s) that sieve missed`);
+        emitToolCalls(fallbackCalls);
+        // Re-send the finish chunk with correct finish_reason
+        writeSseChunk(response, buildChunkPayload(
+          completionId,
+          requestOptions.model.id,
+          {},
+          "tool_calls"
+        ));
+      } else {
+        log.warn("bridge", `[stream] No tool calls detected in stream (expected tools: [${requestOptions.toolNames.join(",")}]). Emitted text preview (first 500 chars): "${emittedPreview}"`);
+      }
+    } else {
+      log.warn("bridge", `[stream] No tool calls detected in stream and no text emitted (expected tools: [${requestOptions.toolNames.join(",")}])`);
+    }
   } else if (sawToolCall) {
     log.info("bridge", `[stream] Completed with ${toolCallIndex} tool call(s)`);
   }
