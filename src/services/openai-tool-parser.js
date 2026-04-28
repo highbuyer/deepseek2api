@@ -1562,6 +1562,24 @@ export function parseToolCallsFromText(text, allowedToolNames = []) {
     log.debug("parser", `Preprocessed unclosed name attr tags (e.g. <tool_name name="WebSearch</tool_name> → <tool_name>WebSearch</tool_name>)`);
   }
 
+  // Step 1.65: Fix JSON-in-XML malformed tags like <target_directory": "/path"</target_directory>
+  // The model sometimes mixes JSON syntax (key": value) into XML tags, producing:
+  //   <target_directory": "/Users/kaio/workspace"</target_directory>
+  // This rewrites them to proper XML:
+  //   <target_directory>/Users/kaio/workspace</target_directory>
+  // Pattern: <tagname": "value" (optional whitespace/newline) </tagname>
+  const beforeJsonXml = fixed;
+  fixed = fixed.replace(
+    /<([a-z0-9_.-]+)"\s*:\s*"([^"]*?)"\s*<\/\1\s*>/gi,
+    (full, tagName, value) => {
+      log.debug("parser", `[preprocess] Fixed JSON-in-XML tag: <${tagName}": "${value.slice(0, 50)}"</${tagName}> → <${tagName}>${value.slice(0, 50)}</${tagName}>`);
+      return `<${tagName}>${value}</${tagName}>`;
+    }
+  );
+  if (fixed !== beforeJsonXml) {
+    log.debug("parser", `Preprocessed JSON-in-XML malformed tags (e.g. <key": "value"</key> → <key>value</key>)`);
+  }
+
   // Step 1.7: Fix <tool_calls name="Glob"> — treat as tool call wrapper, not container
   // The model sometimes uses the plural container tag with a name= attr as a single tool call.
   // Rewrite <tool_calls name="Glob">...</tool_calls> → <tool_call name="Glob">...</tool_call_name>

@@ -826,6 +826,33 @@ describe("<tool name='X'> inside container normalization", () => {
     assert.equal(call.input.command, "ls -la");
   });
 
+  it("parses Glob with JSON-in-XML malformed params from debug log", () => {
+    const text = `<tool_calls>
+<tool_calls>
+  <tool_call name="Glob">
+    <parameters>
+      <target_directory": "/Users/kaio/Desktop/workspace/tdas-v2/packages/gpu-sim-web"
+    </target_directory>
+</tool_calls>`;
+    const call = parseOne(text);
+    assert.equal(call.name, "Glob");
+    assert.equal(call.input.target_directory, "/Users/kaio/Desktop/workspace/tdas-v2/packages/gpu-sim-web");
+  });
+
+  it("parses multiple JSON-in-XML malformed params", () => {
+    const text = `<tool_calls>
+<tool_name>Shell</tool_name>
+<parameters>
+  <command": "ls -la"</command>
+  <description": "List files"</description>
+</parameters>
+</tool_calls>`;
+    const call = parseOne(text);
+    assert.equal(call.name, "Shell");
+    assert.equal(call.input.command, "ls -la");
+    assert.equal(call.input.description, "List files");
+  });
+
   it("parses mixed <tool_call name='X'> and <tool name='Y'> inside container", () => {
     const text = `<tool_calls>
     <tool_call name="Shell">
