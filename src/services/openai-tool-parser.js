@@ -32,11 +32,16 @@ const PARAMETER_NAME_ATTR_PATTERN = /<(?:[a-z0-9_:-]+:)?parameter\b[^>]*\bname\s
 /* ── Known structural tag names (not tool names) ── */
 const KNOWN_STRUCTURAL_TAGS = new Set([
   "tool_calls", "tool_call", "function_calls", "function_call", "invoke", "tool_use",
-  "tool_name", "function_name", "name", "function",
+  "tool_name", "function_name", "name", "function", "tool",
   "parameters", "parameter", "input", "arguments", "argument", "args", "params",
   "command", "query", "body", "data", "result", "response", "content", "value",
   "description", "type", "key", "url", "path", "file", "text", "message",
   "output", "error", "code", "script", "shell", "timeout", "limit"
+]);
+
+/* ── Argument-carrying tag names (skip in named-block scanning) ── */
+const ARGUMENT_CARRYING_TAGS = new Set([
+  "parameter", "parameters", "argument", "arguments", "input", "args", "params"
 ]);
 
 const TOOL_ATTR_PATTERN = /(name|function|tool)\s*=\s*"([^"]+)"/i;
@@ -147,6 +152,50 @@ function findAllTagValues(text, patterns) {
       }
     }
     if (results.length) break;
+  }
+
+  return results;
+}
+
+/**
+ * Find sub-blocks inside a container that have a name= attribute matching
+ * an allowed tool name. Handles formats like:
+ *   <tool name="Shell"><parameter name="command">...</parameter></tool>
+ *   <tool_name name="TodoWrite"><parameters>...</parameters></tool_name>
+ *   <call name="Glob"><arguments>...</arguments></call>
+ *
+ * Returns { name, body, attrs } objects for each matched block.
+ */
+function findNamedToolBlocks(text, allowedToolNames) {
+  if (!allowedToolNames?.length) return [];
+
+  const allowed = new Set(allowedToolNames.map(n => toStringSafe(n).trim()).filter(Boolean));
+  const source = toStringSafe(text);
+  const results = [];
+
+  // Match any tag with attributes that include name="ToolName"
+  // Backreference \1 ensures opening/closing tag names match
+  const anyNamedBlock = /<([a-z0-9_:-]+)\b([^>]*)>([\s\S]*?)<\/\1\s*>/gi;
+
+  for (const match of source.matchAll(anyNamedBlock)) {
+    const tagName = match[1].toLowerCase();
+    const attrs = match[2];
+    const body = match[3];
+
+    // Skip container tags themselves
+    if (["tool_calls", "function_calls"].includes(tagName)) continue;
+
+    // Skip argument-carrying tags (parameter, parameters, etc.)
+    if (ARGUMENT_CARRYING_TAGS.has(tagName)) continue;
+
+    // Check for name= attribute matching an allowed tool name
+    const nameMatch = attrs.match(TOOL_ATTR_PATTERN);
+    if (!nameMatch) continue;
+
+    const toolName = nameMatch[2]?.trim();
+    if (!toolName || !allowed.has(toolName)) continue;
+
+    results.push({ name: toolName, body: body.trim(), attrs: attrs.trim() });
   }
 
   return results;
@@ -385,6 +434,7 @@ function parseStandaloneSingularBlocks(text, allowedToolNames = []) {
   const output = [];
   const source = toStringSafe(text).trim();
 
+  // 1. Try <tool_call name="..."> / <invoke name="..."> blocks
   for (const match of source.matchAll(TOOL_BLOCK_PATTERN)) {
     const parsed = parseToolCallInner(toStringSafe(match[2]).trim(), toStringSafe(match[3]).trim(), allowedToolNames);
     if (parsed) {
@@ -392,10 +442,20 @@ function parseStandaloneSingularBlocks(text, allowedToolNames = []) {
     }
   }
 
+  // 2. Try self-closing <invoke name="..." /> blocks
   for (const match of source.matchAll(TOOL_SELFCLOSE_PATTERN)) {
     const parsed = parseToolCallInner(toStringSafe(match[1]).trim(), "", allowedToolNames);
     if (parsed) {
       output.push(parsed);
+    }
+  }
+
+  // 3. Try <tool name="..."> / <tool_name name="..."> blocks (generic named tags)
+  //    Only if no standard blocks found, to avoid double-parsing
+  if (!output.length) {
+    for (const { name, body } of findNamedToolBlocks(source, allowedToolNames)) {
+      const argumentsText = parseToolCallArguments(body);
+      output.push(buildParsedToolCall(name, argumentsText));
     }
   }
 
@@ -422,6 +482,19 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
     if (innerCalls.length) {
       log.debug("parser", `[parseContainer] Strategy A: found ${innerCalls.length} nested <tool_call/invoke> block(s)`);
       output.push(...innerCalls);
+      continue;
+    }
+
+    // Strategy A2: <tool name="Shell"> or <tool_name name="TodoWrite"> blocks
+    // Any tag with name= attribute matching an allowed tool name
+    const namedBlocks = findNamedToolBlocks(inner, allowedToolNames);
+    if (namedBlocks.length) {
+      log.debug("parser", `[parseContainer] Strategy A2: found ${namedBlocks.length} named block(s): [${namedBlocks.map(b => b.name).join(", ")}]`);
+      for (const { name, body } of namedBlocks) {
+        const argumentsText = parseToolCallArguments(body);
+        log.debug("parser", `[parseContainer] Strategy A2: name="${name}", argumentsText="${argumentsText.slice(0, 100)}"`);
+        output.push(buildParsedToolCall(name, argumentsText));
+      }
       continue;
     }
 
@@ -539,8 +612,9 @@ export function parseToolCallsFromText(text, allowedToolNames = []) {
   }
 
   // Step 2: Quick check for any tool-related XML tags
+  // Also matches <tool name="...">, <tool_name name="...">, <function name="...">
   const stripped = stripFencedCodeBlocks(source);
-  if (!stripped.match(/<(tool_calls|tool_call|function_calls|function_call|invoke|tool_use)\b/i)) {
+  if (!stripped.match(/<(?:tool_calls|tool_call|tool_name|tool|function_calls|function_call|function_name|function|invoke|tool_use)\b/i)) {
     log.debug("parser", `No tool XML tags found in output (length=${source.length})`);
     return [];
   }
