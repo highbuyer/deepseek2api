@@ -10,9 +10,11 @@ const TOOL_SELFCLOSE_PATTERN = /<(?:[a-z0-9_:-]+:)?invoke\b([^>]*)\/>/gi;
 const TOOL_CALLS_CONTAINER_PATTERN = /<(?:[a-z0-9_:-]+:)?(tool_calls|function_calls)\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1\s*>/gi;
 
 /* ── Sub-element patterns ── */
+/* Opening tag uses fuzzy match (e.g. tool[a-z0-9_]*name) to handle garbled tags
+ *   like <tool_cool_name>ReadFile</tool_name> — the closing tag is the anchor */
 const TOOL_NAME_PATTERNS = Object.freeze([
-  /<(?:[a-z0-9_:-]+:)?tool_name\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?tool_name>/i,
-  /<(?:[a-z0-9_:-]+:)?function_name\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?function_name>/i,
+  /<(?:[a-z0-9_:-]+:)?tool[a-z0-9_]*name\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?tool_name>/i,
+  /<(?:[a-z0-9_:-]+:)?function[a-z0-9_]*name\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?function_name>/i,
   /<(?:[a-z0-9_:-]+:)?name\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?name>/i,
   /<(?:[a-z0-9_:-]+:)?function\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?function>/i
 ]);
@@ -657,79 +659,6 @@ function closeUnclosedArgTags(text) {
 }
 
 /**
- * Fix garbled/mistyped tag names by looking at the closing tag.
- * When the model outputs something like <tool_cool_name>ReadFile</tool_name>,
- * the closing tag reveals the intended tag name. This fixes the opening tag
- * to match, enabling downstream patterns to match correctly.
- *
- * Also normalizes garbled wrapper tags like <tool_coll>...</tool_coll> to
- * standard tags like <tool_call_name>...</tool_call_name>.
- */
-function fixGarbledTagNames(text) {
-  let result = toStringSafe(text);
-
-  // Fix 1: Mismatched open/close pairs where the closing tag is a recognized
-  // name-indicator tag. E.g. <tool_cool_name>ReadFile</tool_name> → <tool_name>ReadFile</tool_name>
-  // BUT: only fix if the content between the tags does NOT contain other XML tags,
-  // because if it does, the garbled tag is a WRAPPER (not a name tag).
-  // E.g. <tool_cool_name>ReadFile</tool_name> is fine to fix (ReadFile is just text)
-  // But <tool_cool_name><parameters>...</parameters></tool_name> is a wrapper — don't fix
-  const nameTags = ["tool_name", "function_name", "name", "function"];
-  for (const correctTag of nameTags) {
-    // Match any opening tag (that's NOT the correct tag) followed by content and </correctTag>
-    const mismatchedRe = new RegExp(
-      `<([a-z0-9_:-]+)(\\b[^>]*)>([\\s\\S]*?)<\\/(?:[a-z0-9_:-]+:)?${correctTag}\\s*>`,
-      "gi"
-    );
-    result = result.replace(mismatchedRe, (full, openName, attrs, content) => {
-      if (openName.toLowerCase() === correctTag.toLowerCase()) return full; // Already correct
-      // Only fix if the garbled tag looks like it was meant to be this tag
-      // (starts with "tool" or "function" and is similar)
-      const lower = openName.toLowerCase();
-      if (!lower.startsWith("tool") && !lower.startsWith("function")) return full;
-      // Don't fix if content contains XML tags — this is a wrapper, not a name tag
-      if (content.includes("<")) return full;
-      log.debug("parser", `[fixGarbledTagNames] Fixed garbled opening tag <${openName}> → <${correctTag}> (closing tag was </${correctTag}>)`);
-      return `<${correctTag}${attrs}>${content}</${correctTag}>`;
-    });
-  }
-
-  // Fix 2: Normalize garbled wrapper tags (both opening and closing are garbled)
-  // E.g. <tool_coll>...</tool_coll> → <tool_call_name>...</tool_call_name>
-  // These are tags starting with "tool_" or "function_" that aren't recognized
-  const allKnownTags = new Set([
-    ...KNOWN_STRUCTURAL_TAGS,
-    "tool_call_name", "function_call_name"
-  ]);
-
-  // Match tag names starting with tool_ or function_ that aren't recognized
-  const garbledTagRe = /<(\/?)([a-z0-9_:-]+)((?:\s[^>]*)?)>/gi;
-  result = result.replace(garbledTagRe, (full, isClose, tagName, attrs) => {
-    const lower = tagName.toLowerCase();
-    if (allKnownTags.has(lower)) return full; // Known tag, leave as-is
-
-    // Only normalize tags that look like garbled tool/function tags
-    if (!lower.startsWith("tool_") && !lower.startsWith("function_")) return full;
-
-    // Determine the most likely intended tag based on what it contains
-    let replacement;
-    if (lower.includes("name")) {
-      replacement = lower.startsWith("function_") ? "function_name" : "tool_name";
-    } else if (lower.includes("call")) {
-      replacement = lower.startsWith("function_") ? "function_call" : "tool_call";
-    } else {
-      // Default: treat as tool_call_name (the most common wrapper format)
-      replacement = lower.startsWith("function_") ? "function_call_name" : "tool_call_name";
-    }
-
-    log.debug("parser", `[fixGarbledTagNames] Normalized garbled tag <${isClose ? "/" : ""}${tagName}> → <${isClose ? "/" : ""}${replacement}>`);
-    return `<${isClose}${replacement}${attrs}>`;
-  });
-
-  return result;
-}
-
-/**
  * Close unclosed tool wrapper tags like <tool>, <tool_call, <function_call, <invoke>.
  * When the model omits the closing tag (stream truncation, etc.), this appends
  * synthetic closing tags so that TOOL_BLOCK_PATTERN and findNamedToolBlocks can match.
@@ -758,51 +687,6 @@ function closeUnclosedToolWrapperTags(text) {
   }
 
   return result;
-}
-
-/**
- * Extract tool names from the text content of garbled/unknown tags.
- * When the model outputs garbled tag names like <tool_cool_name>ReadFile</tool_name>,
- * the tool name "ReadFile" is sitting as plain text inside a tag pair.
- * This function scans for ANY tag pair (even with mismatched names) whose text content
- * is an allowed tool name, then extracts arguments from the remaining content.
- *
- * Returns array of parsed tool call objects.
- */
-function extractToolNamesFromGarbledTags(text, allowedToolNames) {
-  if (!allowedToolNames?.length) return [];
-
-  const allowed = new Set(allowedToolNames.map(n => toStringSafe(n).trim()).filter(Boolean));
-  const source = toStringSafe(text);
-  const results = [];
-
-  // Match any opening tag followed by simple text content and any closing tag
-  // Opening and closing tag names CAN differ (garbled tags)
-  const anyTagPair = /<([a-z0-9_:-]+)\b[^>]*>([^<]*)<\/([a-z0-9_:-]+)\s*>/gi;
-
-  for (const match of source.matchAll(anyTagPair)) {
-    const openTag = match[1].toLowerCase();
-    const content = decodeXmlText(match[2]).trim();
-    const closeTag = match[3].toLowerCase();
-
-    // Skip if content is not a plain allowed tool name
-    if (!content || !allowed.has(content)) continue;
-
-    // Skip if this is already a recognized structural tag (would be handled by other strategies)
-    if (KNOWN_STRUCTURAL_TAGS.has(openTag) && KNOWN_STRUCTURAL_TAGS.has(closeTag)) continue;
-
-    // Found a garbled tag containing an allowed tool name!
-    const toolName = content;
-    log.debug("parser", `[extractToolNamesFromGarbledTags] Found tool name "${toolName}" inside garbled tag <${match[1]}>...</${match[3]}>`);
-
-    // Extract arguments from the rest of the content (excluding the matched tag)
-    const remainingContent = source.replace(match[0], "");
-    const argumentsText = parseToolCallArguments(remainingContent);
-
-    results.push(buildParsedToolCall(toolName, argumentsText));
-  }
-
-  return results;
 }
 
 /**
@@ -985,9 +869,6 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
     // Pre-process: strip duplicate container tags (model glitch: <tool_calls> repeated 200+ times)
     flatInner = stripDuplicateContainerTags(flatInner);
 
-    // Pre-process: fix garbled tag names (e.g. <tool_cool_name> → <tool_name>)
-    flatInner = fixGarbledTagNames(flatInner);
-
     // Pre-process: close unclosed argument tags (model forgot </parameters>)
     flatInner = closeUnclosedArgTags(flatInner);
 
@@ -1102,18 +983,6 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
     if (kvToolCalls.length) {
       log.debug("parser", `[parseContainer] Strategy F: found ${kvToolCalls.length} key-value tool call(s): [${kvToolCalls.map(c => c.name).join(", ")}]`);
       output.push(...kvToolCalls);
-      continue;
-    }
-
-    // Strategy G: Extract tool name from text content of garbled/unknown tags
-    // When the model outputs garbled tag names like <tool_cool_name>ReadFile</tool_name>,
-    // the tool name "ReadFile" is sitting as plain text inside a tag pair.
-    // This strategy scans for ANY tag pair whose text content is an allowed tool name,
-    // then extracts arguments from nearby <parameters> or <parameter name=> tags.
-    const garbledResults = extractToolNamesFromGarbledTags(flatInner, allowedToolNames);
-    if (garbledResults.length) {
-      log.debug("parser", `[parseContainer] Strategy G: found ${garbledResults.length} garbled-tag tool call(s): [${garbledResults.map(c => c.name).join(", ")}]`);
-      output.push(...garbledResults);
       continue;
     }
 
@@ -1258,13 +1127,6 @@ export function parseToolCallsFromText(text, allowedToolNames = []) {
   let fixed = source.replace(MALFORMED_ATTR_EQUALS, '<$1 name="$2">');
   if (fixed !== source) {
     log.debug("parser", `Preprocessed malformed tags (e.g. <tool_name="..."> → <tool_name name="...">)`);
-  }
-
-  // Step 1.6: Fix garbled tag names (e.g. <tool_cool_name> → <tool_name>)
-  const beforeGarbled = fixed;
-  fixed = fixGarbledTagNames(fixed);
-  if (fixed !== beforeGarbled) {
-    log.debug("parser", `Preprocessed garbled tag names`);
   }
 
   // Step 2: Quick check for any tool-related XML tags
