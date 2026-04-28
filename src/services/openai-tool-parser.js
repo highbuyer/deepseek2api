@@ -3,7 +3,14 @@ import { log } from "../utils/log.js";
 
 /* ── Single tool-call block patterns ── */
 /* Includes <tool> to handle models that output <tool name="Shell">...</tool> */
-const TOOL_BLOCK_PATTERN = /<(?:[a-z0-9_:-]+:)?(tool_call|function_call|invoke|tool)\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1\s*>/gi;
+/* Two patterns needed because DeepSeek sometimes closes <tool_call ...> with </tool_call_name>
+ * (backreference \1 can't express "tool_call" OR "tool_call_name" as valid close) */
+const TOOL_BLOCK_PATTERNS = Object.freeze([
+  // <tool_call ...>...</tool_call_name> (most common: name-indicator close)
+  /<(?:[a-z0-9_:-]+:)?(tool_call|function_call|invoke|tool)\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1_name\s*>/gi,
+  // <tool_call ...>...</tool_call_name> (same tag match, backreference)
+  /<(?:[a-z0-9_:-]+:)?(tool_call|function_call|invoke|tool)\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1\s*>/gi,
+]);
 const TOOL_SELFCLOSE_PATTERN = /<(?:[a-z0-9_:-]+:)?invoke\b([^>]*)\/>/gi;
 
 /* ── Container patterns: <tool_calls>...</tool_calls> (plural) ── */
@@ -50,7 +57,7 @@ const PARAMETER_NAME_ATTR_PATTERN = /<(?:[a-z0-9_:-]+:)?param(?:eter)?\b[^>]*\bn
 
 /* ── Known structural tag names (not tool names) ── */
 /* NOTE: "tool" is NOT here because <tool name="Shell"> is a valid tool call wrapper.
-   It's handled directly by TOOL_BLOCK_PATTERN and findNamedToolBlocks instead. */
+   It's handled directly by TOOL_BLOCK_PATTERNS and findNamedToolBlocks instead. */
 const KNOWN_STRUCTURAL_TAGS = new Set([
   "tool_calls", "tool_call", "function_calls", "function_call", "invoke", "tool_use",
   "tool_name", "function_name", "name", "function",
@@ -576,11 +583,15 @@ function parseStandaloneSingularBlocks(text, allowedToolNames = []) {
   const source = toStringSafe(text).trim();
 
   // 1. Try <tool_call name="..."> / <invoke name="..."> blocks
-  for (const match of source.matchAll(TOOL_BLOCK_PATTERN)) {
-    const parsed = parseToolCallInner(toStringSafe(match[2]).trim(), toStringSafe(match[3]).trim(), allowedToolNames);
-    if (parsed) {
-      output.push(parsed);
+  //    Try both _name close and exact-match close patterns
+  for (const pattern of TOOL_BLOCK_PATTERNS) {
+    for (const match of source.matchAll(pattern)) {
+      const parsed = parseToolCallInner(toStringSafe(match[2]).trim(), toStringSafe(match[3]).trim(), allowedToolNames);
+      if (parsed) {
+        output.push(parsed);
+      }
     }
+    if (output.length) break; // Found matches, no need to try next pattern
   }
 
   // 2. Try self-closing <invoke name="..." /> blocks
@@ -674,9 +685,82 @@ function closeUnclosedArgTags(text) {
 }
 
 /**
+ * Infer tool name from parameter names when the model omits the tool name.
+ * Uses a simple heuristic: certain parameter names are strong indicators
+ * of specific tools (e.g. "command" → Shell, "path" → ReadFile).
+ * Only returns a name if it's in the allowed list.
+ */
+function inferToolNameFromParams(params, allowedToolNames) {
+  if (!params || !allowedToolNames?.length) return null;
+  const allowed = new Set(allowedToolNames.map(n => toStringSafe(n).trim()).filter(Boolean));
+  const paramNames = new Set(Object.keys(params).map(k => k.toLowerCase()));
+
+  // Parameter name → candidate tool names (ordered by specificity)
+  const HINTS = [
+    { param: "command", tools: ["Shell", "Bash"] },
+    { param: "pattern", tools: ["Glob"] },
+    { param: "path", tools: ["ReadFile", "Read"] },
+    { param: "query", tools: ["WebSearch"] },
+    { param: "url", tools: ["WebFetch"] },
+    { param: "glob_pattern", tools: ["Glob"] },
+    { param: "glob", tools: ["Glob"] },
+  ];
+
+  for (const { param, tools } of HINTS) {
+    if (paramNames.has(param)) {
+      for (const toolName of tools) {
+        if (allowed.has(toolName)) {
+          log.debug("parser", `[inferToolNameFromParams] Param "${param}" → tool "${toolName}"`);
+          return toolName;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Fix mismatched wrapper closing tags.
+ * DeepSeek sometimes closes <tool_call ...> with </tool_calls> instead of </tool_call_name>.
+ * E.g. <tool_call name="Shell">...</tool_calls> → <tool_call name="Shell">...</tool_call_name>
+ *
+ * Also handles the inverse: <tool_calls>...</tool_call_name> (rare but possible).
+ *
+ * Only fixes when the closing tag is clearly wrong — i.e. the open tag has name= attr
+ * (proving it's a tool_call, not a container) but the close uses the plural form.
+ */
+function fixMismatchedWrapperClosings(text) {
+  let result = toStringSafe(text);
+
+  // Fix: <tool_call name="...">...</tool_calls> → </tool_call_name>
+  // Match <tool_call ...>content</tool_calls> where content does NOT contain </tool_call_name>
+  result = result.replace(
+    /<(?:[a-z0-9_:-]+:)?tool_call\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?tool_calls\s*>/gi,
+    (full, attrs, content) => {
+      if (content.includes("</tool_call")) return full; // Already has proper close inside
+      log.debug("parser", `[fixMismatchedWrapperClosings] Fixed </tool_calls> → </tool_call_name>`);
+      return `<tool_call${attrs}>${content}</tool_call_name>`;
+    }
+  );
+
+  // Same for function_call / function_calls
+  result = result.replace(
+    /<(?:[a-z0-9_:-]+:)?function_call\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?function_calls\s*>/gi,
+    (full, attrs, content) => {
+      if (content.includes("</function_call")) return full;
+      log.debug("parser", `[fixMismatchedWrapperClosings] Fixed </function_calls> → </function_call_name>`);
+      return `<function_call${attrs}>${content}</function_call_name>`;
+    }
+  );
+
+  return result;
+}
+
+/**
  * Close unclosed tool wrapper tags like <tool>, <tool_call, <function_call, <invoke>.
  * When the model omits the closing tag (stream truncation, etc.), this appends
- * synthetic closing tags so that TOOL_BLOCK_PATTERN and findNamedToolBlocks can match.
+ * synthetic closing tags so that TOOL_BLOCK_PATTERNS and findNamedToolBlocks can match.
  * Only closes tags that are genuinely unclosed (more opens than closes).
  */
 function closeUnclosedToolWrapperTags(text) {
@@ -884,6 +968,9 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
     // Pre-process: strip duplicate container tags (model glitch: <tool_calls> repeated 200+ times)
     flatInner = stripDuplicateContainerTags(flatInner);
 
+    // Pre-process: fix mismatched wrapper closings (e.g. <tool_call ...>...</tool_calls>)
+    flatInner = fixMismatchedWrapperClosings(flatInner);
+
     // Pre-process: close unclosed argument tags (model forgot </parameters>)
     flatInner = closeUnclosedArgTags(flatInner);
 
@@ -1001,6 +1088,20 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
       continue;
     }
 
+    // Strategy H: Infer tool name from parameter names
+    // When the model forgets the tool name entirely but still outputs <parameter name="command">,
+    // we can guess: command→Shell, path→ReadFile, pattern→Glob, etc.
+    const namedParams = parseParameterNameAttrs(flatInner);
+    if (namedParams && Object.keys(namedParams).length > 0) {
+      const inferredToolName = inferToolNameFromParams(namedParams, allowedToolNames);
+      if (inferredToolName) {
+        const argumentsText = JSON.stringify(namedParams);
+        log.debug("parser", `[parseContainer] Strategy H: inferred tool name="${inferredToolName}" from params [${Object.keys(namedParams).join(",")}], argumentsText="${argumentsText.slice(0, 100)}"`);
+        output.push(buildParsedToolCall(inferredToolName, argumentsText));
+        continue;
+      }
+    }
+
     log.warn("parser", `[parseContainer] <${containerTag}> container found but no tool calls could be extracted. FlatInner (first 300): "${flatInner.slice(0, 300)}"`);
   }
 
@@ -1105,7 +1206,10 @@ function parseMarkupToolCalls(text, allowedToolNames = []) {
     }
   }
 
-  const standaloneCalls = parseStandaloneSingularBlocks(source, allowedToolNames);
+  // Pre-process: fix mismatched wrapper closings (e.g. <tool_call ...>...</tool_calls>)
+  const preprocessed = fixMismatchedWrapperClosings(source);
+
+  const standaloneCalls = parseStandaloneSingularBlocks(preprocessed, allowedToolNames);
   log.debug("parser", `[parseMarkupToolCalls] Standalone mode: found ${standaloneCalls.length} call(s)`);
   return standaloneCalls;
 }
