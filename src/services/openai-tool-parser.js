@@ -757,6 +757,56 @@ function parseKeyValueToolFormat(text, allowedToolNames = []) {
 }
 
 /**
+ * Strip repeated/duplicate container opening tags from content.
+ * When the model glitches, it may output dozens or hundreds of repeated
+ * <tool_calls> tags: <tool_calls>\n<tool_calls>\n<tool_calls>...
+ * This strips all leading duplicate container open tags, keeping only
+ * the actual content after them. Also strips trailing duplicate close tags.
+ *
+ * Returns the cleaned content.
+ */
+function stripDuplicateContainerTags(text) {
+  let result = toStringSafe(text).trim();
+  const originalLength = result.length;
+
+  // Strip leading repeated container open tags (with optional whitespace/newlines between)
+  // E.g. "<tool_calls>\n<tool_calls>\n<tool_calls>\n<tool_name>..." → "<tool_name>..."
+  const containerOpenRe = /^<(?:[a-z0-9_:-]+:)?(?:tool_calls|function_calls)\b[^>]*>\s*/i;
+  let stripped = 0;
+  while (containerOpenRe.test(result)) {
+    const next = result.replace(containerOpenRe, "");
+    if (next === result) break; // No change, stop
+    // Check that what remains is NOT just more container tags or empty
+    const remaining = next.trim();
+    if (!remaining) break; // Don't strip if nothing left
+    // Check if remaining is just closing tags (would leave nothing useful)
+    if (/^<\/(?:[a-z0-9_:-]+:)?(?:tool_calls|function_calls)\s*>\s*$/i.test(remaining)) break;
+    result = next;
+    stripped++;
+    if (stripped > 50) break; // Safety limit
+  }
+
+  // Strip trailing repeated container close tags
+  const containerCloseRe = /\s*<\/(?:[a-z0-9_:-]+:)?(?:tool_calls|function_calls)\s*>$/i;
+  let closeStripped = 0;
+  while (containerCloseRe.test(result)) {
+    const next = result.replace(containerCloseRe, "");
+    if (next === result) break;
+    const remaining = next.trim();
+    if (!remaining) break;
+    result = next;
+    closeStripped++;
+    if (closeStripped > 50) break;
+  }
+
+  if (stripped > 1 || closeStripped > 1) {
+    log.debug("parser", `[stripDuplicateContainerTags] Stripped ${stripped} duplicate open tag(s) and ${closeStripped} duplicate close tag(s), length ${originalLength} → ${result.length}`);
+  }
+
+  return result.trim();
+}
+
+/**
  * Parse <tool_calls> container format.
  * Now handles all known formats including "tag-name-as-tool-name".
  */
@@ -778,6 +828,9 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
       flatInner = nestedContainer[2].trim();
       log.debug("parser", `[parseContainer] Flattened nested <${nestedContainer[1]}> container, new inner length=${flatInner.length}`);
     }
+
+    // Pre-process: strip duplicate container tags (model glitch: <tool_calls> repeated 200+ times)
+    flatInner = stripDuplicateContainerTags(flatInner);
 
     // Pre-process: close unclosed argument tags (model forgot </parameters>)
     flatInner = closeUnclosedArgTags(flatInner);
@@ -913,6 +966,87 @@ function parseMarkupToolCalls(text, allowedToolNames = []) {
     const containerCalls = parseContainerToolBlocks(source, allowedToolNames);
     log.debug("parser", `[parseMarkupToolCalls] Container mode: found ${containerCalls.length} call(s)`);
     return containerCalls;
+  }
+
+  // Fallback: check for unclosed container tags (model glitch — repeated <tool_calls> without closing)
+  // If there are <tool_calls> opening tags but no closing tags, strip the duplicates and try parsing
+  const containerOpenRe = /<(?:[a-z0-9_:-]+:)?(?:tool_calls|function_calls)\b[^>]*>/gi;
+  const containerCloseRe = /<\/(?:[a-z0-9_:-]+:)?(?:tool_calls|function_calls)\s*>/gi;
+  const openCount = (source.match(containerOpenRe) || []).length;
+  const closeCount = (source.match(containerCloseRe) || []).length;
+
+  if (openCount > 0 && closeCount === 0) {
+    // Has opening container tags but no closing tags — strip duplicates and try to parse inner content
+    const stripped = stripDuplicateContainerTags(source);
+    if (stripped.length > 0 && stripped.length < source.length) {
+      log.debug("parser", `[parseMarkupToolCalls] Detected ${openCount} unclosed <tool_calls> tag(s), stripped to ${stripped.length} chars, attempting parse`);
+
+      // Try Strategy B: <tool_name>+<parameters> flat pairs (most common format inside containers)
+      const names = findAllTagValues(stripped, TOOL_NAME_PATTERNS);
+      if (names.length) {
+        const namedParams = parseParameterNameAttrs(stripped);
+        if (namedParams && Object.keys(namedParams).length > 0 && names.length === 1) {
+          const toolName = names[0].trim();
+          const argumentsText = JSON.stringify(namedParams);
+          log.debug("parser", `[parseMarkupToolCalls] Unclosed container fallback (Strategy B named params): name="${toolName}", args="${argumentsText.slice(0, 100)}"`);
+          return [buildParsedToolCall(toolName, argumentsText)];
+        }
+
+        const args = findAllTagValues(stripped, TOOL_ARGS_PATTERNS);
+        if (args.length || names.length) {
+          const results = [];
+          for (let i = 0; i < names.length; i++) {
+            const toolName = names[i].trim();
+            const toolArgs = i < args.length ? args[i].trim() : "{}";
+            if (!toolName) continue;
+
+            let parsedArgs;
+            const jsonArgs = parseJsonObject(toolArgs);
+            if (jsonArgs) {
+              parsedArgs = JSON.stringify(jsonArgs);
+            } else {
+              const markupArgs = parseMarkupInput(toolArgs);
+              if (markupArgs && Object.keys(markupArgs).length > 0) {
+                parsedArgs = JSON.stringify(markupArgs);
+              } else {
+                parsedArgs = toolArgs;
+              }
+            }
+            results.push(buildParsedToolCall(toolName, parsedArgs));
+          }
+          if (results.length) {
+            log.debug("parser", `[parseMarkupToolCalls] Unclosed container fallback (Strategy B): found ${results.length} call(s)`);
+            return results;
+          }
+        }
+      }
+
+      // Try parsing the stripped content as standalone blocks
+      const innerCalls = parseStandaloneSingularBlocks(stripped, allowedToolNames);
+      if (innerCalls.length) {
+        log.debug("parser", `[parseMarkupToolCalls] Unclosed container fallback: found ${innerCalls.length} call(s)`);
+        return innerCalls;
+      }
+
+      // Try other strategies on the stripped content
+      const namedBlocks = findNamedToolBlocks(stripped, allowedToolNames);
+      if (namedBlocks.length) {
+        log.debug("parser", `[parseMarkupToolCalls] Unclosed container fallback (named blocks): found ${namedBlocks.length} call(s)`);
+        return namedBlocks.map(({ name, body }) => {
+          const argumentsText = parseToolCallArguments(body);
+          return buildParsedToolCall(name, argumentsText);
+        });
+      }
+
+      const toolNameTags = findToolNameTags(stripped, allowedToolNames);
+      if (toolNameTags.length) {
+        log.debug("parser", `[parseMarkupToolCalls] Unclosed container fallback (tag-name): found ${toolNameTags.length} call(s)`);
+        return toolNameTags.map(({ name, body }) => {
+          const argumentsText = parseToolCallArguments(body);
+          return buildParsedToolCall(name, argumentsText);
+        });
+      }
+    }
   }
 
   const standaloneCalls = parseStandaloneSingularBlocks(source, allowedToolNames);
