@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { log } from "../utils/log.js";
 
 /* ── Single tool-call block patterns ── */
-const TOOL_BLOCK_PATTERN = /<(?:[a-z0-9_:-]+:)?(tool_call|function_call|invoke)\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1\s*>/gi;
+/* Includes <tool> to handle models that output <tool name="Shell">...</tool> */
+const TOOL_BLOCK_PATTERN = /<(?:[a-z0-9_:-]+:)?(tool_call|function_call|invoke|tool)\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1\s*>/gi;
 const TOOL_SELFCLOSE_PATTERN = /<(?:[a-z0-9_:-]+:)?invoke\b([^>]*)\/>/gi;
 
 /* ── Container patterns: <tool_calls>...</tool_calls> (plural) ── */
@@ -31,9 +32,11 @@ const TOOL_ARGS_PATTERNS = Object.freeze([
 const PARAMETER_NAME_ATTR_PATTERN = /<(?:[a-z0-9_:-]+:)?param(?:eter)?\b[^>]*\bname\s*=\s*"([^"]+)"[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?param(?:eter)?\s*>/gi;
 
 /* ── Known structural tag names (not tool names) ── */
+/* NOTE: "tool" is NOT here because <tool name="Shell"> is a valid tool call wrapper.
+   It's handled directly by TOOL_BLOCK_PATTERN and findNamedToolBlocks instead. */
 const KNOWN_STRUCTURAL_TAGS = new Set([
   "tool_calls", "tool_call", "function_calls", "function_call", "invoke", "tool_use",
-  "tool_name", "function_name", "name", "function", "tool",
+  "tool_name", "function_name", "name", "function",
   "parameters", "parameter", "input", "arguments", "argument", "args", "params",
   "command", "query", "body", "data", "result", "response", "content", "value",
   "description", "type", "key", "url", "path", "file", "text", "message",
@@ -42,6 +45,7 @@ const KNOWN_STRUCTURAL_TAGS = new Set([
 
 /* ── Argument-carrying tag names (skip in named-block scanning) ── */
 /* Also includes name-indicator tags that shouldn't be treated as wrappers */
+/* NOTE: "tool" is NOT here because <tool name="Shell"> is a valid tool call wrapper */
 const ARGUMENT_CARRYING_TAGS = new Set([
   "parameter", "parameters", "argument", "arguments", "input", "args", "params",
   "tool_name", "function_name"
@@ -653,6 +657,37 @@ function closeUnclosedArgTags(text) {
 }
 
 /**
+ * Close unclosed tool wrapper tags like <tool>, <tool_call, <function_call, <invoke>.
+ * When the model omits the closing tag (stream truncation, etc.), this appends
+ * synthetic closing tags so that TOOL_BLOCK_PATTERN and findNamedToolBlocks can match.
+ * Only closes tags that are genuinely unclosed (more opens than closes).
+ */
+function closeUnclosedToolWrapperTags(text) {
+  const source = toStringSafe(text);
+  let result = source;
+
+  const wrapperTags = ["tool", "tool_call", "function_call", "invoke", "tool_use"];
+
+  for (const tagName of wrapperTags) {
+    const openRe = new RegExp(`<(?:[a-z0-9_:-]+:)?${tagName}\\b[^>]*>`, "gi");
+    const closeRe = new RegExp(`</(?:[a-z0-9_:-]+:)?${tagName}\\s*>`, "gi");
+
+    const openCount = (result.match(openRe) || []).length;
+    const closeCount = (result.match(closeRe) || []).length;
+    const missing = openCount - closeCount;
+
+    if (missing > 0) {
+      log.debug("parser", `[closeUnclosedToolWrapperTags] Adding ${missing} missing </${tagName}> closing tag(s)`);
+      for (let i = 0; i < missing; i++) {
+        result += `</${tagName}>`;
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
  * Parse plain-text "Key: Value" tool call format.
  * Handles models that output non-XML text inside <tool_calls> containers:
  *   Tool: Shell
@@ -834,6 +869,10 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
 
     // Pre-process: close unclosed argument tags (model forgot </parameters>)
     flatInner = closeUnclosedArgTags(flatInner);
+
+    // Pre-process: close unclosed tool wrapper tags (model forgot </tool> or </tool_call)
+    // e.g. <tool name="Shell"><parameters>...</parameters>  ← no </tool>
+    flatInner = closeUnclosedToolWrapperTags(flatInner);
 
     // Strategy A: nested <tool_call name="..."> blocks inside container
     const innerCalls = parseStandaloneSingularBlocks(flatInner, allowedToolNames);

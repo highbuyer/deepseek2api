@@ -186,7 +186,19 @@ export function createToolSieve(allowedToolNames = []) {
           }
           pushTextEvent(state, events, consumed.suffix ?? "");
         } else {
-          pushTextEvent(state, events, state.capture);
+          // Stream ended without the closing tag — try to parse the partial capture
+          // by appending a synthetic closing tag and attempting to extract tool calls
+          log.debug("sieve", `[flush] Stream ended without closing tag, attempting partial capture parse (${state.capture.length} chars captured)`);
+          const syntheticBlock = `${state.capture}</tool_calls>`;
+          const partialCalls = parseToolCallsFromText(syntheticBlock, state.allowedToolNames);
+          if (partialCalls.length) {
+            log.debug("sieve", `[flush] Partial capture parse succeeded: found ${partialCalls.length} tool call(s)`);
+            events.push({ type: "tool_calls", calls: partialCalls });
+          } else {
+            // No tool calls could be extracted — emit as plain text
+            log.debug("sieve", `[flush] Partial capture parse found no tool calls, emitting as text`);
+            pushTextEvent(state, events, state.capture);
+          }
         }
       }
 
