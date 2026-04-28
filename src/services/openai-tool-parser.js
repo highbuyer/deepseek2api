@@ -535,8 +535,22 @@ function parseToolCallInner(attrs, inner, allowedToolNames = []) {
   }
 
   // 2. Get tool name from attribute or <tool_name> sub-tag
+  //    If the first match isn't in allowedToolNames, try subsequent matches
+  //    (model sometimes outputs stale/ghost <tool_name>Write</tool_name> before the real one)
   const attrName = attrs.match(TOOL_ATTR_PATTERN)?.[2] ?? "";
-  let name = attrName.trim() || findTagValue(inner, TOOL_NAME_PATTERNS).trim();
+  let name = "";
+  if (attrName.trim()) {
+    name = attrName.trim();
+  } else {
+    const allNames = findAllTagValues(inner, TOOL_NAME_PATTERNS);
+    const allowedSet = new Set(allowedToolNames.map(n => toStringSafe(n).trim()).filter(Boolean));
+    if (allowedSet.size > 0) {
+      // Prefer the first name that's in the allowed list
+      name = allNames.find(n => allowedSet.has(n.trim()))?.trim() ?? allNames[0]?.trim() ?? "";
+    } else {
+      name = allNames[0]?.trim() ?? "";
+    }
+  }
   log.debug("parser", `[parseToolCallInner] attrName="${attrName}", resolved name="${name}"`);
 
   // 3. If no name found, try "tag-name-as-tool-name" format
@@ -1002,9 +1016,17 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
     // Strategy B: <tool_name>+<parameters> flat pairs
     const names = findAllTagValues(flatInner, TOOL_NAME_PATTERNS);
     if (names.length) {
+      // Filter ghost tool names: prefer ones in allowed list
+      const allowedSet = new Set(allowedToolNames.map(n => toStringSafe(n).trim()).filter(Boolean));
+      let effectiveNames = names;
+      if (allowedSet.size > 0 && names.length > 1) {
+        const allowedNames = names.filter(n => allowedSet.has(n.trim()));
+        if (allowedNames.length > 0) effectiveNames = allowedNames;
+      }
+
       const namedParams = parseParameterNameAttrs(flatInner);
-      if (namedParams && Object.keys(namedParams).length > 0 && names.length === 1) {
-        const toolName = names[0].trim();
+      if (namedParams && Object.keys(namedParams).length > 0 && effectiveNames.length === 1) {
+        const toolName = effectiveNames[0].trim();
         const argumentsText = JSON.stringify(namedParams);
         log.debug("parser", `[parseContainer] Strategy B (named params): name="${toolName}", args="${argumentsText.slice(0, 100)}"`);
         output.push(buildParsedToolCall(toolName, argumentsText));
@@ -1012,10 +1034,10 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
       }
 
       const args = findAllTagValues(flatInner, TOOL_ARGS_PATTERNS);
-      log.debug("parser", `[parseContainer] Strategy B: ${names.length} <tool_name> tag(s), ${args.length} <parameters> tag(s)`);
+      log.debug("parser", `[parseContainer] Strategy B: ${effectiveNames.length} <tool_name> tag(s) (from ${names.length} total), ${args.length} <parameters> tag(s)`);
 
-      for (let i = 0; i < names.length; i++) {
-        const toolName = names[i].trim();
+      for (let i = 0; i < effectiveNames.length; i++) {
+        const toolName = effectiveNames[i].trim();
         const toolArgs = i < args.length ? args[i].trim() : "{}";
         if (!toolName) continue;
 
