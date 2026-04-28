@@ -113,6 +113,43 @@ function extractNameAttrFromTag(text, tagName) {
   return attrMatch?.[1]?.trim() ?? "";
 }
 
+/**
+ * Find content of an unclosed argument tag (model omitted closing tag).
+ * E.g. <parameters>{"command": "ls"} without </parameters>
+ * Looks for the opening tag and extracts everything after it to end of source.
+ * Only matches when the tag is truly unclosed (more opening than closing tags).
+ * Returns the extracted content string, or "" if not found.
+ */
+function findUnclosedArgContent(text) {
+  const source = toStringSafe(text);
+  const tagNames = ["parameters", "input", "arguments", "argument", "args", "params"];
+
+  for (const tagName of tagNames) {
+    // Only look for unclosed tags — skip if all tags are properly closed
+    const openRe = new RegExp(`<(?:[a-z0-9_:-]+:)?${tagName}\\b[^>]*>`, "gi");
+    const closeRe = new RegExp(`</(?:[a-z0-9_:-]+:)?${tagName}\\s*>`, "gi");
+    const openCount = (source.match(openRe) || []).length;
+    const closeCount = (source.match(closeRe) || []).length;
+
+    if (openCount <= closeCount) continue; // All tags are properly closed
+
+    // This tag has unclosed instances — extract content from opening tag to end
+    const extractRe = new RegExp(`<(?:[a-z0-9_:-]+:)?${tagName}\\b[^>]*>([\\s\\S]+)$`, "i");
+    const match = source.match(extractRe);
+    if (match?.[1]) {
+      let content = decodeXmlText(match[1].trim());
+      // Strip trailing structural closing tags that are not part of the argument content
+      content = content.replace(/<\/(?:tool_calls|function_calls|tool_call|function_call|invoke|tool_use)\s*>$/i, "").trim();
+      if (content) {
+        log.debug("parser", `[findUnclosedArgContent] Found unclosed <${tagName}> tag, extracted content (length=${content.length}): "${content.slice(0, 150)}"`);
+        return content;
+      }
+    }
+  }
+
+  return "";
+}
+
 function findTagValue(text, patterns) {
   const source = toStringSafe(text);
 
@@ -120,7 +157,16 @@ function findTagValue(text, patterns) {
     const match = source.match(pattern);
     if (match?.[1] !== undefined) {
       const textContent = decodeXmlText(match[1]).trim();
-      if (textContent) return textContent;
+      if (textContent) {
+        // If text content looks like nested XML (e.g. <parameters>...</parameters> inside <tool_name>),
+        // check name= attribute on the opening tag first — it's more likely the actual value
+        if (textContent.startsWith("<")) {
+          const fullMatch = match[0];
+          const attrVal = fullMatch.match(/name\s*=\s*"([^"]+)"/i)?.[1]?.trim();
+          if (attrVal) return attrVal;
+        }
+        return textContent;
+      }
     }
   }
 
@@ -130,13 +176,17 @@ function findTagValue(text, patterns) {
     if (attrVal) return attrVal;
   }
 
+  // Fallback: try unclosed argument tags (model forgot </parameters>)
+  const unclosed = findUnclosedArgContent(source);
+  if (unclosed) return unclosed;
+
   return "";
 }
 
 /**
  * Find ALL matches of a tag pattern (not just the first one).
  * Returns array of decoded values.
- * Also checks name= attribute on matched tags when text content is empty.
+ * Also checks name= attribute on matched tags when text content is empty or looks like XML.
  */
 function findAllTagValues(text, patterns) {
   const source = toStringSafe(text);
@@ -148,13 +198,15 @@ function findAllTagValues(text, patterns) {
     while ((match = re.exec(source)) !== null) {
       if (match[1] !== undefined) {
         const textContent = decodeXmlText(match[1]).trim();
-        if (textContent) {
+        if (textContent && !textContent.startsWith("<")) {
+          // Simple text content — use directly
           results.push(textContent);
         } else {
-          // Text content empty — try name= attribute on the opening tag
+          // Text content empty or looks like nested XML — try name= attribute on the opening tag
           const fullMatch = match[0];
           const attrVal = fullMatch.match(/name\s*=\s*"([^"]+)"/i)?.[1]?.trim();
           if (attrVal) results.push(attrVal);
+          else if (textContent) results.push(textContent); // fallback: use XML content as-is
         }
       }
     }
@@ -389,14 +441,17 @@ function buildParsedToolCall(name, argumentsText) {
  * 3. Generic markup KV
  */
 function parseToolCallArguments(body) {
+  // Pre-process: close unclosed argument tags (model forgot </parameters>)
+  const fixed = closeUnclosedArgTags(body);
+
   // 1. Try <parameter name="key">value</parameter> format
-  const namedParams = parseParameterNameAttrs(body);
+  const namedParams = parseParameterNameAttrs(fixed);
   if (namedParams && Object.keys(namedParams).length > 0) {
     return JSON.stringify(namedParams);
   }
 
   // 2. Try <parameters>JSON</parameters> format
-  const argsRaw = findTagValue(body, TOOL_ARGS_PATTERNS);
+  const argsRaw = findTagValue(fixed, TOOL_ARGS_PATTERNS);
   if (argsRaw) {
     const parsedInput = parseMarkupInput(argsRaw);
     if (parsedInput && Object.keys(parsedInput).length > 0) {
@@ -405,7 +460,7 @@ function parseToolCallArguments(body) {
   }
 
   // 3. Fallback: parse body as generic markup KV
-  const markupObject = parseMarkupObject(body);
+  const markupObject = parseMarkupObject(fixed);
   if (markupObject && Object.keys(markupObject).length > 0) {
     return JSON.stringify(markupObject);
   }
@@ -492,6 +547,37 @@ function parseStandaloneSingularBlocks(text, allowedToolNames = []) {
 }
 
 /**
+ * Pre-process: close unclosed argument tags like <parameters> without </parameters>.
+ * The model sometimes omits the closing tag and goes straight to </tool_calls>.
+ * E.g. <parameters>{"command": "ls"}</tool_calls> → <parameters>{"command": "ls"}</parameters>
+ */
+function closeUnclosedArgTags(text) {
+  const source = toStringSafe(text);
+  let result = source;
+
+  const tagNames = ["parameters", "input", "arguments", "argument", "args", "params"];
+
+  for (const tagName of tagNames) {
+    const openRe = new RegExp(`<(?:[a-z0-9_:-]+:)?${tagName}\\b[^>]*>`, "gi");
+    const closeRe = new RegExp(`</(?:[a-z0-9_:-]+:)?${tagName}\\s*>`, "gi");
+
+    const openCount = (result.match(openRe) || []).length;
+    const closeCount = (result.match(closeRe) || []).length;
+    const missing = openCount - closeCount;
+
+    if (missing > 0) {
+      log.debug("parser", `[closeUnclosedArgTags] Adding ${missing} missing </${tagName}> closing tag(s)`);
+      // Append missing closing tags at the end of the content
+      for (let i = 0; i < missing; i++) {
+        result += `</${tagName}>`;
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
  * Parse <tool_calls> container format.
  * Now handles all known formats including "tag-name-as-tool-name".
  */
@@ -513,6 +599,9 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
       flatInner = nestedContainer[2].trim();
       log.debug("parser", `[parseContainer] Flattened nested <${nestedContainer[1]}> container, new inner length=${flatInner.length}`);
     }
+
+    // Pre-process: close unclosed argument tags (model forgot </parameters>)
+    flatInner = closeUnclosedArgTags(flatInner);
 
     // Strategy A: nested <tool_call name="..."> blocks inside container
     const innerCalls = parseStandaloneSingularBlocks(flatInner, allowedToolNames);
