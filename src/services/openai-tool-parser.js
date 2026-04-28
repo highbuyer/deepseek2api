@@ -10,11 +10,26 @@ const TOOL_SELFCLOSE_PATTERN = /<(?:[a-z0-9_:-]+:)?invoke\b([^>]*)\/>/gi;
 const TOOL_CALLS_CONTAINER_PATTERN = /<(?:[a-z0-9_:-]+:)?(tool_calls|function_calls)\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1\s*>/gi;
 
 /* ── Sub-element patterns ── */
-/* Opening tag uses fuzzy match (e.g. tool[a-z0-9_]*name) to handle garbled tags
- *   like <tool_cool_name>ReadFile</tool_name> — the closing tag is the anchor */
+/* Fuzzy match both opening AND closing tags for tool_name / function_name.
+ *   Handles garbled tags like:
+ *     <tool_cool_name>ReadFile</tool_name>       (garbled open only)
+ *     <tool_cool_name>ReadFile</tool_call_name>  (both garbled)
+ *     <tool_cool_name>ReadFile</tool_coll>       (garbled close, no "name")
+ *   Also handles NO closing tag:
+ *     <tool_cool_name>ReadFile\n<parameters>...
+ * Order: most specific → least specific */
 const TOOL_NAME_PATTERNS = Object.freeze([
+  // garbled open + correct close (e.g. <tool_cool_name>ReadFile</tool_name>)
   /<(?:[a-z0-9_:-]+:)?tool[a-z0-9_]*name\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?tool_name>/i,
+  // garbled open + garbled close with "name" (e.g. <tool_cool_name>ReadFile</tool_call_name>)
+  /<(?:[a-z0-9_:-]+:)?tool[a-z0-9_]*name\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?tool[a-z0-9_]*name>/i,
+  // garbled open + no close — capture text until next < (e.g. <tool_cool_name>ReadFile\n<parameters>)
+  /<(?:[a-z0-9_:-]+:)?tool[a-z0-9_]*name\b[^>]*>([^<]+)/i,
+  // same three for function_name
   /<(?:[a-z0-9_:-]+:)?function[a-z0-9_]*name\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?function_name>/i,
+  /<(?:[a-z0-9_:-]+:)?function[a-z0-9_]*name\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?function[a-z0-9_]*name>/i,
+  /<(?:[a-z0-9_:-]+:)?function[a-z0-9_]*name\b[^>]*>([^<]+)/i,
+  // standard <name> and <function>
   /<(?:[a-z0-9_:-]+:)?name\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?name>/i,
   /<(?:[a-z0-9_:-]+:)?function\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?function>/i
 ]);
