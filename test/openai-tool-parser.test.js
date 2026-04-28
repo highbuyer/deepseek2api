@@ -5,6 +5,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { parseToolCallsFromText } from "../src/services/openai-tool-parser.js";
+import { createToolSieve } from "../src/services/openai-tool-sieve.js";
 
 const ALL_TOOLS = [
   "Shell", "Glob", "rg", "Await", "ReadFile", "Delete", "EditNotebook",
@@ -531,5 +532,93 @@ describe("Real-world debug log test cases", () => {
     assert.equal(calls.length, 5);
     assert.equal(calls[0].input.path, "./douyin.py");
     assert.equal(calls[4].input.path, "./env.js");
+  });
+});
+
+/* ═══════════════════════════════════════════════════
+   Tool-name-as-tag: standalone <ApplyPatch>...</ApplyPatch>
+   (The root cause of the "ApplyPatch not working" bug)
+   ═══════════════════════════════════════════════════ */
+
+describe("Tool-name-as-tag: standalone <ApplyPatch>", () => {
+  it("parses <ApplyPatch>...</ApplyPatch> without <tool_calls> wrapper", () => {
+    const text = `<ApplyPatch>
+<parameters>{"patch":"*** Begin Patch\\n*** Modify File\\n- old\\n+ new"}</parameters>
+</ApplyPatch>`;
+    const call = parseOne(text);
+    assert.equal(call.name, "ApplyPatch");
+    assert.ok(call.input.patch);
+  });
+
+  it("parses <Shell>...</Shell> without <tool_calls> wrapper", () => {
+    const text = `<Shell>
+<parameters>{"command":"ls -la"}</parameters>
+</Shell>`;
+    const call = parseOne(text);
+    assert.equal(call.name, "Shell");
+    assert.equal(call.input.command, "ls -la");
+  });
+
+  it("parses <ReadFile> with <parameter> sub-tags, no wrapper", () => {
+    const text = `<ReadFile>
+<parameter name="path">./test.py</parameter>
+</ReadFile>`;
+    const call = parseOne(text);
+    assert.equal(call.name, "ReadFile");
+    assert.equal(call.input.path, "./test.py");
+  });
+});
+
+/* ═══════════════════════════════════════════════════
+   Sieve: tool-name-specific capture pairs
+   ═══════════════════════════════════════════════════ */
+
+describe("Sieve: tool-name-specific capture", () => {
+  it("detects <ApplyPatch> tag in streaming sieve", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    const events1 = sieve.push("Here is the patch:\n");
+    const events2 = sieve.push("<ApplyPatch>\n");
+    const events3 = sieve.push("<parameters>{\"patch\":\"*** Begin Patch\"}</parameters>\n");
+    const events4 = sieve.push("</ApplyPatch>");
+    const flushEvents = sieve.flush();
+    
+    const allEvents = [...events1, ...events2, ...events3, ...events4, ...flushEvents];
+    const toolCallEvents = allEvents.filter(e => e.type === "tool_calls");
+    assert.equal(toolCallEvents.length, 1, `Expected 1 tool_call event, got ${toolCallEvents.length}`);
+    assert.equal(toolCallEvents[0].calls[0].name, "ApplyPatch");
+  });
+
+  it("detects <Shell> tag in streaming sieve", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    const events1 = sieve.push("Running command:\n");
+    const events2 = sieve.push("<Shell><parameters>{\"command\":\"ls\"}</parameters></Shell>");
+    const flushEvents = sieve.flush();
+    
+    const allEvents = [...events1, ...events2, ...flushEvents];
+    const toolCallEvents = allEvents.filter(e => e.type === "tool_calls");
+    assert.equal(toolCallEvents.length, 1);
+    assert.equal(toolCallEvents[0].calls[0].name, "Shell");
+  });
+
+  it("still detects standard <tool_calls> in sieve", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    const events1 = sieve.push("<tool_calls>\n");
+    const events2 = sieve.push("<tool_name>Shell</tool_name>\n");
+    const events3 = sieve.push("<parameters>{\"command\":\"ls\"}</parameters>\n");
+    const events4 = sieve.push("</tool_calls>");
+    const flushEvents = sieve.flush();
+    
+    const allEvents = [...events1, ...events2, ...events3, ...events4, ...flushEvents];
+    const toolCallEvents = allEvents.filter(e => e.type === "tool_calls");
+    assert.equal(toolCallEvents.length, 1);
+    assert.equal(toolCallEvents[0].calls[0].name, "Shell");
+  });
+
+  it("sieve.emittedText tracks emitted content", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    sieve.push("Hello ");
+    sieve.push("world");
+    sieve.flush();
+    assert.ok(sieve.emittedText.includes("Hello world"));
   });
 });

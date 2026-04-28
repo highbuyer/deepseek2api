@@ -244,7 +244,8 @@ export async function streamOpenAiResponse(options) {
   ));
 
   if (requestOptions.toolNames.length && !sawToolCall) {
-    log.warn("bridge", `[stream] No tool calls detected in stream (expected tools: [${requestOptions.toolNames.join(",")}])`);
+    const emittedPreview = toolSieve?.emittedText?.slice(0, 500) ?? "(no sieve)";
+    log.warn("bridge", `[stream] No tool calls detected in stream (expected tools: [${requestOptions.toolNames.join(",")}]). Emitted text preview (first 500 chars): "${emittedPreview}"`);
   } else if (sawToolCall) {
     log.info("bridge", `[stream] Completed with ${toolCallIndex} tool call(s)`);
   }

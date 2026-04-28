@@ -713,6 +713,20 @@ function parseStandaloneSingularBlocks(text, allowedToolNames = []) {
     }
   }
 
+  // 4. Try "tag-name-as-tool-name" format (e.g. <ApplyPatch>...</ApplyPatch>)
+  //    This handles models that output the tool name directly as an XML tag
+  //    without wrapping it in <tool_call> or <tool_calls>.
+  if (!output.length && allowedToolNames.length) {
+    const toolNameTags = findToolNameTags(source, allowedToolNames);
+    if (toolNameTags.length) {
+      log.debug("parser", `[parseStandaloneSingularBlocks] Strategy 4: found ${toolNameTags.length} tool-name tag(s): [${toolNameTags.map(t => t.name).join(", ")}]`);
+      for (const { name, body } of toolNameTags) {
+        const argumentsText = parseToolCallArguments(body);
+        output.push(buildParsedToolCall(name, argumentsText));
+      }
+    }
+  }
+
   return output;
 }
 
@@ -1413,8 +1427,14 @@ export function parseToolCallsFromText(text, allowedToolNames = []) {
 
   // Step 2: Quick check for any tool-related XML tags
   // Also matches <tool name="...">, <tool_name name="...">, <function name="...">
+  // Also checks for tool-name-specific tags (e.g. <ApplyPatch>, <Shell>)
   const stripped = stripFencedCodeBlocks(fixed);
-  if (!stripped.match(/<(?:tool_calls|tool_call|tool_name|tool|function_calls|function_call|function_name|function|invoke|tool_use)\b/i)) {
+  const hasStandardToolTag = stripped.match(/<(?:tool_calls|tool_call|tool_name|tool|function_calls|function_call|function_name|function|invoke|tool_use)\b/i);
+  const hasToolNameTag = allowedToolNames.length > 0 && allowedToolNames.some(name => {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return stripped.match(new RegExp(`<${escaped}\\b`, "i"));
+  });
+  if (!hasStandardToolTag && !hasToolNameTag) {
     log.debug("parser", `No tool XML tags found in output (length=${fixed.length})`);
     return [];
   }
