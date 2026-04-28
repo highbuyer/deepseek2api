@@ -64,7 +64,7 @@ function splitSafeContent(state, text) {
   return { safe: text.slice(0, partialStart), hold: text.slice(partialStart) };
 }
 
-function consumeCapturedToolBlock(captured, allowedToolNames) {
+function consumeCapturedToolBlock(captured, allowedToolNames, incompleteCount) {
   const lower = captured.toLowerCase();
 
   for (const pair of TOOL_CAPTURE_PAIRS) {
@@ -75,7 +75,12 @@ function consumeCapturedToolBlock(captured, allowedToolNames) {
 
     const closeIndex = lower.lastIndexOf(pair.close);
     if (closeIndex < openIndex) {
-      log.debug("sieve", `[consume] Incomplete block: <${pair.open}> found but no </${pair.close}>, waiting for more data`);
+      // Only log every Nth incomplete check to reduce noise
+      // Always log first occurrence and then periodically
+      const logInterval = Math.max(20, Math.floor(captured.length / 50));
+      if (incompleteCount <= 1 || incompleteCount % logInterval === 0) {
+        log.debug("sieve", `[consume] Still waiting for </${pair.close}> (checked ${incompleteCount}x, captured ${captured.length} chars)`);
+      }
       return { ready: false };
     }
 
@@ -110,7 +115,8 @@ export function createToolSieve(allowedToolNames = []) {
     capture: "",
     capturing: false,
     emittedText: "",
-    pending: ""
+    pending: "",
+    incompleteCount: 0
   };
 
   function drain() {
@@ -121,12 +127,18 @@ export function createToolSieve(allowedToolNames = []) {
         if (state.pending) {
           state.capture += state.pending;
           state.pending = "";
+          state.incompleteCount++;
         }
 
-        const consumed = consumeCapturedToolBlock(state.capture, state.allowedToolNames);
+        const consumed = consumeCapturedToolBlock(state.capture, state.allowedToolNames, state.incompleteCount);
         if (!consumed.ready) {
           break;
         }
+
+        if (state.incompleteCount > 1) {
+          log.debug("sieve", `[consume] Block completed after ${state.incompleteCount} checks, ${state.capture.length} chars captured`);
+        }
+        state.incompleteCount = 0;
 
         state.capture = "";
         state.capturing = false;
@@ -187,6 +199,12 @@ export function createToolSieve(allowedToolNames = []) {
     push(chunk) {
       state.pending += typeof chunk === "string" ? chunk : String(chunk ?? "");
       return drain();
+    },
+    get captureLength() {
+      return state.capture.length;
+    },
+    get isCapturing() {
+      return state.capturing;
     }
   });
 }

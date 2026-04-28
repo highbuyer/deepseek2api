@@ -48,6 +48,9 @@ const TOOL_ATTR_PATTERN = /(name|function|tool)\s*=\s*"([^"]+)"/i;
 const TOOL_KV_PATTERN = /<(?:[a-z0-9_:-]+:)?([a-z0-9_.-]+)\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1\s*>/gi;
 const ANY_TAG_PATTERN = /<([a-z0-9_:-]+)\b[^>]*>/gi;
 
+/* ── Malformed tag pattern: <tool_name="ReadFile"> should be <tool_name name="ReadFile"> ── */
+const MALFORMED_ATTR_EQUALS = /<((?:[a-z0-9_:-]+:)?(?:tool_name|function_name|name|tool|function|call))="([^"]+)"/gi;
+
 function toStringSafe(value) {
   if (typeof value === "string") {
     return value;
@@ -611,18 +614,24 @@ export function parseToolCallsFromText(text, allowedToolNames = []) {
     log.warn("parser", `Stripped ${nullCount} control character(s) from input (including null bytes)`);
   }
 
+  // Step 1.5: Fix malformed tags like <tool_name="ReadFile"> → <tool_name name="ReadFile">
+  const fixed = source.replace(MALFORMED_ATTR_EQUALS, '<$1 name="$2"');
+  if (fixed !== source) {
+    log.debug("parser", `Preprocessed malformed tags (e.g. <tool_name=\"...\"> → <tool_name name=\"...\">)`);
+  }
+
   // Step 2: Quick check for any tool-related XML tags
   // Also matches <tool name="...">, <tool_name name="...">, <function name="...">
-  const stripped = stripFencedCodeBlocks(source);
+  const stripped = stripFencedCodeBlocks(fixed);
   if (!stripped.match(/<(?:tool_calls|tool_call|tool_name|tool|function_calls|function_call|function_name|function|invoke|tool_use)\b/i)) {
-    log.debug("parser", `No tool XML tags found in output (length=${source.length})`);
+    log.debug("parser", `No tool XML tags found in output (length=${fixed.length})`);
     return [];
   }
 
-  log.debug("parser", `Tool XML tags detected. Full source length=${source.length}, first 500 chars: "${source.slice(0, 500)}"`);
+  log.debug("parser", `Tool XML tags detected. Full source length=${fixed.length}, first 500 chars: "${fixed.slice(0, 500)}"`);
 
   // Step 3: Parse
-  const calls = filterAllowedToolCalls(parseMarkupToolCalls(source, allowedToolNames), allowedToolNames);
+  const calls = filterAllowedToolCalls(parseMarkupToolCalls(fixed, allowedToolNames), allowedToolNames);
   log.debug("parser", `Parsed ${calls.length} tool call(s) from text (allowed: [${allowedToolNames.join(",")}])`);
   if (calls.length) {
     calls.forEach((call, i) => {
@@ -633,3 +642,6 @@ export function parseToolCallsFromText(text, allowedToolNames = []) {
   }
   return calls;
 }
+
+// Export for testing
+export { MALFORMED_ATTR_EQUALS };
