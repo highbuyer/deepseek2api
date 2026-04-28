@@ -42,7 +42,10 @@ const TOOL_NAME_PATTERNS = Object.freeze([
 ]);
 
 /* ── Args patterns: <parameters>, <arguments>, <input> etc. (JSON body) ── */
+/* Also handles garbled variants like <tool_call_parameters> ── */
 const TOOL_ARGS_PATTERNS = Object.freeze([
+  /<(?:[a-z0-9_:-]+:)?tool[a-z0-9_]*parameters\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?tool[a-z0-9_]*parameters>/i,
+  /<(?:[a-z0-9_:-]+:)?function[a-z0-9_]*parameters\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?function[a-z0-9_]*parameters>/i,
   /<(?:[a-z0-9_:-]+:)?parameters\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?parameters>/i,
   /<(?:[a-z0-9_:-]+:)?input\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?input>/i,
   /<(?:[a-z0-9_:-]+:)?arguments\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?arguments>/i,
@@ -61,6 +64,7 @@ const PARAMETER_NAME_ATTR_PATTERN = /<(?:[a-z0-9_:-]+:)?param(?:eter)?\b[^>]*\bn
 const KNOWN_STRUCTURAL_TAGS = new Set([
   "tool_calls", "tool_call", "function_calls", "function_call", "invoke", "tool_use",
   "tool_name", "function_name", "name", "function",
+  "tool_call_name", "tool_call_parameters", "function_call_name", "function_call_parameters",
   "parameters", "parameter", "input", "arguments", "argument", "args", "params",
   "command", "query", "body", "data", "result", "response", "content", "value",
   "description", "type", "key", "url", "path", "file", "text", "message",
@@ -72,17 +76,24 @@ const KNOWN_STRUCTURAL_TAGS = new Set([
 /* NOTE: "tool" is NOT here because <tool name="Shell"> is a valid tool call wrapper */
 const ARGUMENT_CARRYING_TAGS = new Set([
   "parameter", "parameters", "argument", "arguments", "input", "args", "params",
-  "tool_name", "function_name"
+  "tool_name", "function_name",
+  "tool_call_parameters", "function_call_parameters"
 ]);
 
 const TOOL_ATTR_PATTERN = /(name|function|tool)\s*=\s*"([^"]+)"/i;
 const TOOL_KV_PATTERN = /<(?:[a-z0-9_:-]+:)?([a-z0-9_.-]+)\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1\s*>/gi;
 const ANY_TAG_PATTERN = /<([a-z0-9_:-]+)\b[^>]*>/gi;
 
-/* ── Malformed tag pattern: <tool_name="ReadFile"> should be <tool_name name="ReadFile">
-    Also handles <tool_name="ReadFile</tool_name> (missing >) → <tool_name name="ReadFile"></tool_name>
-    Uses [^"<>\s]+ to stop at < or > or whitespace, preventing over-matching ── */
+/* ── Malformed tag patterns ── */
+/* Pattern 1: <tool_name="ReadFile"> should be <tool_name name="ReadFile">
+   Also handles <tool_name="ReadFile</tool_name> (missing >) → <tool_name name="ReadFile"></tool_name>
+   Uses [^"<>\s]+ to stop at < or > or whitespace, preventing over-matching */
 const MALFORMED_ATTR_EQUALS = /<((?:[a-z0-9_:-]+:)?(?:tool_name|function_name|name|tool|function|call))="([^"<>\s]+)"?\s*(>)?/gi;
+
+/* Pattern 2: <tool_name name="WebSearch</tool_name> — name attribute value
+   extends to include the closing tag (no closing quote before </).
+   Extract the tool name and rewrite as <tool_name>WebSearch</tool_name> */
+const MALFORMED_NAME_ATTR_UNCLOSED = /<((?:[a-z0-9_:-]+:)?(?:tool_name|function_name))\s+name="([a-zA-Z0-9_]+)<\/\1>/gi;
 
 function toStringSafe(value) {
   if (typeof value === "string") {
@@ -543,7 +554,7 @@ function buildParsedToolCall(name, argumentsText) {
  * Tries multiple formats:
  * 1. <parameter name="key">value</parameter>
  * 2. <parameters>{JSON}</parameters>
- * 3. Generic markup KV
+ * 3. Generic markup KV (excluding tool_name/function_name/parameters tags)
  */
 function parseToolCallArguments(body) {
   // Pre-process: close unclosed argument tags (model forgot </parameters>)
@@ -565,7 +576,13 @@ function parseToolCallArguments(body) {
   }
 
   // 3. Fallback: parse body as generic markup KV
-  const markupObject = parseMarkupObject(fixed);
+  //    Strip <tool_name>, <function_name>, <name>, <parameters> tags first
+  //    to avoid treating them as argument keys
+  const cleanedForKV = fixed
+    .replace(/<(?:[a-z0-9_:-]+:)?(?:tool_name|function_name|tool_call_name|function_call_name)\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?(?:tool_name|function_name|tool_call_name|function_call_name)>/gi, '')
+    .replace(/<(?:[a-z0-9_:-]+:)?(?:tool_call_parameters|function_call_parameters|parameters)\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?(?:tool_call_parameters|function_call_parameters|parameters)>/gi, '')
+    .trim();
+  const markupObject = parseMarkupObject(cleanedForKV);
   if (markupObject && Object.keys(markupObject).length > 0) {
     return JSON.stringify(markupObject);
   }
@@ -683,14 +700,28 @@ function parseStandaloneSingularBlocks(text, allowedToolNames = []) {
 
 /**
  * Pre-process: fix common tag closing issues.
- * 1. Fix singular/plural mismatch: <parameters>...</parameter> → <parameters>...</parameters>
- * 2. Close unclosed argument tags: <parameters>... without </parameters>
+ * 1. Strip garbage characters after CDATA closing (e.g. ]]></parameter>}}})
+ * 2. Fix singular/plural mismatch: <parameters>...</parameter> → <parameters>...</parameters>
+ * 3. Close unclosed argument tags: <parameters>... without </parameters>
  * The model sometimes writes </parameter> when it means </parameters>,
  * or omits the closing tag entirely and goes straight to </tool_calls>.
+ * It also sometimes outputs garbage like ]]>}}}</parameter> after CDATA sections.
  */
 function closeUnclosedArgTags(text) {
   const source = toStringSafe(text);
   let result = source;
+
+  // Step 0: Strip garbage characters between CDATA closing ]]> and closing tags
+  // The model sometimes outputs: ]]>}}}</parameter> or ]]>}}}</parameters>
+  // This garbage prevents proper tag matching. Strip it before processing.
+  // Pattern: ]]> followed by } characters, then </tag>
+  const beforeStep0 = result;
+  result = result.replace(/\]\]>(\}+)(<\/(?:[a-z0-9_:-]+:)?(?:parameters?|arguments?|args?|params|input))/gi, ']]>$2');
+  // Also handle garbage AFTER closing tags: </parameter>}}} or </parameters>}}}
+  result = result.replace(/(<\/(?:[a-z0-9_:-]+:)?(?:parameters?|arguments?|args?|params|input)\s*>)(\}+)/gi, '$1');
+  if (result !== beforeStep0) {
+    log.debug("parser", `[closeUnclosedArgTags] Step 0: Stripped garbage after CDATA/tags, length ${beforeStep0.length} → ${result.length}`);
+  }
 
   // Step 1: Fix singular/plural closing tag mismatches
   // E.g. <parameters>...</parameter> → <parameters>...</parameters>
@@ -703,7 +734,10 @@ function closeUnclosedArgTags(text) {
   for (const { open: tagName, wrongClose } of pluralTags) {
     const openRe = new RegExp(`<(?:[a-z0-9_:-]+:)?${tagName}\\b[^>]*>`, "gi");
     const correctCloseRe = new RegExp(`</(?:[a-z0-9_:-]+:)?${tagName}\\s*>`, "gi");
-    const wrongCloseRe = new RegExp(wrongClose.replace("/", "\\/") + "\\s*>", "gi");
+    // wrongClose is like "</parameter>" — strip the trailing > before adding \s*>
+    // otherwise we'd get <\/parameter>\s*> which requires TWO > characters
+    const wrongCloseBody = wrongClose.slice(0, -1); // e.g. "</parameter" (no trailing >)
+    const wrongCloseRe = new RegExp(wrongCloseBody.replace("/", "\\/") + "\\s*>", "gi");
 
     const openCount = (result.match(openRe) || []).length;
     const correctCloseCount = (result.match(correctCloseRe) || []).length;
@@ -729,7 +763,8 @@ function closeUnclosedArgTags(text) {
   }
 
   // Step 2: Close any remaining unclosed tags
-  const tagNames = ["parameters", "input", "arguments", "argument", "args", "params"];
+  const tagNames = ["parameters", "input", "arguments", "argument", "args", "params",
+    "tool_call_parameters", "function_call_parameters"];
 
   for (const tagName of tagNames) {
     const openRe = new RegExp(`<(?:[a-z0-9_:-]+:)?${tagName}\\b[^>]*>`, "gi");
@@ -1321,6 +1356,29 @@ export function parseToolCallsFromText(text, allowedToolNames = []) {
   let fixed = source.replace(MALFORMED_ATTR_EQUALS, '<$1 name="$2">');
   if (fixed !== source) {
     log.debug("parser", `Preprocessed malformed tags (e.g. <tool_name="..."> → <tool_name name="...">)`);
+  }
+
+  // Step 1.6: Fix <tool_name name="WebSearch</tool_name> — name attr value extends to closing tag
+  // Extract the tool name and rewrite as <tool_name>WebSearch</tool_name>
+  const beforeUnclosed = fixed;
+  fixed = fixed.replace(MALFORMED_NAME_ATTR_UNCLOSED, '<$1>$2</$1>');
+  if (fixed !== beforeUnclosed) {
+    log.debug("parser", `Preprocessed unclosed name attr tags (e.g. <tool_name name="WebSearch</tool_name> → <tool_name>WebSearch</tool_name>)`);
+  }
+
+  // Step 1.7: Fix <tool_calls name="Glob"> — treat as tool call wrapper, not container
+  // The model sometimes uses the plural container tag with a name= attr as a single tool call.
+  // Rewrite <tool_calls name="Glob">...</tool_calls> → <tool_call name="Glob">...</tool_call_name>
+  const beforeContainerFix = fixed;
+  fixed = fixed.replace(
+    /<((?:[a-z0-9_:-]+:)?tool_calls)\s+((?:name|function|tool)\s*=\s*"[^"]+")(?:[^>]*)>([\s\S]*?)<\/\1\s*>/gi,
+    (full, tag, attrs, content) => {
+      log.debug("parser", `[preprocess] Fixed <${tag} ${attrs}> (container with name attr) → <tool_call ${attrs}>`);
+      return `<tool_call ${attrs}>${content}</tool_call_name>`;
+    }
+  );
+  if (fixed !== beforeContainerFix) {
+    log.debug("parser", `Preprocessed <tool_calls name="..."> → <tool_call name="...">`);
   }
 
   // Step 2: Quick check for any tool-related XML tags
