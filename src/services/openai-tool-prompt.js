@@ -262,6 +262,40 @@ function injectToolPrompt(messages, tools, policy) {
   return updated;
 }
 
+function truncatePromptMessages(messages, maxChars) {
+  const systemMsgs = messages.filter((m) => m.role === "system");
+  const nonSystemMsgs = messages.filter((m) => m.role !== "system");
+
+  const systemPart = buildPromptFromMessages(systemMsgs);
+  const systemLen = systemPart.length;
+
+  if (systemLen >= maxChars) {
+    log.warn("prompt", `System prompt alone is ${systemLen} chars (limit: ${maxChars}), keeping it as-is`);
+    return systemPart.slice(0, maxChars);
+  }
+
+  const budget = maxChars - systemLen;
+  const kept = [];
+  let used = 0;
+
+  for (let i = nonSystemMsgs.length - 1; i >= 0; i--) {
+    const block = `${nonSystemMsgs[i].role.toUpperCase()}: ${nonSystemMsgs[i].content ?? ""}`;
+    const entry = i < nonSystemMsgs.length - 1 ? "\n\n" + block : block;
+    if (used + entry.length > budget) break;
+    used += entry.length;
+    kept.unshift(nonSystemMsgs[i]);
+  }
+
+  const dropped = nonSystemMsgs.length - kept.length;
+  const result = systemPart + "\n\n" + buildPromptFromMessages(kept);
+
+  if (dropped > 0) {
+    log.warn("prompt", `Prompt truncated: kept system (${systemLen} chars) + ${kept.length}/${nonSystemMsgs.length} messages, dropped ${dropped} oldest, total ${result.length} chars`);
+  }
+
+  return result;
+}
+
 export function buildOpenAiPrompt({ messages, toolChoice, tools }) {
   const policy = resolveToolChoicePolicy({ tools, toolChoice });
   const normalizedMessages = normalizeMessagesForPrompt(messages);
@@ -270,8 +304,8 @@ export function buildOpenAiPrompt({ messages, toolChoice, tools }) {
   let prompt = buildPromptFromMessages(promptMessages);
 
   if (prompt.length > config.maxPromptChars) {
-    log.warn("prompt", `Prompt too long: ${prompt.length} chars (limit: ${config.maxPromptChars}), truncating from the beginning`);
-    prompt = prompt.slice(prompt.length - config.maxPromptChars);
+    log.warn("prompt", `Prompt too long: ${prompt.length} chars (limit: ${config.maxPromptChars}), truncating conversation history while preserving system prompt`);
+    prompt = truncatePromptMessages(promptMessages, config.maxPromptChars);
   }
 
   log.debug("prompt", `Final prompt length: ${prompt.length} chars, toolNames: [${policy.allowedToolNames.join(",")}]`);
