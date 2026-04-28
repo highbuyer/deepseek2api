@@ -524,8 +524,20 @@ function parseToolCallInner(attrs, inner, allowedToolNames = []) {
     }
   }
 
+  // 4. If no name found, try plain-text "Key: Value" format (e.g. "Tool: Shell")
+  if (!name && allowedToolNames.length) {
+    const kvResults = parseKeyValueToolFormat(inner, allowedToolNames);
+    if (kvResults.length) {
+      const first = kvResults[0];
+      name = first.name;
+      const argumentsText = first.argumentsText;
+      log.debug("parser", `[parseToolCallInner] Found tool name via KV format: name="${name}", argumentsText="${argumentsText.slice(0, 100)}"`);
+      return buildParsedToolCall(name, argumentsText);
+    }
+  }
+
   if (!name) {
-    log.debug("parser", `[parseToolCallInner] No tool name found (tried attr, tool_name tags, and tag-name matching), returning null`);
+    log.debug("parser", `[parseToolCallInner] No tool name found (tried attr, tool_name tags, tag-name matching, and KV format), returning null`);
     return null;
   }
 
@@ -641,6 +653,110 @@ function closeUnclosedArgTags(text) {
 }
 
 /**
+ * Parse plain-text "Key: Value" tool call format.
+ * Handles models that output non-XML text inside <tool_calls> containers:
+ *   Tool: Shell
+ *   command: ls -la
+ *
+ * Also handles bare tool names:
+ *   Shell
+ *
+ * And multiple tool calls separated by blank lines:
+ *   Tool: Shell
+ *   command: ls -la
+ *
+ *   Tool: Glob
+ *   pattern: *.toml
+ *
+ * Returns array of { name, argumentsText } objects.
+ */
+function parseKeyValueToolFormat(text, allowedToolNames = []) {
+  if (!allowedToolNames?.length) return [];
+
+  const allowed = new Set(allowedToolNames.map(n => toStringSafe(n).trim()).filter(Boolean));
+  const source = toStringSafe(text).trim();
+
+  // Skip if content looks like XML (starts with <) — not a KV format
+  if (source.startsWith("<")) return [];
+
+  const results = [];
+
+  // Recognized keys that indicate a tool name
+  const TOOL_NAME_KEYS = new Set(["tool", "name", "function", "action", "tool_name", "function_name", "call"]);
+
+  // Split into blocks separated by blank lines (each block = one tool call)
+  const blocks = source.split(/\n\s*\n/).filter(b => b.trim());
+
+  for (const block of blocks) {
+    const lines = block.split("\n").map(l => l.trim()).filter(Boolean);
+    if (!lines.length) continue;
+
+    let toolName = "";
+    const args = {};
+
+    for (const line of lines) {
+      const colonIdx = line.indexOf(":");
+      if (colonIdx < 0) {
+        // No colon — could be a bare tool name
+        const candidate = line.trim();
+        if (allowed.has(candidate) && !toolName) {
+          toolName = candidate;
+        }
+        continue;
+      }
+
+      const key = line.slice(0, colonIdx).trim().toLowerCase();
+      const value = line.slice(colonIdx + 1).trim();
+
+      if (TOOL_NAME_KEYS.has(key)) {
+        // This line specifies the tool name
+        const candidate = value.trim();
+        if (candidate && !toolName) {
+          toolName = candidate;
+        }
+      } else if (key) {
+        // This is an argument line
+        args[key] = value;
+      }
+    }
+
+    // If no tool name found from "Tool: Name" lines, check if first line is a bare tool name
+    if (!toolName && lines.length > 0) {
+      const firstLine = lines[0].trim();
+      // Check if first line is just a tool name (no colon, or the part before colon is not a known key)
+      if (allowed.has(firstLine)) {
+        toolName = firstLine;
+      } else {
+        // Try the value part of the first line if it looks like "Key: ToolName"
+        const colonIdx = firstLine.indexOf(":");
+        if (colonIdx >= 0) {
+          const possibleName = firstLine.slice(colonIdx + 1).trim();
+          if (allowed.has(possibleName)) {
+            toolName = possibleName;
+          }
+        }
+      }
+    }
+
+    if (toolName && allowed.has(toolName)) {
+      const argumentsText = Object.keys(args).length > 0 ? JSON.stringify(args) : "{}";
+      log.debug("parser", `[parseKeyValueToolFormat] Found tool: name="${toolName}", argumentsText="${argumentsText.slice(0, 100)}"`);
+      results.push({ name: toolName, argumentsText });
+    } else if (toolName) {
+      log.debug("parser", `[parseKeyValueToolFormat] Found tool name "${toolName}" but not in allowed list, skipping`);
+    }
+  }
+
+  // Fallback: if no blocks parsed but the entire content is a single allowed tool name
+  if (!results.length && allowed.has(source)) {
+    log.debug("parser", `[parseKeyValueToolFormat] Entire content is a bare tool name: "${source}"`);
+    results.push({ name: source, argumentsText: "{}" });
+  }
+
+  return results;
+}
+
+/**
  * Parse <tool_calls> container format.
  * Now handles all known formats including "tag-name-as-tool-name".
  */
@@ -752,6 +868,27 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
       const argumentsText = parseToolCallArguments(flatInner);
       log.debug("parser", `[parseContainer] Strategy E: attr name="${attrName}", argumentsText="${argumentsText.slice(0, 100)}"`);
       output.push(buildParsedToolCall(attrName.trim(), argumentsText));
+      continue;
+    }
+
+    // Strategy F: plain-text "Key: Value" format (e.g. "Tool: Shell")
+    // Handles models that output non-XML text inside <tool_calls> containers:
+    //   <tool_calls>
+    //   Tool: Shell
+    //   </tool_calls>
+    // Or with arguments:
+    //   <tool_calls>
+    //   Tool: Shell
+    //   command: ls -la
+    //   </tool_calls>
+    // Or just a bare tool name:
+    //   <tool_calls>
+    //   Shell
+    //   </tool_calls>
+    const kvToolCalls = parseKeyValueToolFormat(flatInner, allowedToolNames);
+    if (kvToolCalls.length) {
+      log.debug("parser", `[parseContainer] Strategy F: found ${kvToolCalls.length} key-value tool call(s): [${kvToolCalls.map(c => c.name).join(", ")}]`);
+      output.push(...kvToolCalls);
       continue;
     }
 
