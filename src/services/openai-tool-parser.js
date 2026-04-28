@@ -143,12 +143,65 @@ function decodeXmlText(text) {
     .replaceAll("&#x27;", "'");
 }
 
+/**
+ * Fix literal control characters inside JSON string values.
+ * Models sometimes output CDATA JSON with literal newlines/tabs/carriage returns
+ * inside string values (e.g. {"patch":"*** Begin Patch\n*** Modify..."}),
+ * which is invalid JSON. This function escapes those control characters
+ * ONLY inside JSON string values, preserving structural whitespace outside strings.
+ */
+function fixJsonControlChars(text) {
+  let result = "";
+  let inString = false;
+  let escape = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+
+    if (escape) {
+      result += ch;
+      escape = false;
+      continue;
+    }
+
+    if (ch === "\\" && inString) {
+      result += ch;
+      escape = true;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = !inString;
+      result += ch;
+      continue;
+    }
+
+    if (inString) {
+      if (ch === "\n") { result += "\\n"; continue; }
+      if (ch === "\r") { result += "\\r"; continue; }
+      if (ch === "\t") { result += "\\t"; continue; }
+    }
+
+    result += ch;
+  }
+
+  return result;
+}
+
 function parseJsonObject(text) {
   try {
     const value = JSON.parse(text);
     return value && typeof value === "object" && !Array.isArray(value) ? value : null;
   } catch {
-    return null;
+    // Retry: fix literal control characters inside JSON string values
+    // (model sometimes outputs CDATA JSON with literal newlines inside strings)
+    try {
+      const fixed = fixJsonControlChars(text);
+      const value = JSON.parse(fixed);
+      return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+    } catch {
+      return null;
+    }
   }
 }
 
