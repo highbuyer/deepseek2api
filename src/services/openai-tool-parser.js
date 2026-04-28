@@ -89,14 +89,33 @@ function parseJsonObject(text) {
   }
 }
 
+/**
+ * Extract the "name" attribute from a tag like <tool_name name="TodoWrite">.
+ * Returns the attribute value if found, otherwise empty string.
+ */
+function extractNameAttrFromTag(text, tagName) {
+  const re = new RegExp(`<(?:[a-z0-9_:-]+:)?${tagName}\\b([^>]*)>`, "i");
+  const match = toStringSafe(text).match(re);
+  if (!match?.[1]) return "";
+  const attrMatch = match[1].match(/name\s*=\s*"([^"]+)"/i);
+  return attrMatch?.[1]?.trim() ?? "";
+}
+
 function findTagValue(text, patterns) {
   const source = toStringSafe(text);
 
   for (const pattern of patterns) {
     const match = source.match(pattern);
     if (match?.[1] !== undefined) {
-      return decodeXmlText(match[1]);
+      const textContent = decodeXmlText(match[1]).trim();
+      if (textContent) return textContent;
     }
+  }
+
+  // If text content is empty, check for name attribute on <tool_name> / <function_name> / <name> tags
+  for (const tagName of ["tool_name", "function_name", "name"]) {
+    const attrVal = extractNameAttrFromTag(source, tagName);
+    if (attrVal) return attrVal;
   }
 
   return "";
@@ -105,6 +124,7 @@ function findTagValue(text, patterns) {
 /**
  * Find ALL matches of a tag pattern (not just the first one).
  * Returns array of decoded values.
+ * Also checks name= attribute on matched tags when text content is empty.
  */
 function findAllTagValues(text, patterns) {
   const source = toStringSafe(text);
@@ -115,7 +135,15 @@ function findAllTagValues(text, patterns) {
     let match;
     while ((match = re.exec(source)) !== null) {
       if (match[1] !== undefined) {
-        results.push(decodeXmlText(match[1]));
+        const textContent = decodeXmlText(match[1]).trim();
+        if (textContent) {
+          results.push(textContent);
+        } else {
+          // Text content empty — try name= attribute on the opening tag
+          const fullMatch = match[0];
+          const attrVal = fullMatch.match(/name\s*=\s*"([^"]+)"/i)?.[1]?.trim();
+          if (attrVal) results.push(attrVal);
+        }
       }
     }
     if (results.length) break;
