@@ -709,7 +709,17 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
 
         let parsedArgs;
         const jsonArgs = parseJsonObject(toolArgs);
-        parsedArgs = jsonArgs ? JSON.stringify(jsonArgs) : toolArgs;
+        if (jsonArgs) {
+          parsedArgs = JSON.stringify(jsonArgs);
+        } else {
+          // Not JSON — try parsing as XML markup KV (e.g. <pattern>...</pattern><path>...</path>)
+          const markupArgs = parseMarkupInput(toolArgs);
+          if (markupArgs && Object.keys(markupArgs).length > 0) {
+            parsedArgs = JSON.stringify(markupArgs);
+          } else {
+            parsedArgs = toolArgs;
+          }
+        }
 
         output.push(buildParsedToolCall(toolName, parsedArgs));
       }
