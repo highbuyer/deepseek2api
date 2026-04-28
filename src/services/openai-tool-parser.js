@@ -27,7 +27,8 @@ const TOOL_ARGS_PATTERNS = Object.freeze([
 ]);
 
 /* ── <parameter name="key">value</parameter> pattern (singular with name attr) ── */
-const PARAMETER_NAME_ATTR_PATTERN = /<(?:[a-z0-9_:-]+:)?parameter\b[^>]*\bname\s*=\s*"([^"]+)"[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?parameter>/gi;
+/* Also matches <param name="key">value</param> (shorthand used by some models) */
+const PARAMETER_NAME_ATTR_PATTERN = /<(?:[a-z0-9_:-]+:)?param(?:eter)?\b[^>]*\bname\s*=\s*"([^"]+)"[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?param(?:eter)?\s*>/gi;
 
 /* ── Known structural tag names (not tool names) ── */
 const KNOWN_STRUCTURAL_TAGS = new Set([
