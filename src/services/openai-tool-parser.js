@@ -304,6 +304,20 @@ function findTagValue(text, patterns) {
  * Also checks name= attribute on matched tags when text content is empty or looks like XML.
  */
 function findAllTagValues(text, patterns) {
+  return findAllTagValuesImpl(text, patterns, /* skipNameAttr */ false);
+}
+
+/**
+ * Find ALL matches of an argument tag pattern (e.g. <parameters>).
+ * Returns array of raw decoded content strings — does NOT apply the name= attribute
+ * fallback that findAllTagValues uses for tool-name extraction.
+ * This prevents <parameter name="path"> sub-elements from being mis-extracted as the args value.
+ */
+function findAllArgsValues(text, patterns) {
+  return findAllTagValuesImpl(text, patterns, /* skipNameAttr */ true);
+}
+
+function findAllTagValuesImpl(text, patterns, skipNameAttr) {
   const source = toStringSafe(text);
   const results = [];
 
@@ -316,12 +330,16 @@ function findAllTagValues(text, patterns) {
         if (textContent && !textContent.startsWith("<")) {
           // Simple text content — use directly
           results.push(textContent);
-        } else {
+        } else if (!skipNameAttr) {
           // Text content empty or looks like nested XML — try name= attribute on the opening tag
+          // (only for tool-name extraction, NOT for args extraction)
           const fullMatch = match[0];
           const attrVal = fullMatch.match(/name\s*=\s*"([^"]+)"/i)?.[1]?.trim();
           if (attrVal) results.push(attrVal);
           else if (textContent) results.push(textContent); // fallback: use XML content as-is
+        } else {
+          // Args extraction: always return raw content, never the name= attribute
+          if (textContent) results.push(textContent);
         }
       }
     }
@@ -800,6 +818,7 @@ function inferToolNameFromParams(params, allowedToolNames) {
   // Parameter name → candidate tool names (ordered by specificity)
   const HINTS = [
     { param: "command", tools: ["Shell", "Bash"] },
+    { param: "patch", tools: ["ApplyPatch"] },
     { param: "pattern", tools: ["Glob"] },
     { param: "path", tools: ["ReadFile", "Read"] },
     { param: "query", tools: ["WebSearch"] },
@@ -1121,7 +1140,7 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
         continue;
       }
 
-      const args = findAllTagValues(flatInner, TOOL_ARGS_PATTERNS);
+      const args = findAllArgsValues(flatInner, TOOL_ARGS_PATTERNS);
       log.debug("parser", `[parseContainer] Strategy B: ${effectiveNames.length} <tool_name> tag(s) (from ${names.length} total), ${args.length} <parameters> tag(s)`);
 
       for (let i = 0; i < effectiveNames.length; i++) {
@@ -1130,16 +1149,22 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
         if (!toolName) continue;
 
         let parsedArgs;
-        const jsonArgs = parseJsonObject(toolArgs);
-        if (jsonArgs) {
-          parsedArgs = JSON.stringify(jsonArgs);
+        // First try <parameter name="key">value</parameter> format (handles XML sub-elements)
+        const namedParams = parseParameterNameAttrs(toolArgs);
+        if (namedParams && Object.keys(namedParams).length > 0) {
+          parsedArgs = JSON.stringify(namedParams);
         } else {
-          // Not JSON — try parsing as XML markup KV (e.g. <pattern>...</pattern><path>...</path>)
-          const markupArgs = parseMarkupInput(toolArgs);
-          if (markupArgs && Object.keys(markupArgs).length > 0) {
-            parsedArgs = JSON.stringify(markupArgs);
+          const jsonArgs = parseJsonObject(toolArgs);
+          if (jsonArgs) {
+            parsedArgs = JSON.stringify(jsonArgs);
           } else {
-            parsedArgs = toolArgs;
+            // Not JSON — try parsing as XML markup KV (e.g. <pattern>...</pattern><path>...</path>)
+            const markupArgs = parseMarkupInput(toolArgs);
+            if (markupArgs && Object.keys(markupArgs).length > 0) {
+              parsedArgs = JSON.stringify(markupArgs);
+            } else {
+              parsedArgs = toolArgs;
+            }
           }
         }
 
@@ -1194,7 +1219,9 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
     const kvToolCalls = parseKeyValueToolFormat(flatInner, allowedToolNames);
     if (kvToolCalls.length) {
       log.debug("parser", `[parseContainer] Strategy F: found ${kvToolCalls.length} key-value tool call(s): [${kvToolCalls.map(c => c.name).join(", ")}]`);
-      output.push(...kvToolCalls);
+      for (const kv of kvToolCalls) {
+        output.push(buildParsedToolCall(kv.name, kv.argumentsText));
+      }
       continue;
     }
 
@@ -1248,10 +1275,13 @@ function parseMarkupToolCalls(text, allowedToolNames = []) {
     if (stripped.length > 0 && stripped.length < source.length) {
       log.debug("parser", `[parseMarkupToolCalls] Detected ${openCount} unclosed <tool_calls> tag(s), stripped to ${stripped.length} chars, attempting parse`);
 
+      // Pre-process: close unclosed argument tags before parsing
+      const fixedStripped = closeUnclosedArgTags(stripped);
+
       // Try Strategy B: <tool_name>+<parameters> flat pairs (most common format inside containers)
-      const names = findAllTagValues(stripped, TOOL_NAME_PATTERNS);
+      const names = findAllTagValues(fixedStripped, TOOL_NAME_PATTERNS);
       if (names.length) {
-        const namedParams = parseParameterNameAttrs(stripped);
+        const namedParams = parseParameterNameAttrs(fixedStripped);
         if (namedParams && Object.keys(namedParams).length > 0 && names.length === 1) {
           const toolName = names[0].trim();
           const argumentsText = JSON.stringify(namedParams);
@@ -1259,7 +1289,7 @@ function parseMarkupToolCalls(text, allowedToolNames = []) {
           return [buildParsedToolCall(toolName, argumentsText)];
         }
 
-        const args = findAllTagValues(stripped, TOOL_ARGS_PATTERNS);
+        const args = findAllArgsValues(fixedStripped, TOOL_ARGS_PATTERNS);
         if (args.length || names.length) {
           const results = [];
           for (let i = 0; i < names.length; i++) {
@@ -1288,15 +1318,15 @@ function parseMarkupToolCalls(text, allowedToolNames = []) {
         }
       }
 
-      // Try parsing the stripped content as standalone blocks
-      const innerCalls = parseStandaloneSingularBlocks(stripped, allowedToolNames);
+      // Try parsing the fixed content as standalone blocks
+      const innerCalls = parseStandaloneSingularBlocks(fixedStripped, allowedToolNames);
       if (innerCalls.length) {
         log.debug("parser", `[parseMarkupToolCalls] Unclosed container fallback: found ${innerCalls.length} call(s)`);
         return innerCalls;
       }
 
-      // Try other strategies on the stripped content
-      const namedBlocks = findNamedToolBlocks(stripped, allowedToolNames);
+      // Try other strategies on the fixed content
+      const namedBlocks = findNamedToolBlocks(fixedStripped, allowedToolNames);
       if (namedBlocks.length) {
         log.debug("parser", `[parseMarkupToolCalls] Unclosed container fallback (named blocks): found ${namedBlocks.length} call(s)`);
         return namedBlocks.map(({ name, body }) => {
@@ -1305,7 +1335,7 @@ function parseMarkupToolCalls(text, allowedToolNames = []) {
         });
       }
 
-      const toolNameTags = findToolNameTags(stripped, allowedToolNames);
+      const toolNameTags = findToolNameTags(fixedStripped, allowedToolNames);
       if (toolNameTags.length) {
         log.debug("parser", `[parseMarkupToolCalls] Unclosed container fallback (tag-name): found ${toolNameTags.length} call(s)`);
         return toolNameTags.map(({ name, body }) => {
