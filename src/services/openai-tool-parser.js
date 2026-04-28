@@ -79,6 +79,28 @@ function stripFencedCodeBlocks(text) {
   return toStringSafe(text).replace(/```[\s\S]*?```/g, " ");
 }
 
+/**
+ * Strip surrounding quotes from a value when the model wraps it in quotes
+ * inside an XML element, e.g. <parameter name="glob_pattern">"*.toml"</parameter>
+ * Only strips if the value starts AND ends with the same quote character.
+ */
+function stripSurroundingQuotes(value) {
+  const trimmed = toStringSafe(value).trim();
+  if (trimmed.length >= 2) {
+    const first = trimmed[0];
+    const last = trimmed[trimmed.length - 1];
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      // Only strip if it's not a valid JSON string (already parsed by JSON.parse)
+      // and looks like a plain quoted value
+      const inner = trimmed.slice(1, -1);
+      // Don't strip if inner content itself contains unescaped matching quotes
+      // (could be a legitimate value)
+      return inner;
+    }
+  }
+  return value;
+}
+
 function decodeXmlText(text) {
   const raw = toStringSafe(text).trim();
   const cdataMatch = raw.match(/^<!\[CDATA\[([\s\S]*?)]]>$/i);
@@ -354,7 +376,8 @@ function parseParameterNameAttrs(text) {
     } else if (value.trim() === "false") {
       output[key] = false;
     } else {
-      output[key] = value;
+      // Strip surrounding quotes that models sometimes add inside XML values
+      output[key] = stripSurroundingQuotes(value);
     }
   }
 
@@ -547,14 +570,53 @@ function parseStandaloneSingularBlocks(text, allowedToolNames = []) {
 }
 
 /**
- * Pre-process: close unclosed argument tags like <parameters> without </parameters>.
- * The model sometimes omits the closing tag and goes straight to </tool_calls>.
- * E.g. <parameters>{"command": "ls"}</tool_calls> → <parameters>{"command": "ls"}</parameters>
+ * Pre-process: fix common tag closing issues.
+ * 1. Fix singular/plural mismatch: <parameters>...</parameter> → <parameters>...</parameters>
+ * 2. Close unclosed argument tags: <parameters>... without </parameters>
+ * The model sometimes writes </parameter> when it means </parameters>,
+ * or omits the closing tag entirely and goes straight to </tool_calls>.
  */
 function closeUnclosedArgTags(text) {
   const source = toStringSafe(text);
   let result = source;
 
+  // Step 1: Fix singular/plural closing tag mismatches
+  // E.g. <parameters>...</parameter> → <parameters>...</parameters>
+  const pluralTags = [
+    { open: "parameters", wrongClose: "</parameter>" },
+    { open: "arguments", wrongClose: "</argument>" },
+    { open: "args", wrongClose: "</arg>" }
+  ];
+
+  for (const { open: tagName, wrongClose } of pluralTags) {
+    const openRe = new RegExp(`<(?:[a-z0-9_:-]+:)?${tagName}\\b[^>]*>`, "gi");
+    const correctCloseRe = new RegExp(`</(?:[a-z0-9_:-]+:)?${tagName}\\s*>`, "gi");
+    const wrongCloseRe = new RegExp(wrongClose.replace("/", "\\/") + "\\s*>", "gi");
+
+    const openCount = (result.match(openRe) || []).length;
+    const correctCloseCount = (result.match(correctCloseRe) || []).length;
+    const wrongCloseCount = (result.match(wrongCloseRe) || []).length;
+
+    // If we have <parameters> opening tags with </parameter> wrong closings
+    // but no correct </parameters> closings, fix the mismatches
+    if (openCount > 0 && wrongCloseCount > 0 && correctCloseCount < openCount) {
+      // Replace wrong closings with correct ones, but only as many as needed
+      let fixed = 0;
+      const needed = openCount - correctCloseCount;
+      result = result.replace(wrongCloseRe, (match) => {
+        if (fixed < needed) {
+          fixed++;
+          return `</${tagName}>`;
+        }
+        return match;
+      });
+      if (fixed > 0) {
+        log.debug("parser", `[closeUnclosedArgTags] Fixed ${fixed} </${wrongClose.slice(2)}> → </${tagName}> mismatch(es)`);
+      }
+    }
+  }
+
+  // Step 2: Close any remaining unclosed tags
   const tagNames = ["parameters", "input", "arguments", "argument", "args", "params"];
 
   for (const tagName of tagNames) {
