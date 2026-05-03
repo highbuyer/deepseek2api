@@ -197,7 +197,7 @@ function decodeXmlText(text) {
  * ONLY inside JSON string values, preserving structural whitespace outside strings.
  */
 function fixJsonControlChars(text) {
-  let result = "";
+  const out = [];
   let inString = false;
   let escape = false;
 
@@ -205,33 +205,33 @@ function fixJsonControlChars(text) {
     const ch = text[i];
 
     if (escape) {
-      result += ch;
+      out.push(ch);
       escape = false;
       continue;
     }
 
     if (ch === "\\" && inString) {
-      result += ch;
+      out.push(ch);
       escape = true;
       continue;
     }
 
     if (ch === '"') {
       inString = !inString;
-      result += ch;
+      out.push(ch);
       continue;
     }
 
     if (inString) {
-      if (ch === "\n") { result += "\\n"; continue; }
-      if (ch === "\r") { result += "\\r"; continue; }
-      if (ch === "\t") { result += "\\t"; continue; }
+      if (ch === "\n") { out.push("\\n"); continue; }
+      if (ch === "\r") { out.push("\\r"); continue; }
+      if (ch === "\t") { out.push("\\t"); continue; }
     }
 
-    result += ch;
+    out.push(ch);
   }
 
-  return result;
+  return out.join("");
 }
 
 function parseJsonObject(text) {
@@ -1824,6 +1824,21 @@ export function parseToolCallsFromText(text, allowedToolNames = []) {
   fixed = fixed.replace(/<tool_params>/gi, '<parameters>').replace(/<\/tool_params>/gi, '</parameters>');
   if (fixed !== beforeToolCallName) {
     log.debug("parser", `Preprocessed <tool_call_name="X"> and/or <tool_params> tags`);
+  }
+
+  // Step 1.58: Fix <tool_call>...</invoke> — model mixed tool_call open with invoke close.
+  // Also <tool_call>...</tool> and <function_call>...</invoke> etc.
+  // Normalize the closing tag to match the opening tag so blocks parse cleanly.
+  const beforeMixedClose = fixed;
+  fixed = fixed.replace(
+    /<((?:[a-z0-9_:-]+:)?(?:tool_call|function_call|tool))\b([^>]*)>([\s\S]*?)<\/((?:[a-z0-9_:-]+:)?invoke)\s*>/gi,
+    (full, openTag, attrs, content, closeTag) => {
+      log.debug("parser", `[preprocess] Fixed mixed close: <${openTag}>...</${closeTag}> → <${openTag}>...</${openTag}>`);
+      return `<${openTag}${attrs}>${content}</${openTag}>`;
+    }
+  );
+  if (fixed !== beforeMixedClose) {
+    log.debug("parser", `Preprocessed mixed close tags (<tool_call>...</invoke> → <tool_call>...</tool_call>)`);
   }
 
   // Step 1.65: Fix JSON-in-XML malformed tags like <target_directory": "/path"</target_directory>

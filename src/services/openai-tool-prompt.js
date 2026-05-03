@@ -90,9 +90,17 @@ function normalizeAssistantPromptContent(message, toolNameById) {
 }
 
 function normalizeToolPromptContent(message, toolNameById) {
-  const content = normalizeContentText(message?.content).trim() || "null";
+  let content = normalizeContentText(message?.content).trim() || "null";
+  // Strip line-number prefixes (Read output format: "  1→code")
+  content = content.replace(/^\s*\d+→/gm, "");
+  // Truncate very long tool results
+  const MAX_TOOL_RESULT_CHARS = 4000;
+  if (content.length > MAX_TOOL_RESULT_CHARS) {
+    content = content.slice(0, MAX_TOOL_RESULT_CHARS)
+      + `\n...[truncated ${content.length - MAX_TOOL_RESULT_CHARS} chars]`;
+  }
   const toolName = toolNameById.get(toStringSafe(message?.tool_call_id).trim()) || toStringSafe(message?.name).trim();
-  return toolName ? `Tool result for ${toolName}:\n${content}` : content;
+  return toolName ? `<tool_result id="${toolName}">\n${content}\n</tool_result>` : content;
 }
 
 function normalizeMessageRole(role) {
@@ -248,15 +256,16 @@ function buildToolPrompt(policy, tools) {
     "4. After tools return results, fix bugs directly.",
     "5. If you do NOT need a tool, answer normally without ANY XML.",
     "6. Text before/after the <function_calls> block is allowed for natural flow.",
-    "7. ApplyPatch patch MUST be standard unified diff (---/+++/@@). NO *** Begin Patch."
+    "7. ApplyPatch patch MUST be standard unified diff (---/+++/@@). NO *** Begin Patch.",
+    "8. NEVER echo <tool_result> content in your visible output — it's internal context only."
   ].join("\n");
 
   if (policy.mode === "required") {
-    prompt += "\n8. For this response, you MUST call at least one tool.";
+    prompt += "\n9. For this response, you MUST call at least one tool.";
   }
 
   if (policy.mode === "forced") {
-    prompt += `\n8. For this response, you MUST call exactly this tool: ${policy.forcedName}.`;
+    prompt += `\n9. For this response, you MUST call exactly this tool: ${policy.forcedName}.`;
   }
 
   return prompt;
@@ -290,12 +299,26 @@ function keepRecentMessages(msgs, budget) {
   let used = 0;
   for (let i = msgs.length - 1; i >= 0; i--) {
     const block = `${msgs[i].role.toUpperCase()}: ${msgs[i].content ?? ""}`;
-    const entry = i < msgs.length - 1 ? "\n\n" + block : block;
-    if (used + entry.length > budget) break;
-    used += entry.length;
-    kept.unshift(msgs[i]);
+    const separator = i < msgs.length - 1 ? "\n\n" : "";
+    const entry = separator + block;
+    if (used + entry.length <= budget) {
+      used += entry.length;
+      kept.push(msgs[i]);
+      continue;
+    }
+    // Try to truncate this message to fit remaining budget
+    const header = separator + `${msgs[i].role.toUpperCase()}: `;
+    const contentBudget = budget - used - header.length;
+    if (contentBudget > 300) {
+      const truncated = {
+        ...msgs[i],
+        content: (msgs[i].content ?? "").slice(0, contentBudget) + "\n...[truncated]"
+      };
+      kept.push(truncated);
+    }
+    break;
   }
-  return kept;
+  return kept.reverse();
 }
 
 function truncatePromptMessages(messages, maxChars) {

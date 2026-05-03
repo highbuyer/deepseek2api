@@ -29,13 +29,18 @@ const LEAK_TAG_REGEX = new RegExp(
  * names above — anything addable to LEAK_TAG_NAMES that doesn't
  * include "tool_"/"function_"/"think>"/"invoke>"/"apply_patch"/
  * "parameter" needs a new sentinel here. */
-const FAST_PATH_SENTINELS = ["think>", "tool_", "function_", "invoke", "apply_patch", "parameter"];
+const FAST_PATH_SENTINELS = ["think>", "tool_", "function_", "invoke", "apply_patch", "parameter", "TOOL:"];
 
 export function stripLeakedMarkers(text) {
   if (!FAST_PATH_SENTINELS.some(s => text.includes(s))) {
-    return text;
+    // Still check for echoed conversation markers
+    if (!text.includes("USER:") && !text.includes("ASSISTANT:")) {
+      return text;
+    }
   }
   return text
     .replace(/^\[proxy\]<\/think\s*>/i, "")
-    .replace(LEAK_TAG_REGEX, "");
+    .replace(LEAK_TAG_REGEX, "")
+    // Strip echoed conversation role markers and TOOL: prefix
+    .replace(/^(?:USER|ASSISTANT|TOOL):\s*/gmi, "");
 }

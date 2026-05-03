@@ -7,6 +7,85 @@ import { resolveOpenAiModel } from "./openai-request.js";
 
 /* ── Anthropic → DeepSeek prompt conversion ── */
 
+/* ── Slash-command Skill routing ── */
+
+const CLI_BUILTINS = new Set([
+  "clear", "help", "config", "compact", "login", "logout", "fast",
+  "worktree", "tasks", "doctor", "status", "ide", "theme", "model",
+  "agents", "hooks", "mcp", "context", "workspace", "terminal-setup"
+]);
+
+function detectSkillSlashCommand(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role !== "user") continue;
+    const content = typeof messages[i].content === "string" ? messages[i].content : "";
+    const preview = content.slice(0, 200).replace(/\n/g, "\\n");
+    log.debug("prompt", `[anthropic] detectSkillSlashCommand: msg[${i}] role=user content_len=${content.length} preview="${preview}"`);
+
+    // Strategy A: bare /xxx at start of a line — only in non-tool-result messages.
+    // Skip if content has <tool_result> blocks (file paths like /home/langshen/...)
+    if (!/<tool_result/.test(content)) {
+      const bareMatch = content.match(/^\/([\w-]+)(?![\w\/-])/m);
+      if (bareMatch && !CLI_BUILTINS.has(bareMatch[1])) {
+        log.debug("prompt", `[anthropic] detectSkillSlashCommand: detected bare /${bareMatch[1]}`);
+        return bareMatch[1];
+      }
+    }
+
+    // Strategy B: <command-name>/xxx</command-name> (Claude Code wraps slash commands in XML)
+    const tagRegex = /<command-name>\/([\w-]+)<\/command-name>/g;
+    let lastSkillCmd = null;
+    let tagMatch;
+    while ((tagMatch = tagRegex.exec(content)) !== null) {
+      if (!CLI_BUILTINS.has(tagMatch[1])) lastSkillCmd = tagMatch[1];
+    }
+    if (lastSkillCmd) {
+      log.debug("prompt", `[anthropic] detectSkillSlashCommand: detected <command-name>/${lastSkillCmd}`);
+      return lastSkillCmd;
+    }
+
+    log.debug("prompt", `[anthropic] detectSkillSlashCommand: no skill slash command found in latest user message`);
+    return null;
+  }
+  log.debug("prompt", `[anthropic] detectSkillSlashCommand: no user message found`);
+  return null;
+}
+
+function injectSkillRoutingHint(allMessages, tools) {
+  const hasSkillTool = tools.some(t => t.name === "Skill");
+  log.debug("prompt", `[anthropic] injectSkillRoutingHint: hasSkillTool=${hasSkillTool} toolCount=${tools.length}`);
+  if (!hasSkillTool) return null;
+
+  const command = detectSkillSlashCommand(allMessages);
+  if (!command) return null;
+
+  log.debug("prompt", `[anthropic] Injecting Skill routing hint for /${command}`);
+
+  const hint = [
+    "",
+    "!!! SLASH COMMAND ROUTING DIRECTIVE !!!",
+    `The user just typed /${command}. This is a skill invocation.`,
+    `You MUST respond by calling: Skill(skill="${command}")`,
+    "Do NOT manually execute the slash command yourself.",
+    "Call the Skill tool as your first and only action.",
+    "!!! END DIRECTIVE !!!"
+  ].join("\n");
+
+  const sysIdx = allMessages.findIndex(m => m.role === "system");
+  if (sysIdx >= 0) {
+    allMessages[sysIdx] = {
+      ...allMessages[sysIdx],
+      content: allMessages[sysIdx].content + "\n" + hint
+    };
+  } else {
+    allMessages.unshift({ role: "system", content: hint });
+  }
+
+  return command;
+}
+
+/* ── Prompt normalization ── */
+
 function normalizeSystemPrompt(system) {
   if (!system) return [];
   if (typeof system === "string") return [{ role: "system", content: system }];
@@ -36,11 +115,21 @@ function contentBlockToText(block) {
     ].join("\n");
   }
   if (block.type === "tool_result") {
-    const content = typeof block.content === "string"
+    let content = typeof block.content === "string"
       ? block.content
       : (Array.isArray(block.content) ? block.content.map(c => c?.text ?? "").join("\n") : "");
+    // Strip line-number prefixes (Claude Code Read format: "  1→code")
+    // so the model doesn't learn to echo file content with line numbers
+    content = content.replace(/^\s*\d+→/gm, "");
+    // Truncate very long tool results to save prompt budget —
+    // dropping old messages is worse than trimming one result
+    const MAX_TOOL_RESULT_CHARS = 4000;
+    if (content.length > MAX_TOOL_RESULT_CHARS) {
+      content = content.slice(0, MAX_TOOL_RESULT_CHARS)
+        + `\n...[truncated ${content.length - MAX_TOOL_RESULT_CHARS} chars]`;
+    }
     const name = toStringSafe(block.tool_use_id).slice(-20);
-    return `Tool result for ${name}:\n${content}`;
+    return `<tool_result id="${name}">\n${content}\n</tool_result>`;
   }
   return "";
 }
@@ -146,13 +235,14 @@ function buildAnthropicToolPrompt(policy, tools) {
     "3. String/scalar params: <parameter name=\"k\" string=\"true\">value</parameter>",
     "4. List/object params: <parameter name=\"k\" string=\"false\">[1,2]</parameter>",
     "5. Multi-line params (patch, code, file content) — use CDATA",
+    "6. Never echo <tool_result> content in your visible output — it's internal context",
   ].join("\n");
 
   if (policy.mode === "required") {
-    prompt += "\n6. For this response, you MUST call at least one tool.";
+    prompt += "\n7. For this response, you MUST call at least one tool.";
   }
   if (policy.mode === "forced") {
-    prompt += `\n6. For this response, you MUST call exactly this tool: ${policy.forcedName}.`;
+    prompt += `\n7. For this response, you MUST call exactly this tool: ${policy.forcedName}.`;
   }
 
   return prompt;
@@ -181,12 +271,26 @@ function keepRecentMessages(msgs, budget) {
   let used = 0;
   for (let i = msgs.length - 1; i >= 0; i--) {
     const block = `${msgs[i].role.toUpperCase()}: ${msgs[i].content ?? ""}`;
-    const entry = i < msgs.length - 1 ? "\n\n" + block : block;
-    if (used + entry.length > budget) break;
-    used += entry.length;
-    kept.unshift(msgs[i]);
+    const separator = i < msgs.length - 1 ? "\n\n" : "";
+    const entry = separator + block;
+    if (used + entry.length <= budget) {
+      used += entry.length;
+      kept.push(msgs[i]);
+      continue;
+    }
+    // Try to truncate this message to fit remaining budget
+    const header = separator + `${msgs[i].role.toUpperCase()}: `;
+    const contentBudget = budget - used - header.length;
+    if (contentBudget > 300) {
+      const truncated = {
+        ...msgs[i],
+        content: (msgs[i].content ?? "").slice(0, contentBudget) + "\n...[truncated]"
+      };
+      kept.push(truncated);
+    }
+    break;
   }
-  return kept;
+  return kept.reverse();
 }
 
 function truncatePrompt(messages, maxChars) {
@@ -239,12 +343,25 @@ export function buildAnthropicPrompt({ messages, system, tools, toolChoice }) {
   const normalizedMessages = normalizeAnthropicMessages(messages);
   const allMessages = [...systemMsgs, ...normalizedMessages];
 
+  // Route slash commands to Skill tool (deepseek models may not follow system prompt)
+  const skillCommand = injectSkillRoutingHint(allMessages, tools ?? []);
+
+  // Force tool_choice to Skill when slash command detected,
+  // otherwise deepseek models will manually simulate the skill instead of delegating
+  const effectiveToolChoice = skillCommand
+    ? { type: "function", function: { name: "Skill" } }
+    : toolChoice;
+
+  if (skillCommand) {
+    log.debug("prompt", `[anthropic] Overriding tool_choice to force Skill tool for /${skillCommand}`);
+  }
+
   const anthropicTools = (tools ?? []).map((t) => ({
     ...t,
     function: { name: t.name, description: t.description, parameters: t.input_schema }
   }));
 
-  const policy = resolveToolChoicePolicy({ tools: anthropicTools, toolChoice });
+  const policy = resolveToolChoicePolicy({ tools: anthropicTools, toolChoice: effectiveToolChoice });
   const promptMessages = injectAnthropicToolPrompt(allMessages, tools ?? [], policy);
 
   let prompt = buildPromptFromMessages(promptMessages);
@@ -259,6 +376,7 @@ export function buildAnthropicPrompt({ messages, system, tools, toolChoice }) {
   return {
     prompt,
     toolChoicePolicy: policy,
-    toolNames: policy.allowedToolNames
+    toolNames: policy.allowedToolNames,
+    forcedSkillCommand: skillCommand ?? ""
   };
 }

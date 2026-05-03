@@ -102,7 +102,11 @@ export async function streamAnthropicMessage(options) {
   let contentIndex = 0;
   let currentBlockType = null;  // "thinking" | "text" | "tool_use"
   let sawToolCall = false;
-  const inputTokens = body?.messages?.reduce((s, m) => s + JSON.stringify(m).length, 0) ?? 0;
+  const inputChars = JSON.stringify(body?.messages).length;
+
+  // When tool_choice is forced, buffer text until we confirm a valid tool call
+  const isForcedMode = promptRequest.toolChoicePolicy.mode === "forced";
+  const textBuffer = [];
 
   response.writeHead(200, {
     "cache-control": "no-cache, no-transform",
@@ -123,7 +127,7 @@ export async function streamAnthropicMessage(options) {
       model: model.id,
       stop_reason: null,
       stop_sequence: null,
-      usage: { input_tokens: Math.round(inputTokens / 4), output_tokens: 0 }
+      usage: { input_tokens: Math.round(inputChars / 4), output_tokens: 0 }
     }
   });
 
@@ -159,6 +163,22 @@ export async function streamAnthropicMessage(options) {
 
   const emitToolCalls = (calls) => {
     if (!calls.length) return;
+
+    // In forced mode, only accept calls matching the forced tool
+    if (isForcedMode) {
+      const forcedName = promptRequest.toolChoicePolicy.forcedName;
+      const validCalls = calls.filter(c => c.name === forcedName);
+      if (!validCalls.length) return; // discard non-compliant calls, keep buffering
+      // Flush buffered text before the valid tool call
+      if (textBuffer.length) {
+        const combined = textBuffer.join("");
+        textBuffer.length = 0;
+        startBlock("text", { text: "" });
+        emitDelta("text_delta", "text", combined);
+      }
+      calls = validCalls;
+    }
+
     sawToolCall = true;
     finishCurrentBlock();
 
@@ -179,8 +199,12 @@ export async function streamAnthropicMessage(options) {
       startBlock("thinking", { thinking: "" });
       emitDelta("thinking_delta", "thinking", cleaned);
     } else {
-      startBlock("text", { text: "" });
-      emitDelta("text_delta", "text", cleaned);
+      if (isForcedMode) {
+        textBuffer.push(cleaned);
+      } else {
+        startBlock("text", { text: "" });
+        emitDelta("text_delta", "text", cleaned);
+      }
     }
   };
 
@@ -236,6 +260,21 @@ export async function streamAnthropicMessage(options) {
         log.debug("bridge", `[anthropic-stream] No tool calls (allowed: [${promptRequest.toolNames.join(",")}]). ${emittedText.length} chars total (think: ${thinkLen}, response: ${emittedText.length - thinkLen}).\n${summary}`);
       }
     }
+  }
+
+  /* ── Forced mode fallback: synthesize Skill call when model doesn't comply ── */
+
+  if (isForcedMode && !sawToolCall && promptRequest.forcedSkillCommand) {
+    // Discard buffered text — model output was non-compliant (hallucinated forbidden tools)
+    textBuffer.length = 0;
+    log.info("bridge", `[anthropic-stream] Forced mode: synthesizing Skill(skill="${promptRequest.forcedSkillCommand}") call`);
+
+    const synthCall = {
+      id: createMessageId(),
+      name: "Skill",
+      argumentsText: JSON.stringify({ skill: promptRequest.forcedSkillCommand })
+    };
+    emitToolCalls([synthCall]);
   }
 
   /* ── message_delta + message_stop ── */
