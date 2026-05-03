@@ -3,8 +3,9 @@ import { createChatSession, deleteChatSession } from "./chat-session-service.js"
 import { proxyDeepseekRequest } from "./deepseek-proxy.js";
 import { log } from "../utils/log.js";
 
-const THINK_OPEN_TAG = "VSION>";
+const THINK_OPEN_TAG = "<think>";
 const THINK_CLOSE_TAG = "</think>";
+const THINK_FORCED_CLOSE_TAG = "[proxy]</think>";
 
 function startCompletion({ account, requestOptions, sessionId }) {
   return proxyDeepseekRequest({
@@ -31,16 +32,19 @@ function createThinkingTagger() {
   let currentKind = null;
 
   return {
+    get kind() {
+      return currentKind;
+    },
     flush() {
       if (currentKind !== "thinking") {
         return "";
       }
 
       currentKind = "response";
-      return THINK_CLOSE_TAG;
+      return THINK_FORCED_CLOSE_TAG;
     },
     push(delta) {
-      if (!delta?.text) {
+      if (!delta) {
         return "";
       }
 
@@ -55,11 +59,20 @@ function createThinkingTagger() {
         currentKind = delta.kind;
       }
 
+      if (!delta.text) {
+        return prefix;
+      }
+
       return prefix + delta.text;
     }
   };
 }
 
+/* Stream consumer.
+ * The thinking-tagger emits text with `<think>`/`</think>` markers around
+ * reasoning content.  All filtering of tool-call XML and partial-prefix
+ * holding is delegated to the sieve via `onText(text, kind)`.  Callers
+ * receive structured events from the sieve and decide how to write SSE. */
 async function consumeTaggedStream(stream, onText) {
   if (!stream) {
     log.warn("runner", "No stream body received from upstream");
@@ -70,12 +83,15 @@ async function consumeTaggedStream(stream, onText) {
   const deltaDecoder = createDeepseekDeltaDecoder();
   const tagger = createThinkingTagger();
   let chunkCount = 0;
-  const parser = createSseParser(({ data, event }) => {
+
+  const parser = createSseParser(({ data }) => {
     chunkCount++;
-    const text = tagger.push(deltaDecoder.consume(data));
-    if (text) {
-      onText(text);
-    }
+    const delta = deltaDecoder.consume(data);
+    if (!delta) return;
+    const text = tagger.push(delta);
+    if (!text) return;
+
+    onText(text, tagger.kind);
   });
 
   for await (const chunk of stream) {
@@ -85,7 +101,7 @@ async function consumeTaggedStream(stream, onText) {
   parser.flush();
   const suffix = tagger.flush();
   if (suffix) {
-    onText(suffix);
+    onText(suffix, tagger.kind);
   }
 
   log.debug("runner", `Stream consumed: ${chunkCount} SSE events`);
@@ -131,9 +147,9 @@ export async function streamCompletionContent({ account, deleteAfterFinish = fal
     onComplete: async (sessionId) => {
       const { response } = await startCompletion({ account, requestOptions, sessionId });
       let hasContent = false;
-      await consumeTaggedStream(response.body, (text) => {
+      await consumeTaggedStream(response.body, (text, kind) => {
         hasContent = true;
-        onText(text);
+        onText(text, kind);
       });
 
       if (!hasContent) {

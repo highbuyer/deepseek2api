@@ -6,6 +6,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { parseToolCallsFromText } from "../src/services/openai-tool-parser.js";
 import { createToolSieve } from "../src/services/openai-tool-sieve.js";
+import { stripLeakedMarkers } from "../src/utils/strip-markers.js";
 
 const ALL_TOOLS = [
   "Shell", "Glob", "rg", "Await", "ReadFile", "Delete", "EditNotebook",
@@ -866,5 +867,234 @@ describe("<tool name='X'> inside container normalization", () => {
     assert.equal(calls.length, 2);
     assert.equal(calls[0].name, "Shell");
     assert.equal(calls[1].name, "ReadFile");
+  });
+
+  it("parses bare <tool_call> wrapper around <tool name='X'> blocks", () => {
+    const text = `<tool_calls>
+  <tool_call>
+    <tool name="ReadFile">
+      <parameter name="path" value="/root/douyin/douyin.py</parameter>
+    </tool_call>
+  <tool_call>
+    <tool name="ReadFile">
+      <parameter name="path" value="/root/douyin/main.py</parameter>
+    </tool_call>
+  <tool_call>
+    <tool name="ReadFile">
+      <parameter name="path" value="/root/douyin/env.js</parameter>
+    </tool_call>
+</tool_calls>`;
+    const calls = parseToolCallsFromText(text, ALL_TOOLS);
+    assert.equal(calls.length, 3);
+    assert.equal(calls[0].name, "ReadFile");
+    assert.equal(JSON.parse(calls[0].argumentsText).path, "/root/douyin/douyin.py");
+    assert.equal(calls[1].name, "ReadFile");
+    assert.equal(JSON.parse(calls[1].argumentsText).path, "/root/douyin/main.py");
+    assert.equal(calls[2].name, "ReadFile");
+    assert.equal(JSON.parse(calls[2].argumentsText).path, "/root/douyin/env.js");
+  });
+
+  it("parses <parameter name='X' value='Y</parameter> malformed attribute", () => {
+    const text = `<tool_calls>
+  <tool_call name="ReadFile">
+    <parameter name="path" value="/root/douyin/douyin.py</parameter>
+  </tool_call_name>
+</tool_calls>`;
+    const call = parseOne(text);
+    assert.equal(call.name, "ReadFile");
+    assert.equal(call.input.path, "/root/douyin/douyin.py");
+  });
+
+  it("parses garbled <tool_name name='X</parameter name='>JSON</parameter> format", () => {
+    const text = `<tool_calls>
+  <tool_call>
+    <tool_name name="Shell</parameter name=">{"command":"pwd","description":"Check dir"}</parameter>
+  </tool_call>
+</tool_calls>`;
+    const call = parseOne(text);
+    assert.equal(call.name, "Shell");
+    assert.equal(call.input.command, "pwd");
+    assert.equal(call.input.description, "Check dir");
+  });
+
+  it("parses nested <tool_name><tool_name>X</tool_name>...</tool_name> format", () => {
+    const text = `<tool_calls>
+  <tool_call>
+    <tool_name>
+      <tool_name>ReadFile</tool_name>
+      <parameter name="path">/Users/yiming/project/fmp/main.py</parameter>
+    </tool_name>
+  </tool_call>
+</tool_calls>`;
+    const call = parseOne(text);
+    assert.equal(call.name, "ReadFile");
+    assert.equal(call.input.path, "/Users/yiming/project/fmp/main.py");
+  });
+});
+
+describe("Think/thought block filtering", () => {
+  it("strips <think>...</think> and keeps tool calls outside", () => {
+    const text = `<think>I should list files first.</think><tool_calls>
+    <tool_name>Shell</tool_name>
+    <parameters><command>ls</command></parameters>
+</tool_calls>`;
+    const call = parseOne(text);
+    assert.equal(call.name, "Shell");
+  });
+
+  it("ignores tool calls within <think> blocks", () => {
+    const text = `<think>
+I need to run a command:
+<tool_calls>
+    <tool_name>Shell</tool_name>
+    <parameters><command>rm -rf /</command></parameters>
+</tool_calls>
+</think>`;
+    const calls = parseToolCallsFromText(text, ALL_TOOLS);
+    assert.equal(calls.length, 0);
+  });
+
+  it("strips leaked </thought> tag from tool call XML", () => {
+    const text = `<tool_calls>
+<tool_call>
+<tool_name="Shell</thought>
+<parameter name="command">find /tmp -name test</parameter>
+</tool_call>
+</tool_calls>`;
+    const call = parseOne(text);
+    assert.equal(call.name, "Shell");
+  });
+});
+
+/* ═══════════════════════════════════════════════════
+   Streaming sieve: kind-aware text events
+   ═══════════════════════════════════════════════════ */
+
+describe("Sieve: kind-aware text events", () => {
+  it("emits text events tagged with the kind passed to push()", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    const events = sieve.push("hello world", "response");
+    sieve.flush();
+    const textEvent = events.find(e => e.type === "text");
+    assert.ok(textEvent);
+    assert.equal(textEvent.kind, "response");
+    assert.equal(textEvent.text, "hello world");
+  });
+
+  it("preserves thinking kind for thinking-stage text", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    const events = sieve.push("reasoning step", "thinking");
+    sieve.flush();
+    const textEvent = events.find(e => e.type === "text");
+    assert.ok(textEvent);
+    assert.equal(textEvent.kind, "thinking");
+  });
+
+  it("does not leak partial tool-tag prefix across chunk boundary", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    const e1 = sieve.push("hello <tool_c", "response");
+    const e2 = sieve.push("all><tool_name>Shell</tool_name><parameters>{\"command\":\"ls\"}</parameters></tool_call>", "response");
+    const flushEvents = sieve.flush();
+    const allText = [...e1, ...e2, ...flushEvents]
+      .filter(e => e.type === "text")
+      .map(e => e.text)
+      .join("");
+    assert.ok(!allText.includes("<tool_c"), `Expected no leaked partial tag, got: ${JSON.stringify(allText)}`);
+    assert.equal(allText.trimEnd(), "hello");
+  });
+
+  it("exposes pendingLength while holding partial prefix", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    sieve.push("hello <tool_c", "response");
+    assert.equal(sieve.pendingLength, "<tool_c".length);
+    sieve.flush();
+  });
+});
+
+/* ═══════════════════════════════════════════════════
+   Streaming sieve: close-tag variants (</tool_call_name>)
+   ═══════════════════════════════════════════════════ */
+
+describe("Sieve: close-tag variants", () => {
+  it("recognizes </tool_call_name> as a close variant of <tool_call>", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    const all = [
+      ...sieve.push("<tool_call name=\"Shell\">", "response"),
+      ...sieve.push("<parameter name=\"command\">ls</parameter>", "response"),
+      ...sieve.push("</tool_call_name>", "response"),
+      ...sieve.flush()
+    ];
+    const toolCallEvents = all.filter(e => e.type === "tool_calls");
+    assert.equal(toolCallEvents.length, 1, "Should emit tool_calls without waiting for stream end");
+    assert.equal(toolCallEvents[0].calls[0].name, "Shell");
+  });
+
+  it("still recognizes canonical </tool_call> close", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    const all = [
+      ...sieve.push("<tool_call name=\"Shell\"><parameter name=\"command\">ls</parameter></tool_call>", "response"),
+      ...sieve.flush()
+    ];
+    const toolCallEvents = all.filter(e => e.type === "tool_calls");
+    assert.equal(toolCallEvents.length, 1);
+    assert.equal(toolCallEvents[0].calls[0].name, "Shell");
+  });
+});
+
+describe("Sieve+strip: orphan close tags split across chunks", () => {
+  /* Reproduces real-world leak: model emits a stray `</tool_name>` (or
+   * `</parameter>`, etc.) outside any captured block, AND the streaming
+   * boundary lands between the tag name and the closing `>`.  The sieve
+   * must hold the partial prefix until the next chunk completes the tag,
+   * so the downstream stripper sees a whole token and removes it. */
+  const collectText = (events) => events
+    .filter(e => e.type === "text")
+    .map(e => stripLeakedMarkers(e.text))
+    .join("");
+
+  it("strips </tool_name> even when split as `</tool_name` + `>`", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    const all = [
+      ...sieve.push("Updated todos to-do list\n</tool_name", "response"),
+      ...sieve.push(">\n现在我对项目有了全面了解。", "response"),
+      ...sieve.flush()
+    ];
+    const out = collectText(all);
+    assert.ok(!out.includes("</tool_name>"), `leaked: ${JSON.stringify(out)}`);
+    assert.ok(!out.includes("</tool_name"), `partial leak: ${JSON.stringify(out)}`);
+    assert.ok(out.includes("Updated todos to-do list"));
+    assert.ok(out.includes("现在我对项目有了全面了解"));
+  });
+
+  it("strips </parameter> when split as `</paramet` + `er>`", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    const all = [
+      ...sieve.push("done\n</paramet", "response"),
+      ...sieve.push("er>\nnext step", "response"),
+      ...sieve.flush()
+    ];
+    const out = collectText(all);
+    assert.ok(!out.includes("</parameter>"), `leaked: ${JSON.stringify(out)}`);
+  });
+
+  it("strips </tool_calls> when split as `</tool_call` + `s>`", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    const all = [
+      ...sieve.push("plain text\n</tool_call", "response"),
+      ...sieve.push("s>\ntrailing", "response"),
+      ...sieve.flush()
+    ];
+    const out = collectText(all);
+    assert.ok(!out.includes("</tool_calls>"), `leaked: ${JSON.stringify(out)}`);
+  });
+
+  it("strips orphan </tool_name> in single chunk (sanity)", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    const all = [
+      ...sieve.push("a\n</tool_name>\nb", "response"),
+      ...sieve.flush()
+    ];
+    const out = collectText(all);
+    assert.ok(!out.includes("</tool_name>"));
   });
 });

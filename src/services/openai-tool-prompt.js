@@ -2,30 +2,7 @@ import { buildPromptFromMessages } from "../utils/prompt.js";
 import { getToolFunction, getToolName, resolveToolChoicePolicy } from "./openai-tool-policy.js";
 import { config } from "../config.js";
 import { log } from "../utils/log.js";
-
-function toStringSafe(value) {
-  if (typeof value === "string") {
-    return value;
-  }
-
-  if (value === null || value === undefined) {
-    return "";
-  }
-
-  return String(value);
-}
-
-function toJsonText(value, fallback = "{}") {
-  if (typeof value === "string") {
-    return value.trim() || fallback;
-  }
-
-  try {
-    return JSON.stringify(value ?? {}) || fallback;
-  } catch {
-    return fallback;
-  }
-}
+import { toStringSafe, toJsonText } from "../utils/safe-string.js";
 
 function toCdata(text) {
   const value = toStringSafe(text);
@@ -192,48 +169,94 @@ function buildToolPrompt(policy, tools) {
   }
 
   let prompt = [
-    "You have access to these tools:",
+    "=== TOOLS ===",
     "",
     toolSchemas.join("\n\n"),
     "",
-    "When calling tools, emit raw XML inline at the exact point where the tool call should appear.",
-    "You may include normal assistant text before and/or after the XML block when appropriate.",
-    "If the user explicitly asks for text before or after the tool call, preserve that text around the XML block instead of omitting it.",
-    "Do not wrap the XML in markdown code fences.",
+    "=== TOOL CALL FORMAT ===",
     "",
-    "<tool_calls>",
-    "  <tool_call>",
-    "    <tool_name>TOOL_NAME_HERE</tool_name>",
-    "    <parameters>{\"key\":\"value\"}</parameters>",
-    "  </tool_call>",
-    "</tool_calls>",
+    "You are trained on the DSML (DeepSeek Markup Language) format.",
+    "Use this exact structure — it matches your training:",
     "",
-    "Example with surrounding text:",
-    "开始查询。",
-    "<tool_calls>",
-    "  <tool_call>",
-    "    <tool_name>weather</tool_name>",
-    "    <parameters>{\"city\":\"Shanghai\"}</parameters>",
-    "  </tool_call>",
-    "</tool_calls>",
-    "查询已提交。",
+    "<function_calls>",
+    "  <invoke name=\"ToolName\">",
+    "    <parameter name=\"param1\" string=\"true\">value1</parameter>",
+    "    <parameter name=\"param2\" string=\"false\">[1, 2, 3]</parameter>",
+    "  </invoke>",
+    "</function_calls>",
     "",
     "RULES:",
-    "1) When using a tool, output a raw XML block exactly in the position where that tool call should happen.",
-    "2) <parameters> MUST contain a strict JSON object with double-quoted keys and strings.",
-    "3) Multiple tools go inside one <tool_calls> root.",
-    "4) Normal text is allowed before and after the XML block.",
-    "5) Do not wrap the XML in markdown code fences.",
-    "6) Use only declared tool names and exact schema field names.",
-    "7) If you do not need a tool, answer normally without any XML."
+    "",
+    "1. Container: <function_calls> ... </function_calls> (exactly one root)",
+    "2. Each tool: <invoke name=\"TOOL_NAME\"> ... </invoke>",
+    "3. String/scalar params: <parameter name=\"k\" string=\"true\">value</parameter>",
+    "4. List/object params: <parameter name=\"k\" string=\"false\">[1,2]</parameter>",
+    "5. Multi-line params (patch, code, file content) — use CDATA:",
+    "   <parameter name=\"patch\" string=\"true\"><![CDATA[diff --git a/x b/x",
+    "   @@ -1,3 +1,4 @@",
+    "   -old",
+    "   +new]]></parameter>",
+    "6. Tag names are literal: function_calls, invoke, parameter. NO variation.",
+    "7. NEVER use *** Begin Patch / *** End Patch wrappers — only standard unified diff.",
+    "8. NEVER wrap the XML in markdown code fences (```).",
+    "",
+    "=== EXAMPLES ===",
+    "",
+    "ReadFile:",
+    "<function_calls>",
+    "  <invoke name=\"ReadFile\">",
+    "    <parameter name=\"path\" string=\"true\">/src/main.py</parameter>",
+    "  </invoke>",
+    "</function_calls>",
+    "",
+    "Shell:",
+    "<function_calls>",
+    "  <invoke name=\"Shell\">",
+    "    <parameter name=\"command\" string=\"true\">npm test</parameter>",
+    "  </invoke>",
+    "</function_calls>",
+    "",
+    "ApplyPatch (note CDATA for multi-line patch):",
+    "<function_calls>",
+    "  <invoke name=\"ApplyPatch\">",
+    "    <parameter name=\"target_directory\" string=\"true\">/project</parameter>",
+    "    <parameter name=\"patch\" string=\"true\"><![CDATA[--- a/src/main.py",
+    "+++ b/src/main.py",
+    "@@ -1,3 +1,4 @@",
+    " import os",
+    "+import sys",
+    " ",
+    " def main():]]></parameter>",
+    "  </invoke>",
+    "</function_calls>",
+    "",
+    "Multiple tools:",
+    "<function_calls>",
+    "  <invoke name=\"ReadFile\">",
+    "    <parameter name=\"path\" string=\"true\">/src/main.py</parameter>",
+    "  </invoke>",
+    "  <invoke name=\"Glob\">",
+    "    <parameter name=\"pattern\" string=\"true\">**/*.test.js</parameter>",
+    "  </invoke>",
+    "</function_calls>",
+    "",
+    "=== WORKFLOW ===",
+    "",
+    "1. Thinking: 2-3 lines MAX. Do NOT analyze in depth — ACT.",
+    "2. Call tools immediately. Prefer tools over explanations.",
+    "3. If a tool fails, try a different approach. Never repeat the same failed call.",
+    "4. After tools return results, fix bugs directly.",
+    "5. If you do NOT need a tool, answer normally without ANY XML.",
+    "6. Text before/after the <function_calls> block is allowed for natural flow.",
+    "7. ApplyPatch patch MUST be standard unified diff (---/+++/@@). NO *** Begin Patch."
   ].join("\n");
 
   if (policy.mode === "required") {
-    prompt += "\n8) For this response, you MUST call at least one tool.";
+    prompt += "\n8. For this response, you MUST call at least one tool.";
   }
 
   if (policy.mode === "forced") {
-    prompt += `\n8) For this response, you MUST call exactly this tool: ${policy.forcedName}.`;
+    prompt += `\n8. For this response, you MUST call exactly this tool: ${policy.forcedName}.`;
   }
 
   return prompt;
@@ -262,6 +285,19 @@ function injectToolPrompt(messages, tools, policy) {
   return updated;
 }
 
+function keepRecentMessages(msgs, budget) {
+  const kept = [];
+  let used = 0;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const block = `${msgs[i].role.toUpperCase()}: ${msgs[i].content ?? ""}`;
+    const entry = i < msgs.length - 1 ? "\n\n" + block : block;
+    if (used + entry.length > budget) break;
+    used += entry.length;
+    kept.unshift(msgs[i]);
+  }
+  return kept;
+}
+
 function truncatePromptMessages(messages, maxChars) {
   const systemMsgs = messages.filter((m) => m.role === "system");
   const nonSystemMsgs = messages.filter((m) => m.role !== "system");
@@ -270,22 +306,19 @@ function truncatePromptMessages(messages, maxChars) {
   const systemLen = systemPart.length;
 
   if (systemLen >= maxChars) {
-    log.warn("prompt", `System prompt alone is ${systemLen} chars (limit: ${maxChars}), keeping it as-is`);
-    return systemPart.slice(0, maxChars);
+    const MIN_USER_BUDGET = Math.min(2000, Math.floor(maxChars * 0.1));
+    const systemBudget = maxChars - MIN_USER_BUDGET;
+    const systemPartTrimmed = systemPart.slice(0, Math.max(0, systemBudget));
+    const budget = maxChars - systemPartTrimmed.length;
+    const kept = keepRecentMessages(nonSystemMsgs, budget);
+    const dropped = nonSystemMsgs.length - kept.length;
+    const result = systemPartTrimmed + (kept.length ? "\n\n" + buildPromptFromMessages(kept) : "");
+    log.warn("prompt", `System prompt alone (${systemLen} chars) exceeds limit (${maxChars}), trimmed to ${systemBudget} + ${kept.length}/${nonSystemMsgs.length} recent messages (dropped ${dropped}), total ${result.length} chars`);
+    return result;
   }
 
   const budget = maxChars - systemLen;
-  const kept = [];
-  let used = 0;
-
-  for (let i = nonSystemMsgs.length - 1; i >= 0; i--) {
-    const block = `${nonSystemMsgs[i].role.toUpperCase()}: ${nonSystemMsgs[i].content ?? ""}`;
-    const entry = i < nonSystemMsgs.length - 1 ? "\n\n" + block : block;
-    if (used + entry.length > budget) break;
-    used += entry.length;
-    kept.unshift(nonSystemMsgs[i]);
-  }
-
+  const kept = keepRecentMessages(nonSystemMsgs, budget);
   const dropped = nonSystemMsgs.length - kept.length;
   const result = systemPart + "\n\n" + buildPromptFromMessages(kept);
 

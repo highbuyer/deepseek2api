@@ -1,14 +1,21 @@
 import { parseToolCallsFromText } from "./openai-tool-parser.js";
+import { toStringSafe } from "../utils/safe-string.js";
+import { stripLeakedMarkers, LEAK_TAG_PREFIXES } from "../utils/strip-markers.js";
 import { log } from "../utils/log.js";
 
+/* Each capture pair has one open and a list of acceptable close variants.
+ * `<tool_call>` is closed by either `</tool_call>` (canonical) or
+ * `</tool_call_name>` (DeepSeek's frequent garbled form).  Listing both lets
+ * the streaming sieve emit tool_calls as soon as the block ends, instead of
+ * waiting for end-of-stream and falling back to synthetic close. */
 const TOOL_CAPTURE_PAIRS = Object.freeze([
-  { open: "<tool_calls", close: "</tool_calls>" },
-  { open: "<function_calls", close: "</function_calls>" },
-  { open: "<tool_call", close: "</tool_call>" },
-  { open: "<function_call", close: "</function_call>" },
-  { open: "<invoke", close: "</invoke>" },
-  { open: "<tool_use", close: "</tool_use>" },
-  { open: "<apply_patch", close: "</apply_patch>" }
+  { open: "<tool_calls", closes: ["</tool_calls>"] },
+  { open: "<function_calls", closes: ["</function_calls>"] },
+  { open: "<tool_call", closes: ["</tool_call>", "</tool_call_name>"] },
+  { open: "<function_call", closes: ["</function_call>", "</function_call_name>"] },
+  { open: "<invoke", closes: ["</invoke>"] },
+  { open: "<tool_use", closes: ["</tool_use>"] },
+  { open: "<apply_patch", closes: ["</apply_patch>"] }
 ]);
 
 function isInsideCodeFence(state, prefix) {
@@ -16,17 +23,30 @@ function isInsideCodeFence(state, prefix) {
   return (combined.match(/```/g)?.length ?? 0) % 2 === 1;
 }
 
-function findPartialToolTagStart(text, capturePairs = TOOL_CAPTURE_PAIRS) {
+function findPartialToolTagStart(text, capturePairs) {
   const lastIndex = text.lastIndexOf("<");
   if (lastIndex < 0 || text.slice(lastIndex).includes(">")) {
     return -1;
   }
 
   const tail = text.slice(lastIndex).toLowerCase();
-  return capturePairs.some(({ open }) => open.startsWith(tail)) ? lastIndex : -1;
+  /* Hold the partial fragment if it could grow into either:
+   * - any capture-pair open/close (block-style tools)
+   * - any orphan leak tag the downstream stripper would remove
+   *   (`<tool_name`, `</parameter`, etc.) — without this the stream
+   *   boundary can split a leak token and slip the second half past
+   *   the regex-based stripper. */
+  const matchesCapture = capturePairs.some(({ open, closes }) =>
+    open.startsWith(tail) || closes.some(c => c.startsWith(tail))
+  );
+  if (matchesCapture) return lastIndex;
+
+  return LEAK_TAG_PREFIXES.some(p => p.toLowerCase().startsWith(tail))
+    ? lastIndex
+    : -1;
 }
 
-function findToolSegmentStart(state, text, capturePairs = TOOL_CAPTURE_PAIRS) {
+function findToolSegmentStart(state, text, capturePairs) {
   const lower = text.toLowerCase();
   let offset = 0;
 
@@ -56,7 +76,7 @@ function findToolSegmentStart(state, text, capturePairs = TOOL_CAPTURE_PAIRS) {
   return -1;
 }
 
-function splitSafeContent(state, text, capturePairs = TOOL_CAPTURE_PAIRS) {
+function splitSafeContent(state, text, capturePairs) {
   const partialStart = findPartialToolTagStart(text, capturePairs);
   if (partialStart < 0 || isInsideCodeFence(state, text.slice(0, partialStart))) {
     return { safe: text, hold: "" };
@@ -65,7 +85,7 @@ function splitSafeContent(state, text, capturePairs = TOOL_CAPTURE_PAIRS) {
   return { safe: text.slice(0, partialStart), hold: text.slice(partialStart) };
 }
 
-function consumeCapturedToolBlock(captured, allowedToolNames, incompleteCount, capturePairs = TOOL_CAPTURE_PAIRS) {
+function consumeCapturedToolBlock(captured, allowedToolNames, capturePairs) {
   const lower = captured.toLowerCase();
 
   for (const pair of capturePairs) {
@@ -74,22 +94,23 @@ function consumeCapturedToolBlock(captured, allowedToolNames, incompleteCount, c
       continue;
     }
 
-    const closeIndex = lower.lastIndexOf(pair.close);
-    if (closeIndex < openIndex) {
-      // Only log every Nth incomplete check to reduce noise
-      // Always log first occurrence and then periodically
-      const logInterval = Math.max(20, Math.floor(captured.length / 50));
-      if (incompleteCount <= 1 || incompleteCount % logInterval === 0) {
-        log.debug("sieve", `[consume] Still waiting for </${pair.close}> (checked ${incompleteCount}x, captured ${captured.length} chars)`);
+    let closeIndex = -1;
+    let chosenClose = pair.closes[0];
+    for (const closeStr of pair.closes) {
+      const idx = lower.lastIndexOf(closeStr);
+      if (idx > closeIndex) {
+        closeIndex = idx;
+        chosenClose = closeStr;
       }
+    }
+
+    if (closeIndex < openIndex) {
       return { ready: false };
     }
 
-    const closeEnd = closeIndex + pair.close.length;
+    const closeEnd = closeIndex + chosenClose.length;
     const block = captured.slice(openIndex, closeEnd);
-    log.debug("sieve", `[consume] Complete block captured: <${pair.open}>...</${pair.close}>, block length=${block.length}, preview="${block.slice(0, 200)}"`);
     const calls = parseToolCallsFromText(block, allowedToolNames);
-    log.debug("sieve", `[consume] Parsed ${calls.length} tool call(s) from captured block`);
     return {
       ready: true,
       prefix: captured.slice(0, openIndex),
@@ -101,29 +122,30 @@ function consumeCapturedToolBlock(captured, allowedToolNames, incompleteCount, c
   return { ready: true, prefix: captured, calls: [], suffix: "" };
 }
 
-function pushTextEvent(state, events, text) {
+function pushTextEvent(state, events, text, kind) {
   if (!text) {
     return;
   }
 
   state.emittedText += text;
-  events.push({ type: "text", text });
+  if (state.emittedText.length > 100000) {
+    log.warn("sieve", `[pushTextEvent] emittedText length ${state.emittedText.length} exceeds limit, truncating to last 50000 chars`);
+    state.emittedText = state.emittedText.slice(-50000);
+  }
+  events.push({ type: "text", text, kind: kind ?? state.lastKind ?? "response" });
 }
 
 export function createToolSieve(allowedToolNames = []) {
-  // Build extended capture pairs including tool-name-specific tags
-  // E.g. if ApplyPatch is in allowedToolNames, add { open: "<applypatch", close: "</applypatch>" }
-  // This allows the sieve to detect when the model outputs <ApplyPatch> instead of <tool_calls>
+  /* Tool-name-specific tags let the sieve also detect bare <ApplyPatch>...
+   * style outputs (model omits the <tool_calls> wrapper).  Skip names that
+   * already collide with a generic open tag. */
   const capturePairs = [...TOOL_CAPTURE_PAIRS];
   for (const name of (allowedToolNames ?? [])) {
     const lower = name.toLowerCase();
-    // Skip if already covered by a generic pattern (e.g. <tool> covers <tool>)
     if (!TOOL_CAPTURE_PAIRS.some(p => lower === p.open.slice(1))) {
-      capturePairs.push({ open: `<${lower}`, close: `</${lower}>` });
+      capturePairs.push({ open: `<${lower}`, closes: [`</${lower}>`] });
     }
   }
-
-  log.debug("sieve", `[createToolSieve] Capture pairs: [${capturePairs.map(p => p.open).join(", ")}] (from tools: [${(allowedToolNames ?? []).join(", ")}])`);
 
   const state = {
     allowedToolNames,
@@ -131,7 +153,7 @@ export function createToolSieve(allowedToolNames = []) {
     capturing: false,
     emittedText: "",
     pending: "",
-    incompleteCount: 0
+    lastKind: "response"
   };
 
   function drain() {
@@ -142,22 +164,24 @@ export function createToolSieve(allowedToolNames = []) {
         if (state.pending) {
           state.capture += state.pending;
           state.pending = "";
-          state.incompleteCount++;
         }
 
-        const consumed = consumeCapturedToolBlock(state.capture, state.allowedToolNames, state.incompleteCount, capturePairs);
+        if (state.capture.length > 50000) {
+          log.warn("sieve", `[drain] Capture length ${state.capture.length} exceeds limit, forcing flush as text`);
+          pushTextEvent(state, events, state.capture, state.lastKind);
+          state.capture = "";
+          state.capturing = false;
+          continue;
+        }
+
+        const consumed = consumeCapturedToolBlock(state.capture, state.allowedToolNames, capturePairs);
         if (!consumed.ready) {
           break;
         }
 
-        if (state.incompleteCount > 1) {
-          log.debug("sieve", `[consume] Block completed after ${state.incompleteCount} checks, ${state.capture.length} chars captured`);
-        }
-        state.incompleteCount = 0;
-
         state.capture = "";
         state.capturing = false;
-        pushTextEvent(state, events, consumed.prefix ?? "");
+        pushTextEvent(state, events, consumed.prefix ?? "", state.lastKind);
         if (consumed.calls?.length) {
           events.push({ type: "tool_calls", calls: consumed.calls });
         }
@@ -171,8 +195,7 @@ export function createToolSieve(allowedToolNames = []) {
 
       const start = findToolSegmentStart(state, state.pending, capturePairs);
       if (start >= 0) {
-        log.debug("sieve", `[drain] Tool segment start detected at offset ${start}, entering capture mode`);
-        pushTextEvent(state, events, state.pending.slice(0, start));
+        pushTextEvent(state, events, state.pending.slice(0, start), state.lastKind);
         state.capture = state.pending.slice(start);
         state.pending = "";
         state.capturing = true;
@@ -181,7 +204,7 @@ export function createToolSieve(allowedToolNames = []) {
 
       const { safe, hold } = splitSafeContent(state, state.pending, capturePairs);
       state.pending = hold;
-      pushTextEvent(state, events, safe);
+      pushTextEvent(state, events, safe, state.lastKind);
       break;
     }
 
@@ -193,51 +216,61 @@ export function createToolSieve(allowedToolNames = []) {
       const events = drain();
 
       if (state.capturing) {
-        const consumed = consumeCapturedToolBlock(state.capture, state.allowedToolNames, 0, capturePairs);
-        if (consumed.ready) {
-          pushTextEvent(state, events, consumed.prefix ?? "");
-          if (consumed.calls?.length) {
-            events.push({ type: "tool_calls", calls: consumed.calls });
-          }
-          pushTextEvent(state, events, consumed.suffix ?? "");
+        if (state.capture.length > 50000) {
+          log.warn("sieve", `[flush] Capture length ${state.capture.length} exceeds limit, forcing flush as text`);
+          pushTextEvent(state, events, state.capture, state.lastKind);
+          state.capture = "";
+          state.capturing = false;
         } else {
-          // Stream ended without the closing tag — try to parse the partial capture
-          // by appending a synthetic closing tag and attempting to extract tool calls
-          log.debug("sieve", `[flush] Stream ended without closing tag, attempting partial capture parse (${state.capture.length} chars captured)`);
-          // Detect which capture pair was matched and use its close tag for the synthetic block
-          const lowerCapture = state.capture.toLowerCase();
-          let syntheticClose = "</tool_calls>";
-          for (const pair of capturePairs) {
-            if (lowerCapture.indexOf(pair.open) >= 0) {
-              syntheticClose = pair.close;
-              break;
+          const consumed = consumeCapturedToolBlock(state.capture, state.allowedToolNames, capturePairs);
+          if (consumed.ready) {
+            pushTextEvent(state, events, consumed.prefix ?? "", state.lastKind);
+            if (consumed.calls?.length) {
+              events.push({ type: "tool_calls", calls: consumed.calls });
             }
-          }
-          const syntheticBlock = `${state.capture}${syntheticClose}`;
-          const partialCalls = parseToolCallsFromText(syntheticBlock, state.allowedToolNames);
-          if (partialCalls.length) {
-            log.debug("sieve", `[flush] Partial capture parse succeeded: found ${partialCalls.length} tool call(s)`);
-            events.push({ type: "tool_calls", calls: partialCalls });
+            pushTextEvent(state, events, consumed.suffix ?? "", state.lastKind);
           } else {
-            // No tool calls could be extracted — emit as plain text
-            log.debug("sieve", `[flush] Partial capture parse found no tool calls, emitting as text`);
-            pushTextEvent(state, events, state.capture);
+            /* Stream ended mid-capture.  Try a synthetic close so the parser
+             * has a chance to extract calls; if it can't, drop the capture
+             * (emitting raw XML pollutes the conversation). */
+            const lowerCapture = state.capture.toLowerCase();
+            let syntheticClose = "</tool_calls>";
+            for (const pair of capturePairs) {
+              if (lowerCapture.indexOf(pair.open) >= 0) {
+                syntheticClose = pair.closes[0];
+                break;
+              }
+            }
+            const syntheticBlock = `${state.capture}${syntheticClose}`;
+            const partialCalls = parseToolCallsFromText(syntheticBlock, state.allowedToolNames);
+            if (partialCalls.length) {
+              events.push({ type: "tool_calls", calls: partialCalls });
+            } else {
+              log.debug("sieve", `[flush] Dropping ${state.capture.length} chars of unparseable capture`);
+            }
           }
         }
       }
 
-      pushTextEvent(state, events, state.pending);
+      pushTextEvent(state, events, state.pending, state.lastKind);
       state.capture = "";
       state.capturing = false;
       state.pending = "";
       return events;
     },
-    push(chunk) {
-      state.pending += typeof chunk === "string" ? chunk : String(chunk ?? "");
+    push(chunk, kind) {
+      const text = toStringSafe(chunk);
+      if (kind) {
+        state.lastKind = kind;
+      }
+      state.pending += text;
       return drain();
     },
     get captureLength() {
       return state.capture.length;
+    },
+    get pendingLength() {
+      return state.pending.length;
     },
     get isCapturing() {
       return state.capturing;
@@ -248,8 +281,8 @@ export function createToolSieve(allowedToolNames = []) {
   });
 }
 
-function toTextEvent(chunk) {
-  return { type: "text", text: typeof chunk === "string" ? chunk : String(chunk ?? "") };
+function toTextEvent(chunk, kind = "response") {
+  return { type: "text", text: toStringSafe(chunk), kind };
 }
 
 function flattenToolEvents(events) {
@@ -261,7 +294,8 @@ function flattenToolEvents(events) {
 
     output[output.length - 1] = {
       type: "text",
-      text: `${output.at(-1).text}${event.text}`
+      text: `${output.at(-1).text}${event.text}`,
+      kind: output.at(-1).kind
     };
     return output;
   }, []);
@@ -279,12 +313,14 @@ export function splitToolAwareEvents(text, allowedToolNames = []) {
 
 export function extractToolAwareOutput(text, allowedToolNames = []) {
   const events = splitToolAwareEvents(text, allowedToolNames);
+  const content = events
+    .filter((event) => event.type === "text")
+    .map((event) => stripLeakedMarkers(event.text))
+    .join("")
+    .trimStart();
   return {
     events,
-    content: events
-      .filter((event) => event.type === "text")
-      .map((event) => event.text)
-      .join(""),
+    content,
     toolCalls: events.flatMap((event) => event.type === "tool_calls" ? event.calls ?? [] : [])
   };
 }

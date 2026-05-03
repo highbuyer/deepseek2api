@@ -1,21 +1,10 @@
 import { createOpenAiError } from "./openai-error.js";
+import { toStringSafe } from "../utils/safe-string.js";
 
 const TOOL_CHOICE_AUTO = "auto";
 const TOOL_CHOICE_NONE = "none";
 const TOOL_CHOICE_REQUIRED = "required";
 const TOOL_CHOICE_FORCED = "forced";
-
-function toStringSafe(value) {
-  if (typeof value === "string") {
-    return value;
-  }
-
-  if (value === null || value === undefined) {
-    return "";
-  }
-
-  return String(value);
-}
 
 export function getToolFunction(tool) {
   if (!tool || typeof tool !== "object") {

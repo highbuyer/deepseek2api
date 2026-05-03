@@ -110,7 +110,7 @@ export function createDeepseekDeltaDecoder() {
       const payload = JSON.parse(payloadText);
       currentKind = resolveCurrentKind(payload, currentKind);
       const text = extractFragmentText(payload);
-      return text ? { kind: currentKind, text } : null;
+      return { kind: currentKind, text };
     }
   };
 }

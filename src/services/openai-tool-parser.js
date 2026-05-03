@@ -1,14 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { log } from "../utils/log.js";
+import { toStringSafe } from "../utils/safe-string.js";
 
 /* ── Single tool-call block patterns ── */
 /* Includes <tool> to handle models that output <tool name="Shell">...</tool> */
 /* Two patterns needed because DeepSeek sometimes closes <tool_call ...> with </tool_call_name>
  * (backreference \1 can't express "tool_call" OR "tool_call_name" as valid close) */
 const TOOL_BLOCK_PATTERNS = Object.freeze([
-  // <tool_call ...>...</tool_call_name> (most common: name-indicator close)
+  // Garbled close: <tool_call ...>...</tool_call_name> (DeepSeek fallback)
   /<(?:[a-z0-9_:-]+:)?(tool_call|function_call|invoke|tool)\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1_name\s*>/gi,
-  // <tool_call ...>...</tool_call_name> (same tag match, backreference)
+  // Exact close tag match (e.g. <tool_call ...>...</tool_call>).
   /<(?:[a-z0-9_:-]+:)?(tool_call|function_call|invoke|tool)\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1\s*>/gi,
 ]);
 const TOOL_SELFCLOSE_PATTERN = /<(?:[a-z0-9_:-]+:)?invoke\b([^>]*)\/>/gi;
@@ -80,7 +81,7 @@ const ARGUMENT_CARRYING_TAGS = new Set([
   "tool_call_parameters", "function_call_parameters"
 ]);
 
-const TOOL_ATTR_PATTERN = /(name|function|tool)\s*=\s*"([^"]+)"/i;
+const TOOL_ATTR_PATTERN = /(name|function|tool)\s*=\s*"([^"<>\s]+)/i;
 const TOOL_KV_PATTERN = /<(?:[a-z0-9_:-]+:)?([a-z0-9_.-]+)\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1\s*>/gi;
 const ANY_TAG_PATTERN = /<([a-z0-9_:-]+)\b[^>]*>/gi;
 
@@ -94,18 +95,6 @@ const MALFORMED_ATTR_EQUALS = /<((?:[a-z0-9_:-]+:)?(?:tool_name|function_name|na
    extends to include the closing tag (no closing quote before </).
    Extract the tool name and rewrite as <tool_name>WebSearch</tool_name> */
 const MALFORMED_NAME_ATTR_UNCLOSED = /<((?:[a-z0-9_:-]+:)?(?:tool_name|function_name))\s+name="([a-zA-Z0-9_]+)<\/\1>/gi;
-
-function toStringSafe(value) {
-  if (typeof value === "string") {
-    return value;
-  }
-
-  if (value === null || value === undefined) {
-    return "";
-  }
-
-  return String(value);
-}
 
 /**
  * Look up a tool name in the allowed list using case-insensitive matching.
@@ -147,6 +136,22 @@ function sanitizeControlChars(text) {
 
 function stripFencedCodeBlocks(text) {
   return toStringSafe(text).replace(/```[\s\S]*?```/g, " ");
+}
+
+/* Truncate a long string for log output without slicing inside an XML tag.
+ * If the cut point lands after a `<` whose matching `>` got dropped, back
+ * up to that `<` so the log doesn't show garbage like `</tool_ca`.  Append
+ * an ellipsis with the dropped char count so the reader knows there's more. */
+function previewForLog(text, maxLen = 500) {
+  const str = toStringSafe(text);
+  if (str.length <= maxLen) return str;
+  let cut = str.slice(0, maxLen);
+  const lastLt = cut.lastIndexOf("<");
+  const lastGt = cut.lastIndexOf(">");
+  if (lastLt > lastGt) {
+    cut = cut.slice(0, lastLt);
+  }
+  return `${cut}…[+${str.length - cut.length} chars]`;
 }
 
 /**
@@ -241,6 +246,24 @@ function parseJsonObject(text) {
       const value = JSON.parse(fixed);
       return value && typeof value === "object" && !Array.isArray(value) ? value : null;
     } catch {
+      // Third fallback: lenient extraction for flat JSON objects like
+      // {"patch":"...content with unescaped chars...", "desc":"..."}
+      // where the value may have characters that break strict JSON parsing
+      // (e.g. unescaped double-quotes inside patch content).
+      const trimmed = text.trim();
+      if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+        const inner = trimmed.slice(1, -1).trim();
+        const m = inner.match(/^"([^"]+)"\s*:\s*"/);
+        if (m) {
+          const key = m[1];
+          const valueStart = m[0].length;
+          const lastQuote = inner.lastIndexOf('"');
+          if (lastQuote > valueStart) {
+            const value = inner.slice(valueStart, lastQuote);
+            if (value) return { [key]: value };
+          }
+        }
+      }
       return null;
     }
   }
@@ -254,7 +277,7 @@ function extractNameAttrFromTag(text, tagName) {
   const re = new RegExp(`<(?:[a-z0-9_:-]+:)?${tagName}\\b([^>]*)>`, "i");
   const match = toStringSafe(text).match(re);
   if (!match?.[1]) return "";
-  const attrMatch = match[1].match(/name\s*=\s*"([^"]+)"/i);
+  const attrMatch = match[1].match(/name\s*=\s*"([^"<>\s]+)/i);
   return attrMatch?.[1]?.trim() ?? "";
 }
 
@@ -286,7 +309,7 @@ function findUnclosedArgContent(text) {
       // Strip trailing structural closing tags that are not part of the argument content
       content = content.replace(/<\/(?:tool_calls|function_calls|tool_call|function_call|invoke|tool_use)\s*>$/i, "").trim();
       if (content) {
-        log.debug("parser", `[findUnclosedArgContent] Found unclosed <${tagName}> tag, extracted content (length=${content.length}): "${content.slice(0, 150)}"`);
+        log.debug("parser", `[findUnclosedArgContent] Found unclosed <${tagName}> tag, extracted content (length=${content.length}): "${previewForLog(content, 300)}"`);
         return content;
       }
     }
@@ -307,7 +330,7 @@ function findTagValue(text, patterns) {
         // check name= attribute on the opening tag first — it's more likely the actual value
         if (textContent.startsWith("<")) {
           const fullMatch = match[0];
-          const attrVal = fullMatch.match(/name\s*=\s*"([^"]+)"/i)?.[1]?.trim();
+          const attrVal = fullMatch.match(/name\s*=\s*"([^"<>\s]+)/i)?.[1]?.trim();
           if (attrVal) return attrVal;
         }
         return textContent;
@@ -357,19 +380,41 @@ function findAllTagValuesImpl(text, patterns, skipNameAttr) {
     while ((match = re.exec(source)) !== null) {
       if (match[1] !== undefined) {
         const textContent = decodeXmlText(match[1]).trim();
-        if (textContent && !textContent.startsWith("<")) {
-          // Simple text content — use directly
-          results.push(textContent);
-        } else if (!skipNameAttr) {
-          // Text content empty or looks like nested XML — try name= attribute on the opening tag
-          // (only for tool-name extraction, NOT for args extraction)
-          const fullMatch = match[0];
-          const attrVal = fullMatch.match(/name\s*=\s*"([^"]+)"/i)?.[1]?.trim();
-          if (attrVal) results.push(attrVal);
-          else if (textContent) results.push(textContent); // fallback: use XML content as-is
-        } else {
-          // Args extraction: always return raw content, never the name= attribute
+        // When extracting args (skipNameAttr=true), always use raw content.
+        // When extracting tool names (skipNameAttr=false), apply heuristics to
+        // avoid mistaking JSON args or nested XML for a tool name.
+        if (skipNameAttr) {
+          // Args extraction: always return raw content as-is
           if (textContent) results.push(textContent);
+        } else {
+          // Tool-name extraction: apply content-type heuristics
+          const fullMatch = match[0];
+          // Extract just the opening tag (stop before the first >) so name=
+          // attribute lookups don't accidentally match inside nested elements
+          // like <parameter name="path">.
+          const openTag = fullMatch.slice(0, fullMatch.indexOf(">") + 1);
+          if (!textContent) {
+            const attrVal = openTag.match(/name\s*=\s*"([^"<>\s]+)/i)?.[1]?.trim();
+            if (attrVal) results.push(attrVal);
+          } else if (textContent.startsWith("{") || textContent.startsWith("[")) {
+            const attrVal = openTag.match(/name\s*=\s*"([^"<>\s]+)/i)?.[1]?.trim();
+            if (attrVal) results.push(attrVal);
+          } else if (!textContent.startsWith("<")) {
+            results.push(textContent);
+          } else {
+            const attrVal = openTag.match(/name\s*=\s*"([^"<>\s]+)/i)?.[1]?.trim();
+            if (attrVal) {
+              results.push(attrVal);
+            } else {
+              const nestedResults = findAllTagValuesImpl(textContent, patterns, skipNameAttr);
+              if (nestedResults.length) {
+                results.push(...nestedResults);
+              } else {
+                const stripped = textContent.replace(/<[^>]+>/g, '').trim();
+                if (stripped) results.push(stripped);
+              }
+            }
+          }
         }
       }
     }
@@ -507,8 +552,18 @@ function parseParameterNameAttrs(text) {
 
   for (const match of source.matchAll(PARAMETER_NAME_ATTR_PATTERN)) {
     const key = toStringSafe(match[1]).trim();
-    const value = decodeXmlText(match[2]);
+    let value = decodeXmlText(match[2]);
     if (!key) continue;
+
+    // If text content is empty, check for value="..." attribute on the opening tag.
+    // Model sometimes outputs <parameter name="key" value="val"/> or
+    // <parameter name="key" value="val"></parameter> instead of text content.
+    if (!value.trim()) {
+      const valueAttr = match[0].match(/\bvalue\s*=\s*"([^"]*)"/i);
+      if (valueAttr?.[1]) {
+        value = decodeXmlText(valueAttr[1]);
+      }
+    }
 
     found = true;
     const jsonValue = parseJsonObject(value);
@@ -591,13 +646,139 @@ function parseMarkupInput(raw) {
   return parseJsonObject(text) ?? {};
 }
 
+function unwrapNestedJsonStrings(obj, depth) {
+  if (depth <= 0 || !obj || typeof obj !== "object") return obj;
+  if (Array.isArray(obj)) return obj.map(v => unwrapNestedJsonStrings(v, depth));
+  const result = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if ((trimmed.startsWith("[") || trimmed.startsWith("{")) &&
+          (trimmed.endsWith("]") || trimmed.endsWith("}"))) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          result[key] = unwrapNestedJsonStrings(parsed, depth - 1);
+          continue;
+        } catch {}
+      }
+    }
+    result[key] = unwrapNestedJsonStrings(value, depth - 1);
+  }
+  return result;
+}
+
+function fixApplyPatchArgs(input) {
+  if (!input || typeof input !== "object") return input;
+
+  const hasTargetDir = typeof input.target_directory === "string" && input.target_directory.trim();
+  const patch = input.patch;
+  if (typeof patch !== "string" || !patch.trim()) return input;
+
+  let targetDir = hasTargetDir ? input.target_directory.trim().replace(/\/$/, "") : "";
+  let convertedPatch = patch;
+
+  if (patch.includes("*** Begin Patch")) {
+    // Hybrid format: "*** Begin Patch / *** Add <file> / *** / <unified-diff> / *** End Patch"
+    // Pure DeepSeek format: "*** Begin Patch / *** Add File: <path> / *** Content: ..."
+    // Edit+Replace format: "*** Begin Patch / *** Edit File: <path> / *** Replace: / *** With:"
+    const sections = patch.split(/(?=\*{3} Begin Patch)/);
+    const blocks = [];
+
+    for (const section of sections) {
+      // Extract file path — three variants:
+      //   *** Add File: /path  (old format)
+      //   *** Add /path        (new shorthand)
+      //   *** Edit File: /path
+      const fileMatch = section.match(/\*{3} (?:Add|Edit)(?:\s+File:)?\s*(\S+)/i);
+      const filePath = fileMatch ? fileMatch[1] : null;
+
+      // If the section contains a standard unified-diff block (---/+++/@@),
+      // extract it directly and just strip the DeepSeek wrappers.
+      const diffMatch = section.match(/(--- [^\n]+\n\+{3} [^\n]+\n@@ [\s\S]*?)(?=\*{3} End Patch|\*{3} Begin Patch|$)/i);
+      if (diffMatch) {
+        let diff = diffMatch[1].trim();
+        // Infer target_directory: prefer +++ absolute path, fall back to *** Add path
+        if (!targetDir) {
+          const plusMatch = diff.match(/^\+{3}\s+(?:b\/)?(\S+)/m);
+          if (plusMatch && plusMatch[1].startsWith("/")) {
+            // +++ has absolute path: e.g. /home/user/project/sub/file.py
+            // If *** Add gives relative sub/file.py, target_dir = abs minus relative
+            if (filePath && !filePath.startsWith("/")) {
+              const absPath = plusMatch[1];
+              const idx = absPath.lastIndexOf(filePath);
+              if (idx > 0) targetDir = absPath.slice(0, idx).replace(/\/$/, "");
+            }
+            if (!targetDir) {
+              targetDir = plusMatch[1].replace(/\/[^/]+$/, "");
+            }
+          } else if (filePath) {
+            targetDir = filePath.replace(/\/[^/]+$/, "");
+          }
+        }
+        // Make diff paths relative by stripping target_directory prefix
+        if (targetDir) {
+          const escaped = targetDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          diff = diff
+            .replace(new RegExp(`(--- a)${escaped}/?`, "g"), "$1")
+            .replace(new RegExp(`(\\+{3}\\s+)${escaped}/?`, "g"), "$1");
+        }
+        blocks.push(diff);
+        continue;
+      }
+
+      // Old format: *** Content: section
+      const contentMatch = section.match(/\*{3} Content:\s*\n?([\s\S]*?)(?=\*{3} Begin Patch|\*{3} End Patch|$)/i);
+      if (contentMatch && filePath) {
+        const content = contentMatch[1].trim();
+        if (!targetDir) {
+          targetDir = filePath.replace(/\/[^/]+$/, "");
+        }
+        const relPath = targetDir && filePath.startsWith(targetDir + "/")
+          ? filePath.slice(targetDir.length + 1)
+          : filePath.replace(/^\//, "");
+        const lines = content.split("\n");
+        blocks.push(`--- a/${relPath}\n+++ b/${relPath}\n@@ -1,0 +1,${lines.length} @@\n+${lines.join("\n+")}`);
+      }
+
+      // Edit+Replace format
+      const repMatch = section.match(/\*{3} Replace:\s*\n?([\s\S]*?)\*{3} With:\s*\n?([\s\S]*?)(?=\*{3} Begin Patch|\*{3} End Patch|$)/i);
+      if (repMatch && filePath) {
+        const oldLines = repMatch[1].trim().split("\n");
+        const newLines = repMatch[2].trim().split("\n");
+        if (!targetDir) {
+          targetDir = filePath.replace(/\/[^/]+$/, "");
+        }
+        const relPath = targetDir && filePath.startsWith(targetDir + "/")
+          ? filePath.slice(targetDir.length + 1)
+          : filePath.replace(/^\//, "");
+        blocks.push(`--- a/${relPath}\n+++ b/${relPath}\n@@ -1,${oldLines.length} +1,${newLines.length} @@\n${oldLines.map(l => `-${l}`).join("\n")}\n${newLines.map(l => `+${l}`).join("\n")}`);
+      }
+    }
+
+    if (blocks.length) {
+      convertedPatch = blocks.join("\n");
+    }
+  }
+
+  return {
+    ...input,
+    target_directory: targetDir || input.target_directory || "",
+    patch: convertedPatch
+  };
+}
+
 function buildParsedToolCall(name, argumentsText) {
   const normalizedArguments = argumentsText.trim() ? argumentsText.trim() : "{}";
+  const parsed = parseJsonObject(normalizedArguments) ?? parseMarkupInput(normalizedArguments);
+  const input = unwrapNestedJsonStrings(parsed, 3);
+  // DeepSeek's ApplyPatch often misses target_directory and uses a custom
+  // "*** Begin Patch" format instead of standard unified diff.  Fix both.
+  const fixed = name === "ApplyPatch" ? fixApplyPatchArgs(input) : input;
   return {
     id: `call_${randomUUID().replaceAll("-", "")}`,
     name,
-    argumentsText: normalizedArguments,
-    input: parseJsonObject(normalizedArguments) ?? parseMarkupInput(normalizedArguments)
+    argumentsText: JSON.stringify(fixed),
+    input: fixed
   };
 }
 
@@ -639,6 +820,16 @@ function parseToolCallArguments(body) {
     return JSON.stringify(markupObject);
   }
 
+  // 4. Last resort: look for a bare JSON object in the body text.
+  //    Handles garbled formats like:
+  //    <tool_name name="Shell</parameter name=">{"command":"ls"}</parameter>
+  //    where the JSON args are plain text between malformed tags.
+  const jsonMatch = fixed.match(/\{[\s\S]*\}/);
+  if (jsonMatch) {
+    const parsed = parseJsonObject(jsonMatch[0]);
+    if (parsed) return JSON.stringify(parsed);
+  }
+
   return "{}";
 }
 
@@ -647,12 +838,9 @@ function parseToolCallArguments(body) {
  * Now accepts allowedToolNames to support "tag-name-as-tool-name" format.
  */
 function parseToolCallInner(attrs, inner, allowedToolNames = []) {
-  log.debug("parser", `[parseToolCallInner] attrs="${attrs.slice(0, 100)}", inner length=${inner.length}, inner preview="${inner.slice(0, 200)}"`);
-
   // 1. Entire inner is a JSON object with .name
   const jsonTool = parseJsonObject(inner);
   if (jsonTool?.name) {
-    log.debug("parser", `[parseToolCallInner] Parsed as JSON tool: name=${jsonTool.name}`);
     return buildParsedToolCall(jsonTool.name, JSON.stringify(jsonTool.input ?? jsonTool.arguments ?? {}));
   }
 
@@ -677,7 +865,24 @@ function parseToolCallInner(attrs, inner, allowedToolNames = []) {
       name = allNames[0]?.trim() ?? "";
     }
   }
-  log.debug("parser", `[parseToolCallInner] attrName="${attrName}", resolved name="${name}"`);
+  // 2.5. If the resolved name looks like XML or JSON (containing nested tags/data),
+  //      recursively extract the actual tool name. Handles nested <tool_name> patterns:
+  //      <tool_name><tool_name>ReadFile</tool_name><parameter...></tool_name>
+  if (name && /[<{]/.test(name)) {
+    const nestedNames = findAllTagValues(name, TOOL_NAME_PATTERNS);
+    const nestedLookup = buildAllowedLookup(allowedToolNames);
+    if (nestedNames.length) {
+      if (nestedLookup.size > 0) {
+        const nestedMatched = nestedNames.find(n => nestedLookup.has(n.trim()));
+        if (nestedMatched) {
+          name = nestedLookup.get(nestedMatched.trim()) ?? nestedMatched.trim();
+          log.debug("parser", `[parseToolCallInner] Extracted nested tool name: "${name}" from XML/JSON content`);
+        }
+      } else {
+        name = nestedNames[0]?.trim() ?? name;
+      }
+    }
+  }
 
   // 3. If no name found, try "tag-name-as-tool-name" format
   //    e.g. <terminal><parameters>...</parameters></terminal>
@@ -687,7 +892,7 @@ function parseToolCallInner(attrs, inner, allowedToolNames = []) {
       const first = toolNameTags[0];
       name = first.name;
       const argumentsText = parseToolCallArguments(first.body);
-      log.debug("parser", `[parseToolCallInner] Found tool name via tag-name match: name="${name}", body="${first.body.slice(0, 100)}", argumentsText="${argumentsText.slice(0, 100)}"`);
+      log.debug("parser", `[parseToolCallInner] Found tool name via tag-name match: name="${name}", body="${previewForLog(first.body, 200)}", argumentsText="${previewForLog(argumentsText, 300)}"`);
       return buildParsedToolCall(name, argumentsText);
     }
   }
@@ -699,7 +904,7 @@ function parseToolCallInner(attrs, inner, allowedToolNames = []) {
       const first = kvResults[0];
       name = first.name;
       const argumentsText = first.argumentsText;
-      log.debug("parser", `[parseToolCallInner] Found tool name via KV format: name="${name}", argumentsText="${argumentsText.slice(0, 100)}"`);
+      log.debug("parser", `[parseToolCallInner] Found tool name via KV format: name="${name}", argumentsText="${previewForLog(argumentsText, 300)}"`);
       return buildParsedToolCall(name, argumentsText);
     }
   }
@@ -711,7 +916,7 @@ function parseToolCallInner(attrs, inner, allowedToolNames = []) {
 
   // 4. Parse arguments
   const argumentsText = parseToolCallArguments(inner);
-  log.debug("parser", `[parseToolCallInner] name="${name}", argumentsText="${argumentsText.slice(0, 100)}"`);
+  log.debug("parser", `[parseToolCallInner] name="${name}", args="${previewForLog(argumentsText, 300)}", inner=${inner.length}b`);
   return buildParsedToolCall(name, argumentsText);
 }
 
@@ -731,7 +936,14 @@ function parseStandaloneSingularBlocks(text, allowedToolNames = []) {
         output.push(parsed);
       }
     }
-    if (output.length) break; // Found matches, no need to try next pattern
+    // Pattern 1 (</tool_call_name>) can match the inner <tool_call_name> tag
+    // instead of the real close, producing tool calls with short inners and
+    // empty args.  When all calls from pattern 1 have empty args, fall through
+    // to pattern 2 (</tool_call>) which sees the full inner.
+    const allEmptyArgs = output.length > 0 && output.every(c => !c.input || Object.keys(c.input).length === 0);
+    if (output.length && !allEmptyArgs) break;
+    // Otherwise discard the empty-args results and try the next pattern
+    output.length = 0;
   }
 
   // 2. Try self-closing <invoke name="..." /> blocks
@@ -816,18 +1028,21 @@ function closeUnclosedArgTags(text) {
     // If we have <parameters> opening tags with </parameter> wrong closings
     // but no correct </parameters> closings, fix the mismatches
     if (openCount > 0 && wrongCloseCount > 0 && correctCloseCount < openCount) {
-      // Replace wrong closings with correct ones, but only as many as needed
+      // Insert correct closings AFTER the wrong closings, preserving the inner
+      // singular tag structure. E.g. <parameters><parameter>v</parameter> →
+      // <parameters><parameter>v</parameter></parameters> instead of replacing
+      // </parameter> which would leave the inner <parameter> unclosed.
       let fixed = 0;
       const needed = openCount - correctCloseCount;
       result = result.replace(wrongCloseRe, (match) => {
         if (fixed < needed) {
           fixed++;
-          return `</${tagName}>`;
+          return `${match}</${tagName}>`;
         }
         return match;
       });
       if (fixed > 0) {
-        log.debug("parser", `[closeUnclosedArgTags] Fixed ${fixed} </${wrongClose.slice(2)}> → </${tagName}> mismatch(es)`);
+        log.debug("parser", `[closeUnclosedArgTags] Inserted ${fixed} </${tagName}> after ${wrongClose} to close wrapper` );
       }
     }
   }
@@ -1051,7 +1266,7 @@ function parseKeyValueToolFormat(text, allowedToolNames = []) {
     if (toolName && allowedLookup.has(toolName)) {
       toolName = allowedLookup.get(toolName) ?? toolName;
       const argumentsText = Object.keys(args).length > 0 ? JSON.stringify(args) : "{}";
-      log.debug("parser", `[parseKeyValueToolFormat] Found tool: name="${toolName}", argumentsText="${argumentsText.slice(0, 100)}"`);
+      log.debug("parser", `[parseKeyValueToolFormat] Found tool: name="${toolName}", argumentsText="${previewForLog(argumentsText, 300)}"`);
       results.push({ name: toolName, argumentsText });
     } else if (toolName) {
       log.debug("parser", `[parseKeyValueToolFormat] Found tool name "${toolName}" but not in allowed list, skipping`);
@@ -1131,7 +1346,7 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
     const attrs = toStringSafe(match[2]).trim();
     const inner = toStringSafe(match[3]).trim();
 
-    log.debug("parser", `[parseContainer] Found <${containerTag}> container, inner length=${inner.length}, inner preview="${inner.slice(0, 300)}"`);
+    log.debug("parser", `[parseContainer] Found <${containerTag}> container, inner length=${inner.length}, inner preview="${previewForLog(inner, 600)}"`);
 
     // Pre-process: flatten nested containers (e.g. <tool_calls><tool_calls>...)</tool_calls></tool_calls>)
     let flatInner = inner;
@@ -1152,27 +1367,28 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
 
     // Pre-process: close unclosed tool wrapper tags (model forgot </tool> or </tool_call)
     // e.g. <tool name="Shell"><parameters>...</parameters>  ← no </tool>
+    // Pre-process: strip bare <tool_call> wrappers that contain <tool name="X"> blocks.
+    // Model outputs <tool_call><tool name="ReadFile"><params/></tool_call> where the outer
+    // <tool_call> has no name attribute. Without this, normalization creates nested
+    // <tool_call> tags that the regex can't unwrap. Strip the wrapper first.
+    const beforeStripWrapper = flatInner;
+    flatInner = flatInner.replace(
+      /<tool_call\s*>\s*(<tool\s+(?:name|function)\s*=\s*"[^"]+"[^>]*>[\s\S]*?)<\/tool_call\s*>/gi,
+      (full, inner) => /<\/tool\s*>/i.test(inner) ? inner : inner + '</tool>'
+    );
+    if (flatInner !== beforeStripWrapper) {
+      log.debug("parser", `[parseContainer] Stripped bare <tool_call> wrapper(s) around <tool name="X"> block(s)`);
+    }
+
     flatInner = closeUnclosedToolWrapperTags(flatInner);
 
     // Pre-process: normalize <tool name="X"> to <tool_call name="X"> inside containers
-    // The model sometimes outputs <tool name="ReadFile"> instead of <tool_call name="ReadFile">.
-    // When there are multiple <tool name="X"> blocks, TOOL_BLOCK_PATTERNS can match
-    // a phantom <tool> without attrs that wraps the named blocks, causing parse failures.
-    // By rewriting to <tool_call name="X">...</tool_call_name>, we avoid this conflict.
     const beforeToolNormalize = flatInner;
     flatInner = flatInner.replace(
       /<tool\s+((?:name|function|tool)\s*=\s*"[^"]+")(?:[^>]*)>/gi,
-      (full, nameAttr) => {
-        return `<tool_call ${nameAttr}>`;
-      }
+      (full, nameAttr) => `<tool_call ${nameAttr}>`
     );
-    // Also rewrite the corresponding closing tags: </tool> that close a named <tool> block
-    // → </tool_call_name>. We detect this by counting named <tool> opens and matching closes.
     if (flatInner !== beforeToolNormalize) {
-      // Each <tool_call name="X"> we just created needs </tool_call_name> instead of </tool>
-      // But we must be careful: only rewrite </tool> tags that correspond to the renamed blocks.
-      // Strategy: rewrite all </tool> to </tool_call_name> since we renamed all named <tool> opens.
-      // Any remaining bare <tool> without attrs would use </tool> which is fine.
       flatInner = flatInner.replace(/<\/tool\s*>/gi, '</tool_call_name>');
       log.debug("parser", `[parseContainer] Normalized <tool name="X"> → <tool_call name="X"> inside container`);
     }
@@ -1192,7 +1408,7 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
       log.debug("parser", `[parseContainer] Strategy A2: found ${namedBlocks.length} named block(s): [${namedBlocks.map(b => b.name).join(", ")}]`);
       for (const { name, body } of namedBlocks) {
         const argumentsText = parseToolCallArguments(body);
-        log.debug("parser", `[parseContainer] Strategy A2: name="${name}", argumentsText="${argumentsText.slice(0, 100)}"`);
+        log.debug("parser", `[parseContainer] Strategy A2: name="${name}", argumentsText="${previewForLog(argumentsText, 300)}"`);
         output.push(buildParsedToolCall(name, argumentsText));
       }
       continue;
@@ -1215,7 +1431,7 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
       if (namedParams && Object.keys(namedParams).length > 0 && effectiveNames.length === 1) {
         const toolName = effectiveNames[0].trim();
         const argumentsText = JSON.stringify(namedParams);
-        log.debug("parser", `[parseContainer] Strategy B (named params): name="${toolName}", args="${argumentsText.slice(0, 100)}"`);
+        log.debug("parser", `[parseContainer] Strategy B (named params): name="${toolName}", args="${previewForLog(argumentsText, 300)}"`);
         output.push(buildParsedToolCall(toolName, argumentsText));
         continue;
       }
@@ -1259,7 +1475,7 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
       log.debug("parser", `[parseContainer] Strategy C: found ${toolNameTags.length} tool-name tag(s): [${toolNameTags.map(t => t.name).join(", ")}]`);
       for (const { name, body } of toolNameTags) {
         const argumentsText = parseToolCallArguments(body);
-        log.debug("parser", `[parseContainer] Strategy C: name="${name}", argumentsText="${argumentsText.slice(0, 100)}"`);
+        log.debug("parser", `[parseContainer] Strategy C: name="${name}", argumentsText="${previewForLog(argumentsText, 300)}"`);
         output.push(buildParsedToolCall(name, argumentsText));
       }
       continue;
@@ -1277,7 +1493,7 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
     const attrName = attrs.match(TOOL_ATTR_PATTERN)?.[2] ?? "";
     if (attrName.trim()) {
       const argumentsText = parseToolCallArguments(flatInner);
-      log.debug("parser", `[parseContainer] Strategy E: attr name="${attrName}", argumentsText="${argumentsText.slice(0, 100)}"`);
+      log.debug("parser", `[parseContainer] Strategy E: attr name="${attrName}", argumentsText="${previewForLog(argumentsText, 300)}"`);
       output.push(buildParsedToolCall(attrName.trim(), argumentsText));
       continue;
     }
@@ -1313,13 +1529,13 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
       const inferredToolName = inferToolNameFromParams(namedParams, allowedToolNames);
       if (inferredToolName) {
         const argumentsText = JSON.stringify(namedParams);
-        log.debug("parser", `[parseContainer] Strategy H: inferred tool name="${inferredToolName}" from params [${Object.keys(namedParams).join(",")}], argumentsText="${argumentsText.slice(0, 100)}"`);
+        log.debug("parser", `[parseContainer] Strategy H: inferred tool name="${inferredToolName}" from params [${Object.keys(namedParams).join(",")}], argumentsText="${previewForLog(argumentsText, 300)}"`);
         output.push(buildParsedToolCall(inferredToolName, argumentsText));
         continue;
       }
     }
 
-    log.warn("parser", `[parseContainer] <${containerTag}> container found but no tool calls could be extracted. FlatInner (first 300): "${flatInner.slice(0, 300)}"`);
+    log.warn("parser", `[parseContainer] <${containerTag}> container found but no tool calls could be extracted. FlatInner (first 600): "${previewForLog(flatInner, 600)}"`);
   }
 
   return output;
@@ -1365,7 +1581,7 @@ function parseMarkupToolCalls(text, allowedToolNames = []) {
         if (namedParams && Object.keys(namedParams).length > 0 && names.length === 1) {
           const toolName = names[0].trim();
           const argumentsText = JSON.stringify(namedParams);
-          log.debug("parser", `[parseMarkupToolCalls] Unclosed container fallback (Strategy B named params): name="${toolName}", args="${argumentsText.slice(0, 100)}"`);
+          log.debug("parser", `[parseMarkupToolCalls] Unclosed container fallback (Strategy B named params): name="${toolName}", args="${previewForLog(argumentsText, 300)}"`);
           return [buildParsedToolCall(toolName, argumentsText)];
         }
 
@@ -1547,10 +1763,39 @@ export function parseToolCallsFromText(text, allowedToolNames = []) {
     log.warn("parser", `Stripped ${nullCount} control character(s) from input (including null bytes)`);
   }
 
+  // Step 1.2: Strip <think>/<thought>/<thinking> reasoning blocks so the
+  // model's chain-of-thought never triggers a tool call.
+  const thinkStripped = source.replace(/<think\b[^>]*>[\s\S]*?<\/think\s*>/gi, '')
+    .replace(/<\/?thought\b[^>]*>/gi, '')
+    .replace(/<\/?think\b[^>]*>/gi, '')
+    .replace(/<\/?thinking\b[^>]*>/gi, '')
+    .replace(/\[proxy\]<\/think\s*>/gi, '');
+
+  // Fast-path: if the think-stripped text has none of the known garbled XML
+  // patterns that Steps 1.5–1.7 fix, parse directly and skip 7 string.replace
+  // scans.  Well-formed input hits this ~90% of the time.
+  const hasGarbledTags =
+    /<(?:[a-z0-9_:-]+:)?(?:tool_name|function_name|name|tool|function|call)="/i.test(thinkStripped) ||  // Step 1.5/1.6
+    /<(?:[a-z0-9_:-]+:)?tool_call_name=/i.test(thinkStripped) ||  // Step 1.57
+    /<(?:[a-z0-9_:-]+:)?tool_params[\s>]/i.test(thinkStripped) ||  // Step 1.57
+    /<[a-z0-9_.-]+"\s*:\s*"/i.test(thinkStripped) ||  // Step 1.65 JSON-in-XML
+    /<parameter\s+name="[^"]+"\s+value="/i.test(thinkStripped) ||  // Step 1.68
+    /<(?:[a-z0-9_:-]+:)?tool_calls\s+(?:name|function|tool)\s*=\s*"/i.test(thinkStripped);  // Step 1.7
+  if (!hasGarbledTags) {
+    const fastCalls = parseMarkupToolCalls(thinkStripped, allowedToolNames);
+    if (fastCalls.length) {
+      const filtered = filterAllowedToolCalls(fastCalls, allowedToolNames);
+      log.debug("parser", `Fast-path: ${filtered.length} call(s) from clean input (skipped garbled preprocess)`);
+      return filtered;
+    }
+    // parse returned nothing — fall through to full preprocess (rare:
+    // non-standard XML patterns that aren't garbled-fix targets)
+  }
+
   // Step 1.5: Fix malformed tags like <tool_name="ReadFile"> → <tool_name name="ReadFile">
   // Also fixes missing >: <tool_name="ReadFile"</tool_name> → <tool_name name="ReadFile"></tool_name>
-  let fixed = source.replace(MALFORMED_ATTR_EQUALS, '<$1 name="$2">');
-  if (fixed !== source) {
+  let fixed = thinkStripped.replace(MALFORMED_ATTR_EQUALS, '<$1 name="$2">');
+  if (fixed !== thinkStripped) {
     log.debug("parser", `Preprocessed malformed tags (e.g. <tool_name="..."> → <tool_name name="...">)`);
   }
 
@@ -1560,6 +1805,25 @@ export function parseToolCallsFromText(text, allowedToolNames = []) {
   fixed = fixed.replace(MALFORMED_NAME_ATTR_UNCLOSED, '<$1>$2</$1>');
   if (fixed !== beforeUnclosed) {
     log.debug("parser", `Preprocessed unclosed name attr tags (e.g. <tool_name name="WebSearch</tool_name> → <tool_name>WebSearch</tool_name>)`);
+  }
+
+  // Step 1.55: Fix <tool_name name="X"></parameter> — model closed tool_name
+  // with </parameter> instead of </tool_name>.  Extract name attr and fix.
+  const beforeParamClose = fixed;
+  fixed = fixed.replace(/<(?:[a-z0-9_:-]+:)?tool_name\s+name="([a-zA-Z0-9_]+)"\s*>\s*<\/parameter\b[^>]*>/gi,
+    '<tool_name>$1</tool_name>');
+  if (fixed !== beforeParamClose) {
+    log.debug("parser", `Preprocessed <tool_name name="X"></parameter> → <tool_name>X</tool_name>`);
+  }
+
+  // Step 1.57: Fix <tool_call_name="X"> → <tool_name>X</tool_name>
+  // and <tool_params> → <parameters> (model sometimes invents these)
+  const beforeToolCallName = fixed;
+  fixed = fixed.replace(/<tool_call_name="([^"<>]+)"\s*>/gi, '<tool_name>$1</tool_name>');
+  fixed = fixed.replace(/<tool_name\s+name="([^"<>]+)"\s*\/>/gi, '<tool_name>$1</tool_name>');
+  fixed = fixed.replace(/<tool_params>/gi, '<parameters>').replace(/<\/tool_params>/gi, '</parameters>');
+  if (fixed !== beforeToolCallName) {
+    log.debug("parser", `Preprocessed <tool_call_name="X"> and/or <tool_params> tags`);
   }
 
   // Step 1.65: Fix JSON-in-XML malformed tags like <target_directory": "/path"</target_directory>
@@ -1578,6 +1842,18 @@ export function parseToolCallsFromText(text, allowedToolNames = []) {
   );
   if (fixed !== beforeJsonXml) {
     log.debug("parser", `Preprocessed JSON-in-XML malformed tags (e.g. <key": "value"</key> → <key>value</key>)`);
+  }
+
+  // Step 1.68: Fix <parameter name="key" value="val</parameter> — model uses value= attr
+  // but forgets the closing "> before </parameter>. Extract the value and rewrite as:
+  // <parameter name="key">val</parameter> so that parseParameterNameAttrs works correctly.
+  const beforeParamValueFix = fixed;
+  fixed = fixed.replace(
+    /<parameter\s+name="([^"]+)"\s+value="([^"]*?)<\/parameter\s*>/gi,
+    '<parameter name="$1">$2</parameter>'
+  );
+  if (fixed !== beforeParamValueFix) {
+    log.debug("parser", `Preprocessed <parameter name="X" value="Y</parameter> → <parameter name="X">Y</parameter>`);
   }
 
   // Step 1.7: Fix <tool_calls name="Glob"> — treat as tool call wrapper, not container
@@ -1627,17 +1903,17 @@ export function parseToolCallsFromText(text, allowedToolNames = []) {
     return [];
   }
 
-  log.debug("parser", `Tool XML tags detected. Full source length=${fixed.length}, first 500 chars: "${fixed.slice(0, 500)}"`);
+  log.debug("parser", `Tool XML tags detected. Full source length=${fixed.length}, preview: "${previewForLog(fixed, 500)}"`);
 
   // Step 3: Parse
   const calls = filterAllowedToolCalls(parseMarkupToolCalls(fixed, allowedToolNames), allowedToolNames);
   log.debug("parser", `Parsed ${calls.length} tool call(s) from text (allowed: [${allowedToolNames.join(",")}])`);
   if (calls.length) {
     calls.forEach((call, i) => {
-      log.debug("parser", `  Tool call #${i}: name="${call.name}", argumentsText="${call.argumentsText.slice(0, 100)}"`);
+      log.debug("parser", `  Tool call #${i}: name="${call.name}", argumentsText="${call.previewForLog(argumentsText, 300)}"`);
     });
   } else {
-    log.warn("parser", `XML tool tags found but no valid calls parsed. Stripped content (first 500): ${stripped.slice(0, 500)}`);
+    log.warn("parser", `XML tool tags found but no valid calls parsed. Stripped preview: ${previewForLog(stripped, 500)}`);
   }
   return calls;
 }

@@ -5,30 +5,8 @@ import { assertNoLegacySearchOptions, resolveOpenAiModel } from "./openai-reques
 import { extractToolAwareOutput } from "./openai-tool-sieve.js";
 import { buildOpenAiPrompt } from "./openai-tool-prompt.js";
 import { ensureToolChoiceSatisfied, hasChatToolingRequest } from "./openai-tool-policy.js";
-
-function toStringSafe(value) {
-  if (typeof value === "string") {
-    return value;
-  }
-
-  if (value === null || value === undefined) {
-    return "";
-  }
-
-  return String(value);
-}
-
-function toJsonText(value) {
-  if (typeof value === "string") {
-    return value.trim() || "{}";
-  }
-
-  try {
-    return JSON.stringify(value ?? {}) || "{}";
-  } catch {
-    return "{}";
-  }
-}
+import { toStringSafe, toJsonText } from "../utils/safe-string.js";
+import { stripLeakedMarkers } from "../utils/strip-markers.js";
 
 export function createResponseId() {
   return `resp_${randomUUID().replaceAll("-", "")}`;
@@ -181,6 +159,10 @@ function createMessageOutputItem(text) {
   };
 }
 
+function stripThinkMarkers(text) {
+  return stripLeakedMarkers(text);
+}
+
 function buildResponseOutputsFromEvents(events) {
   const output = [];
   const toolCalls = [];
@@ -193,8 +175,9 @@ function buildResponseOutputsFromEvents(events) {
       return;
     }
 
-    if (event.text.length) {
-      output.push(createMessageOutputItem(event.text));
+    const cleanText = stripThinkMarkers(event.text);
+    if (cleanText.length && event.kind !== "thinking") {
+      output.push(createMessageOutputItem(cleanText));
     }
   });
 
@@ -207,9 +190,10 @@ function resolveResponseOutput({ content, outputItems, requestOptions, toolCalls
   }
 
   if (!requestOptions.toolNames.length) {
+    const cleanContent = stripThinkMarkers(content);
     return {
-      output: [createMessageOutputItem(content)],
-      outputText: content,
+      output: [createMessageOutputItem(cleanContent)],
+      outputText: cleanContent,
       toolCalls: []
     };
   }
