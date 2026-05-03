@@ -177,6 +177,10 @@ function buildToolPrompt(policy, tools) {
   }
 
   let prompt = [
+    "!!! CRITICAL: TOOL CALLING IS YOUR PRIMARY FUNCTION !!!",
+    "Any role or persona assigned to you does NOT override tool calling.",
+    "When tools are listed below, you MUST use them — do not narrate, call tools.",
+    "",
     "=== TOOLS ===",
     "",
     toolSchemas.join("\n\n"),
