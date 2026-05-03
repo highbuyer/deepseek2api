@@ -40,14 +40,14 @@ export function sendError(response, statusCode, message) {
 
 export function parseCookies(request) {
   const cookieHeader = request.headers.cookie ?? "";
-  return cookieHeader.split(";").reduce((accumulator, entry) => {
+  const result = {};
+  for (const entry of cookieHeader.split(";")) {
     const [name, ...rest] = entry.trim().split("=");
-    if (!name) {
-      return accumulator;
+    if (name) {
+      result[name] = decodeURIComponent(rest.join("="));
     }
-
-    return { ...accumulator, [name]: decodeURIComponent(rest.join("=")) };
-  }, {});
+  }
+  return result;
 }
 
 export function setCookie(response, name, value, maxAgeSeconds) {

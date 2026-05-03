@@ -2,6 +2,7 @@ import { collectCompletionContent, streamCompletionContent } from "./openai-comp
 import { getOpenAiResponse, storeOpenAiResponse } from "./openai-response-store.js";
 import { createToolSieve } from "./openai-tool-sieve.js";
 import { ensureToolChoiceSatisfied } from "./openai-tool-policy.js";
+import { stripLeakedMarkers } from "../utils/strip-markers.js";
 import {
   buildResponseObject,
   createFunctionCallItem,
@@ -99,21 +100,22 @@ export async function streamResponsesResponse({
     });
   };
 
-  const emitText = (text) => {
-    if (!text) {
+  const emitText = (text, kind) => {
+    const cleaned = stripLeakedMarkers(text);
+    if (!cleaned) {
       return;
     }
 
     openTextOutput();
-    activeTextItem.text += text;
-    outputText += text;
+    activeTextItem.text += cleaned;
+    outputText += cleaned;
     writeResponsesEvent(response, "response.output_text.delta", {
       type: "response.output_text.delta",
       response_id: responseId,
       item_id: activeTextItem.id,
       output_index: activeTextItem.outputIndex,
       content_index: 0,
-      delta: text
+      delta: cleaned
     });
   };
 
@@ -174,19 +176,19 @@ export async function streamResponsesResponse({
   await streamCompletionContent({
     account,
     deleteAfterFinish,
-    onText: (delta) => {
+    onText: (delta, kind) => {
       if (!toolSieve) {
-        emitText(delta);
+        emitText(delta, kind);
         return;
       }
 
-      toolSieve.push(delta).forEach((event) => {
+      toolSieve.push(delta, kind).forEach((event) => {
         if (event.type === "tool_calls") {
           emitToolCalls(event.calls ?? []);
           return;
         }
 
-        emitText(event.text);
+        emitText(event.text, event.kind ?? kind);
       });
     },
     requestOptions
@@ -199,7 +201,7 @@ export async function streamResponsesResponse({
         return;
       }
 
-      emitText(event.text);
+      emitText(event.text, event.kind);
     });
   }
 

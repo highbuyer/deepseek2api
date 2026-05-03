@@ -187,7 +187,6 @@ function consumeCapturedToolBlock(captured, allowedToolNames, capturePairs) {
       }
     }
     const suffix = closeEnd < captured.length ? captured.slice(closeEnd) : "";
-    log.debug("sieve", `[consume] Dropping ${captured.length - suffix.length} chars of drop-only/role-marker capture, preserving ${suffix.length} chars suffix`);
     return { ready: true, prefix: "", calls: [], suffix };
   }
 

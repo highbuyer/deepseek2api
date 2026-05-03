@@ -15,9 +15,10 @@ async function loadPipeline() {
 }
 
 export async function preloadEmbeddingModel() {
-  if (!_pipeline) {
-    _pipeline = await loadPipeline();
+  if (!_pipeline && !_pipelineLoading) {
+    _pipelineLoading = loadPipeline().then((pipe) => { _pipeline = pipe; return pipe; });
   }
+  await (_pipelineLoading ?? _pipeline);
 }
 
 async function getPipeline() {
@@ -50,8 +51,7 @@ export async function createEmbeddings({ body }) {
   const extractor = await getPipeline();
   const output = await extractor(inputs, { pooling: "mean", normalize: true });
 
-  const tensor = output.tolist ? output : output;
-  const data = Array.from(tensor.data ?? tensor);
+  const data = Array.from(output.data ?? output);
   const dims = tensor.dims ?? [data.length];
   const vecSize = dims.length > 1 ? dims[1] : dims[0];
   const count = dims.length > 1 ? dims[0] : 1;
@@ -61,6 +61,7 @@ export async function createEmbeddings({ body }) {
     vectors.push(data.slice(i * vecSize, (i + 1) * vecSize));
   }
 
+  const tokenEstimate = inputs.join(" ").length;
   return {
     object: "list",
     data: vectors.map((embedding, index) => ({
@@ -69,6 +70,6 @@ export async function createEmbeddings({ body }) {
       embedding
     })),
     model: EMBEDDING_MODEL,
-    usage: { prompt_tokens: inputs.join(" ").length, total_tokens: inputs.join(" ").length }
+    usage: { prompt_tokens: tokenEstimate, total_tokens: tokenEstimate }
   };
 }
