@@ -1,5 +1,24 @@
+import { listEmbeddingModels } from "./openai-embeddings.js";
+
 const DEFAULT_OPENAI_MODEL = "deepseek-chat-fast";
 const SEARCH_MODEL_SUFFIX = "-search";
+
+// Map OpenAI model names (sent by Warp client) to DeepSeek equivalents.
+const MODEL_ALIASES = Object.freeze({
+  "gpt-5.5": "deepseek-reasoner-expert",
+  "gpt-5": "deepseek-reasoner-expert",
+  "gpt-4o": "deepseek-chat-expert",
+  "gpt-4.1": "deepseek-chat-expert",
+  "gpt-4": "deepseek-chat-fast",
+  "gpt-4-turbo": "deepseek-chat-fast",
+  "gpt-3.5-turbo": "deepseek-chat-fast",
+  "gpt-4o-mini": "deepseek-chat-fast",
+  o1: "deepseek-chat-fast",
+  o3: "deepseek-chat-fast",
+  "o4-mini": "deepseek-reasoner-expert",
+  "o3-mini": "deepseek-reasoner-expert",
+  "o1-mini": "deepseek-reasoner-expert"
+});
 
 const BASE_OPENAI_MODELS = Object.freeze([
   Object.freeze({ id: "deepseek-chat-fast", modelType: "default", thinkingEnabled: false }),
@@ -34,12 +53,20 @@ function createBadRequestError(message) {
 }
 
 export function listOpenAiModels() {
-  return OPENAI_MODELS.map(({ id }) => ({ id, object: "model" }));
+  const chatIds = new Set(OPENAI_MODELS.map(({ id }) => id));
+  return [
+    ...OPENAI_MODELS.map(({ id }) => ({ id, object: "model" })),
+    ...listEmbeddingModels().filter((m) => !chatIds.has(m.id))
+  ];
 }
 
 export function resolveOpenAiModel(model) {
   const modelId = model ?? DEFAULT_OPENAI_MODEL;
-  const resolvedModel = OPENAI_MODEL_MAP[modelId];
+
+  // Check alias map first (e.g. "gpt-5.5" → "deepseek-chat-expert").
+  const aliasedId = MODEL_ALIASES[modelId] ?? modelId;
+
+  const resolvedModel = OPENAI_MODEL_MAP[aliasedId];
 
   if (!resolvedModel) {
     throw createBadRequestError(`Unsupported model: ${modelId}`);

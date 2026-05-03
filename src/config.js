@@ -12,18 +12,30 @@ const dataDirectory = join(process.cwd(), "data");
 
 mkdirSync(dataDirectory, { recursive: true });
 
+const certsDirectory = join(process.cwd(), "certs");
+
+const certKeyPath = join(certsDirectory, "localhost.key");
+const certCrtPath = join(certsDirectory, "localhost.crt");
+const httpsEnabled = existsSync(certKeyPath) && existsSync(certCrtPath);
+
 const adminUsername = process.env.APP_ADMIN_USERNAME ?? "";
 const adminPassword = process.env.APP_ADMIN_PASSWORD ?? "";
 
 const debugEnv = process.env.DEBUG ?? "";
 const debugEnabled = debugEnv === "1" || debugEnv === "true" || debugEnv.includes("deepseek2api");
 
-const maxPromptChars = Number(process.env.MAX_PROMPT_CHARS ?? 32000);
+// DeepSeek accepts prompts up to ~150K chars; beyond that it returns empty streams.
+// 96K is a safe default that keeps system prompt + recent conversation within limits.
+// Override with MAX_PROMPT_CHARS=128000 etc. if you need larger prompts.
+const maxPromptChars = Number(process.env.MAX_PROMPT_CHARS ?? 96000);
 const maxToolDescChars = Number(process.env.MAX_TOOL_DESC_CHARS ?? 200);
 
 export const config = Object.freeze({
   port: Number(process.env.PORT ?? 3000),
   debug: debugEnabled,
+  httpsEnabled,
+  httpsKeyFile: certKeyPath,
+  httpsCertFile: certCrtPath,
   maxPromptChars,
   maxToolDescChars,
   dataFile: join(dataDirectory, "app.json"),

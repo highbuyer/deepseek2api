@@ -2,7 +2,9 @@ import { getApiKeyRecord } from "../services/api-key-service.js";
 import { takeRoundRobinAccount } from "../services/account-rotation-service.js";
 import { isIncognitoEnabledForOwner } from "../services/incognito-service.js";
 import { collectOpenAiResponse, streamOpenAiResponse } from "../services/openai-bridge.js";
+import { collectAnthropicMessage, streamAnthropicMessage } from "../services/anthropic-bridge.js";
 import { listOpenAiModels } from "../services/openai-request.js";
+import { createEmbeddings } from "../services/openai-embeddings.js";
 import {
   collectResponsesResponse,
   getStoredOpenAiResponse,
@@ -97,6 +99,19 @@ async function handleResponsesCreateRequest(request, response, apiKeyRecord) {
 
     const deleteAfterFinish = isIncognitoEnabledForOwner(apiKeyRecord.ownerId);
     log.info("route", `[responses] stream=${!!body.stream} model=${body.model || "default"} toolCalls=${apiKeyRecord.toolCallsEnabled} accountId=${account.id}`);
+    // Debug: dump input structure to see if file content is present
+    if (Array.isArray(body.input)) {
+      body.input.slice(0, 2).forEach((item, i) => {
+        const content = item?.content;
+        if (Array.isArray(content)) {
+          const types = content.map(c => c?.type || typeof c).join(",");
+          const preview = JSON.stringify(content).slice(0, 500);
+          log.debug("route", `[responses] input[${i}] content types=[${types}] preview=${preview}`);
+        } else if (typeof content === "string") {
+          log.debug("route", `[responses] input[${i}] content string len=${content.length} preview=${content.slice(0, 300)}`);
+        }
+      });
+    }
     if (body.stream) {
       await streamResponsesResponse({
         response,
@@ -116,6 +131,38 @@ async function handleResponsesCreateRequest(request, response, apiKeyRecord) {
       responseScope: apiKeyRecord.id,
       toolCallsEnabled: apiKeyRecord.toolCallsEnabled
     });
+    sendJson(response, 200, payload);
+  });
+}
+
+async function handleEmbeddingsRequest(request, response, apiKeyRecord) {
+  await withOwnerRequestLimit(apiKeyRecord.ownerId, async () => {
+    const body = parseJsonBody(await readRequestBody(request)) ?? {};
+    log.info("route", `[embeddings] model=${body.model || "default"}`);
+    const payload = await createEmbeddings({ body });
+    sendJson(response, 200, payload);
+  });
+}
+
+async function handleMessagesRequest(request, response, apiKeyRecord) {
+  await withOwnerRequestLimit(apiKeyRecord.ownerId, async () => {
+    const body = parseJsonBody(await readRequestBody(request)) ?? {};
+    const account = takeRoundRobinAccount(apiKeyRecord);
+    if (!account) {
+      log.warn("route", "No available account for messages");
+      sendError(response, 404, "Account not found");
+      return;
+    }
+
+    const deleteAfterFinish = isIncognitoEnabledForOwner(apiKeyRecord.ownerId);
+    log.info("route", `[messages] stream=${!!body.stream} model=${body.model || "default"} accountId=${account.id}`);
+
+    if (body.stream !== false) {
+      await streamAnthropicMessage({ response, account, body, deleteAfterFinish });
+      return;
+    }
+
+    const payload = await collectAnthropicMessage({ account, body, deleteAfterFinish });
     sendJson(response, 200, payload);
   });
 }
@@ -149,8 +196,18 @@ export async function handleOpenAiRequest(request, response, url) {
       return true;
     }
 
+    if (request.method === "POST" && url.pathname === "/v1/messages") {
+      await handleMessagesRequest(request, response, apiKeyRecord);
+      return true;
+    }
+
     if (request.method === "POST" && url.pathname === "/v1/chat/completions") {
       await handleChatCompletionsRequest(request, response, apiKeyRecord);
+      return true;
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/embeddings") {
+      await handleEmbeddingsRequest(request, response, apiKeyRecord);
       return true;
     }
 

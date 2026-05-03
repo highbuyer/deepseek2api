@@ -7,6 +7,7 @@ import { parseToolCallsFromText } from "./openai-tool-parser.js";
 import { buildOpenAiPrompt } from "./openai-tool-prompt.js";
 import { ensureToolChoiceSatisfied, hasChatToolingRequest } from "./openai-tool-policy.js";
 import { createOpenAiError } from "./openai-error.js";
+import { stripLeakedMarkers } from "../utils/strip-markers.js";
 import { log } from "../utils/log.js";
 
 function createCompletionId() {
@@ -35,15 +36,13 @@ function resolveCompletionRequest(body, toolCallsEnabled) {
 
   const model = resolveOpenAiModel(body?.model);
   const toolNames = (body?.tools ?? []).map(t => t?.function?.name ?? t?.name).filter(Boolean);
-  log.debug("bridge", `Model: ${model.id}, toolCallsEnabled: ${toolCallsEnabled}, tools: [${toolNames.join(",")}], tool_choice: ${JSON.stringify(body?.tool_choice)}`);
+  log.debug("bridge", `Model: ${model.id}, toolCallsEnabled: ${toolCallsEnabled}, tools: [${toolNames.join(",")}]`);
 
   const promptRequest = buildOpenAiPrompt({
     messages: body?.messages ?? [],
     toolChoice: toolCallsEnabled ? body?.tool_choice : undefined,
     tools: toolCallsEnabled ? body?.tools ?? [] : []
   });
-
-  log.debug("bridge", `Prompt length: ${promptRequest.prompt.length} chars, toolChoicePolicy.mode: ${promptRequest.toolChoicePolicy.mode}, allowedToolNames: [${promptRequest.toolNames.join(",")}]`);
 
   return {
     model,
@@ -57,12 +56,18 @@ function buildChatCompletionPayload(completionId, requestOptions, content) {
   const parsed = requestOptions.toolNames.length
     ? extractToolAwareOutput(content, requestOptions.toolNames)
     : { content, toolCalls: [] };
+  parsed.content = stripLeakedMarkers(parsed.content);
 
-  log.debug("bridge", `[collect] Content length: ${content.length}, parsed toolCalls: ${parsed.toolCalls.length}, parsed content length: ${parsed.content.length}`);
   if (parsed.toolCalls.length) {
-    log.debug("bridge", `Parsed tool calls:`, parsed.toolCalls.map(c => ({ name: c.name, argsLen: c.argumentsText.length })));
+    log.debug("bridge", `[collect] Parsed ${parsed.toolCalls.length} tool call(s)`);
   } else if (requestOptions.toolNames.length) {
-    log.warn("bridge", `No tool calls parsed from model output (expected tools: [${requestOptions.toolNames.join(",")}]). Raw content (first 500 chars): ${content.slice(0, 500)}`);
+    const thinkMatch = content.match(/<think>([\s\S]*?)<\/think>/);
+    const thinkLen = thinkMatch ? thinkMatch[1].length : 0;
+    const respText = content.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+    const head = respText.slice(0, 300);
+    const tail = respText.length > 600 ? respText.slice(-200) : "";
+    const summary = tail ? `${head}\n...\n${tail}` : head;
+    log.debug("bridge", `[collect] No tool calls (allowed: [${requestOptions.toolNames.join(",")}]). ${content.length} chars total (think: ${thinkLen}, response: ${content.length - thinkLen}).\n${summary}`);
   }
 
   ensureToolChoiceSatisfied(requestOptions.toolChoicePolicy, parsed.toolCalls);
@@ -130,13 +135,12 @@ export async function collectOpenAiResponse({
   toolCallsEnabled = false
 }) {
   const requestOptions = resolveCompletionRequest(body, toolCallsEnabled);
-  log.info("bridge", `[collect] model=${requestOptions.model.id}, stream=false, accountId=${account.id}, deleteAfter=${deleteAfterFinish}`);
+  log.info("bridge", `[collect] model=${requestOptions.model.id}, accountId=${account.id}`);
   const { content } = await collectCompletionContent({
     account,
     deleteAfterFinish,
     requestOptions
   });
-  log.debug("bridge", `[collect] Raw content length: ${content.length}`);
 
   return buildChatCompletionPayload(createCompletionId(), requestOptions, content);
 }
@@ -151,7 +155,7 @@ export async function streamOpenAiResponse(options) {
   } = options;
   const completionId = createCompletionId();
   const requestOptions = resolveCompletionRequest(body, toolCallsEnabled);
-  log.info("bridge", `[stream] model=${requestOptions.model.id}, stream=true, accountId=${account.id}, deleteAfter=${deleteAfterFinish}, toolNames=[${requestOptions.toolNames.join(",")}]`);
+  log.info("bridge", `[stream] model=${requestOptions.model.id}, accountId=${account.id}, toolNames=[${requestOptions.toolNames.join(",")}]`);
   const toolSieve = requestOptions.toolNames.length
     ? createToolSieve(requestOptions.toolNames)
     : null;
@@ -173,12 +177,8 @@ export async function streamOpenAiResponse(options) {
   ));
 
   const emitToolCalls = (calls) => {
-    if (!calls.length) {
-      return;
-    }
-
+    if (!calls.length) return;
     sawToolCall = true;
-    log.debug("bridge", `[stream] Tool calls detected: ${calls.map(c => c.name).join(",")}`);
     writeSseChunk(response, buildChunkPayload(
       completionId,
       requestOptions.model.id,
@@ -187,54 +187,40 @@ export async function streamOpenAiResponse(options) {
     toolCallIndex += calls.length;
   };
 
+  const emitTextEvent = (text, kind) => {
+    const cleaned = stripLeakedMarkers(text);
+    if (!cleaned) return;
+    const delta = kind === "thinking"
+      ? { reasoning_content: cleaned }
+      : { content: cleaned };
+    writeSseChunk(response, buildChunkPayload(completionId, requestOptions.model.id, delta));
+  };
+
+  const emitSieveEvents = (events, fallbackKind) => {
+    for (const event of events) {
+      if (event.type === "tool_calls") {
+        emitToolCalls(event.calls ?? []);
+      } else if (event.type === "text") {
+        emitTextEvent(event.text, event.kind ?? fallbackKind);
+      }
+    }
+  };
+
   await streamCompletionContent({
     account,
     deleteAfterFinish,
-    onText: (delta) => {
-      if (!toolSieve) {
-        writeSseChunk(response, buildChunkPayload(
-          completionId,
-          requestOptions.model.id,
-          { content: delta }
-        ));
+    onText: (delta, kind) => {
+      if (toolSieve) {
+        emitSieveEvents(toolSieve.push(delta, kind), kind);
         return;
       }
-
-      const events = toolSieve.push(delta);
-      events.forEach((event) => {
-        if (event.type === "tool_calls") {
-          emitToolCalls(event.calls ?? []);
-          return;
-        }
-
-        if (event.text) {
-          writeSseChunk(response, buildChunkPayload(
-            completionId,
-            requestOptions.model.id,
-            { content: event.text }
-          ));
-        }
-      });
+      emitTextEvent(delta, kind);
     },
     requestOptions
   });
 
   if (toolSieve) {
-    const tailEvents = toolSieve.flush();
-    tailEvents.forEach((event) => {
-      if (event.type === "tool_calls") {
-        emitToolCalls(event.calls ?? []);
-        return;
-      }
-
-      if (event.text) {
-        writeSseChunk(response, buildChunkPayload(
-          completionId,
-          requestOptions.model.id,
-          { content: event.text }
-        ));
-      }
-    });
+    emitSieveEvents(toolSieve.flush());
   }
 
   writeSseChunk(response, buildChunkPayload(
@@ -244,35 +230,28 @@ export async function streamOpenAiResponse(options) {
     sawToolCall ? "tool_calls" : "stop"
   ));
 
-  if (requestOptions.toolNames.length && !sawToolCall) {
-    const emittedText = toolSieve?.emittedText ?? "";
-    const emittedPreview = emittedText.slice(0, 500) || "(empty)";
-
-    // Fallback: try full-text parsing on the complete emitted text.
-    // The sieve only detects XML-tag-based tool calls during streaming,
-    // but the full parser has additional strategies (tag-name-as-tool-name,
-    // KV format, parameter inference, diff/patch detection, etc.)
+  if (requestOptions.toolNames.length && !sawToolCall && toolSieve) {
+    /* Last-ditch: the streaming sieve already tried hard to find tool calls
+     * via standard XML tags; if it found none, the parser's broader
+     * strategies (raw patch detection, etc.) might still pick something up
+     * from the full emitted text.  This pays for itself only when the model
+     * skipped XML entirely, which is rare. */
+    const emittedText = toolSieve.emittedText;
     if (emittedText.length > 0) {
-      log.debug("bridge", `[stream] Fallback: attempting full-text parse on ${emittedText.length} chars of emitted text`);
       const fallbackCalls = parseToolCallsFromText(emittedText, requestOptions.toolNames);
       if (fallbackCalls.length) {
-        log.info("bridge", `[stream] Fallback parse succeeded: found ${fallbackCalls.length} tool call(s) that sieve missed`);
+        log.info("bridge", `[stream] Fallback parse found ${fallbackCalls.length} tool call(s) the sieve missed`);
         emitToolCalls(fallbackCalls);
-        // Re-send the finish chunk with correct finish_reason
-        writeSseChunk(response, buildChunkPayload(
-          completionId,
-          requestOptions.model.id,
-          {},
-          "tool_calls"
-        ));
       } else {
-        log.warn("bridge", `[stream] No tool calls detected in stream (expected tools: [${requestOptions.toolNames.join(",")}]). Emitted text preview (first 500 chars): "${emittedPreview}"`);
+        const thinkMatch = emittedText.match(/<think>([\s\S]*?)<\/think>/);
+        const thinkLen = thinkMatch ? thinkMatch[1].length : 0;
+        const respText = emittedText.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+        const head = respText.slice(0, 300);
+        const tail = respText.length > 600 ? respText.slice(-200) : "";
+        const summary = tail ? `${head}\n...\n${tail}` : head;
+        log.debug("bridge", `[stream] No tool calls (allowed: [${requestOptions.toolNames.join(",")}]). ${emittedText.length} chars total (think: ${thinkLen}, response: ${emittedText.length - thinkLen}).\n${summary}`);
       }
-    } else {
-      log.warn("bridge", `[stream] No tool calls detected in stream and no text emitted (expected tools: [${requestOptions.toolNames.join(",")}])`);
     }
-  } else if (sawToolCall) {
-    log.info("bridge", `[stream] Completed with ${toolCallIndex} tool call(s)`);
   }
 
   response.end("data: [DONE]\n\n");
