@@ -97,9 +97,10 @@ function normalizeToolPromptContent(message, toolNameById) {
   const MAX_TOOL_RESULT_CHARS = 12000;
   if (content.length > MAX_TOOL_RESULT_CHARS) {
     const omitted = content.length - MAX_TOOL_RESULT_CHARS;
-    content = `⚠️ FILE TRUNCATED — ${omitted} chars (${Math.round(omitted / content.length * 100)}%) omitted. Only first ${MAX_TOOL_RESULT_CHARS} chars shown.\n\n`
+    content = `⚠️ FILE TRUNCATED — ${omitted} chars (${Math.round(omitted / content.length * 100)}%) omitted. Only first ${MAX_TOOL_RESULT_CHARS} chars shown.\n`
+      + `💡 To read the rest: use Grep to search for specific patterns, or Read with offset/limit to fetch later sections.\n\n`
       + content.slice(0, MAX_TOOL_RESULT_CHARS)
-      + `\n\n⚠️ END TRUNCATED — ${omitted} chars not shown. Do NOT assume you have the full file.`;
+      + `\n\n⚠️ END — ${omitted} chars not shown. Use Grep for targeted search or Read with offset to continue.`;
   }
   const toolName = toolNameById.get(toStringSafe(message?.tool_call_id).trim()) || toStringSafe(message?.name).trim();
   return toolName ? `<tool_result id="${toolName}">\n${content}\n</tool_result>` : content;
