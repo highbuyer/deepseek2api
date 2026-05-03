@@ -187,6 +187,7 @@ function consumeCapturedToolBlock(captured, allowedToolNames, capturePairs) {
       }
     }
     const suffix = closeEnd < captured.length ? captured.slice(closeEnd) : "";
+    log.debug("sieve", `[consume] Dropping ${captured.length - suffix.length} chars of drop-only/role-marker capture, preserving ${suffix.length} chars suffix`);
     return { ready: true, prefix: "", calls: [], suffix };
   }
 
@@ -221,7 +222,13 @@ function consumeCapturedToolBlock(captured, allowedToolNames, capturePairs) {
     };
   }
 
-  return { ready: true, prefix: captured, calls: [], suffix: "" };
+  // No capture pair matched — this is an unrecognized XML block.
+  // Try a best-effort parse, then drop everything that isn't a valid tool call.
+  const fallbackCalls = parseToolCallsFromText(captured, allowedToolNames);
+  if (fallbackCalls.length) {
+    return { ready: true, prefix: "", calls: fallbackCalls, suffix: "" };
+  }
+  return { ready: true, prefix: "", calls: [], suffix: "" };
 }
 
 function pushTextEvent(state, events, text, kind) {
@@ -269,8 +276,11 @@ export function createToolSieve(allowedToolNames = []) {
         }
 
         if (state.capture.length > 50000) {
-          log.warn("sieve", `[drain] Capture length ${state.capture.length} exceeds limit, forcing flush as text`);
-          pushTextEvent(state, events, state.capture, state.lastKind);
+          log.warn("sieve", `[drain] Capture length ${state.capture.length} exceeds limit, attempting parse then dropping`);
+          const overflowCalls = parseToolCallsFromText(state.capture, state.allowedToolNames);
+          if (overflowCalls.length) {
+            events.push({ type: "tool_calls", calls: overflowCalls });
+          }
           state.capture = "";
           state.capturing = false;
           continue;
@@ -319,8 +329,11 @@ export function createToolSieve(allowedToolNames = []) {
 
       if (state.capturing) {
         if (state.capture.length > 50000) {
-          log.warn("sieve", `[flush] Capture length ${state.capture.length} exceeds limit, forcing flush as text`);
-          pushTextEvent(state, events, state.capture, state.lastKind);
+          log.warn("sieve", `[flush] Capture length ${state.capture.length} exceeds limit, attempting parse then dropping`);
+          const overflowCalls = parseToolCallsFromText(state.capture, state.allowedToolNames);
+          if (overflowCalls.length) {
+            events.push({ type: "tool_calls", calls: overflowCalls });
+          }
           state.capture = "";
           state.capturing = false;
         } else {
