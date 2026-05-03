@@ -123,7 +123,7 @@ function contentBlockToText(block) {
     content = content.replace(/^\s*\d+→/gm, "");
     // Truncate very long tool results to save prompt budget —
     // dropping old messages is worse than trimming one result
-    const MAX_TOOL_RESULT_CHARS = 4000;
+    const MAX_TOOL_RESULT_CHARS = 12000;
     if (content.length > MAX_TOOL_RESULT_CHARS) {
       content = content.slice(0, MAX_TOOL_RESULT_CHARS)
         + `\n...[truncated ${content.length - MAX_TOOL_RESULT_CHARS} chars]`;

@@ -94,7 +94,7 @@ function normalizeToolPromptContent(message, toolNameById) {
   // Strip line-number prefixes (Read output format: "  1→code")
   content = content.replace(/^\s*\d+→/gm, "");
   // Truncate very long tool results
-  const MAX_TOOL_RESULT_CHARS = 4000;
+  const MAX_TOOL_RESULT_CHARS = 12000;
   if (content.length > MAX_TOOL_RESULT_CHARS) {
     content = content.slice(0, MAX_TOOL_RESULT_CHARS)
       + `\n...[truncated ${content.length - MAX_TOOL_RESULT_CHARS} chars]`;
