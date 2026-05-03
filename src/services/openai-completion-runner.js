@@ -96,6 +96,9 @@ async function consumeTaggedStream(stream, onText) {
 
   for await (const chunk of stream) {
     parser.push(decoder.decode(chunk, { stream: true }));
+    if (chunkCount > 0 && chunkCount % 100 === 0) {
+      log.info("runner", `Stream progress: ${chunkCount} SSE events processed, tagger=${tagger.kind}`);
+    }
   }
 
   parser.flush();
