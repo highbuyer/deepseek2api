@@ -11,12 +11,25 @@ import { log } from "../utils/log.js";
 const TOOL_CAPTURE_PAIRS = Object.freeze([
   { open: "<tool_calls", closes: ["</tool_calls>"] },
   { open: "<function_calls", closes: ["</function_calls>"] },
-  { open: "<tool_call", closes: ["</tool_call>", "</tool_call_name>"] },
+  { open: "<tool_call_name", closes: ["</tool_call_name>"] },
+  { open: "<tool_call", closes: ["</tool_call_name>", "</tool_call_name>"] },
   { open: "<function_call", closes: ["</function_call>", "</function_call_name>"] },
   { open: "<invoke", closes: ["</invoke>"] },
   { open: "<tool_use", closes: ["</tool_use>"] },
-  { open: "<apply_patch", closes: ["</apply_patch>"] }
+  { open: "<apply_patch", closes: ["</apply_patch>"] },
+  { open: "<tool_result", closes: ["</tool_result>"] }
 ]);
+
+/** Tags in DROP_ONLY_CAPTURE_OPENS are captured and DROPPED entirely — they
+ * are never valid tool calls (e.g. <tool_result> is an echoed tool output).
+ * The sieve will swallow the whole block including its content without
+ * attempting to parse tool calls from it. */
+const DROP_ONLY_CAPTURE_OPENS = new Set(["<tool_result"]);
+
+/** Role-marker prefixes that the model may echo from the prompt format.
+ * "TOOL:" always precedes <tool_result> in the prompt, so the sieve must
+ * also recognize these to prevent the prefix leaking before the XML tag. */
+const LEAK_ROLE_MARKERS = Object.freeze(["TOOL:", "USER:", "ASSISTANT:"]);
 
 function isInsideCodeFence(state, prefix) {
   const combined = `${state.emittedText}${prefix}`;
@@ -25,55 +38,99 @@ function isInsideCodeFence(state, prefix) {
 
 function findPartialToolTagStart(text, capturePairs) {
   const lastIndex = text.lastIndexOf("<");
-  if (lastIndex < 0 || text.slice(lastIndex).includes(">")) {
-    return -1;
+  if (lastIndex >= 0 && !text.slice(lastIndex).includes(">")) {
+    const tail = text.slice(lastIndex).toLowerCase();
+    /* Hold the partial fragment if it could grow into either:
+     * - any capture-pair open/close (block-style tools)
+     * - any orphan leak tag the downstream stripper would remove
+     *   (`<tool_name`, `</parameter`, etc.) — without this the stream
+     *   boundary can split a leak token and slip the second half past
+     *   the regex-based stripper. */
+    const matchesCapture = capturePairs.some(({ open, closes }) =>
+      open.startsWith(tail) || closes.some(c => c.startsWith(tail))
+    );
+    if (matchesCapture) return lastIndex;
+
+    if (LEAK_TAG_PREFIXES.some(p => p.toLowerCase().startsWith(tail))) {
+      return lastIndex;
+    }
   }
 
-  const tail = text.slice(lastIndex).toLowerCase();
-  /* Hold the partial fragment if it could grow into either:
-   * - any capture-pair open/close (block-style tools)
-   * - any orphan leak tag the downstream stripper would remove
-   *   (`<tool_name`, `</parameter`, etc.) — without this the stream
-   *   boundary can split a leak token and slip the second half past
-   *   the regex-based stripper. */
-  const matchesCapture = capturePairs.some(({ open, closes }) =>
-    open.startsWith(tail) || closes.some(c => c.startsWith(tail))
-  );
-  if (matchesCapture) return lastIndex;
+  /* Also hold partial role-marker prefixes (TOOL:, USER:, ASSISTANT:)
+   * that the model may echo from the prompt format.  Without this,
+   * "TOOL: <tool_result>" gets split at chunk boundaries — the "TOOL: "
+   * leaks as text before the sieve sees the XML tag. */
+  for (const marker of LEAK_ROLE_MARKERS) {
+    const markerLower = marker.toLowerCase();
+    /* Check if the text ends with a prefix of any role marker */
+    for (let len = 1; len <= Math.min(text.length, marker.length); len++) {
+      const tail = text.slice(-len).toLowerCase();
+      if (markerLower.startsWith(tail) && len < marker.length) {
+        return text.length - len;
+      }
+    }
+    /* Check if a complete role marker appears at end of text */
+    if (text.toLowerCase().endsWith(markerLower)) {
+      return text.length - marker.length;
+    }
+  }
 
-  return LEAK_TAG_PREFIXES.some(p => p.toLowerCase().startsWith(tail))
-    ? lastIndex
-    : -1;
+  return -1;
 }
 
 function findToolSegmentStart(state, text, capturePairs) {
   const lower = text.toLowerCase();
-  let offset = 0;
+  let bestIndex = -1;
 
-  while (offset < lower.length) {
-    let bestIndex = -1;
-    let matchedOpen = "";
+  /* Check XML capture pairs */
+  {
+    let offset = 0;
+    while (offset < lower.length) {
+      let idx = -1;
+      let matchedOpen = "";
 
-    for (const { open } of capturePairs) {
-      const index = lower.indexOf(open, offset);
-      if (index >= 0 && (bestIndex === -1 || index < bestIndex)) {
-        bestIndex = index;
-        matchedOpen = open;
+      for (const { open } of capturePairs) {
+        const index = lower.indexOf(open, offset);
+        if (index >= 0 && (idx === -1 || index < idx)) {
+          idx = index;
+          matchedOpen = open;
+        }
       }
-    }
 
-    if (bestIndex === -1) {
-      return -1;
-    }
+      if (idx === -1) break;
 
-    if (!isInsideCodeFence(state, text.slice(0, bestIndex))) {
-      return bestIndex;
-    }
+      if (!isInsideCodeFence(state, text.slice(0, idx))) {
+        if (bestIndex === -1 || idx < bestIndex) {
+          bestIndex = idx;
+        }
+        break;
+      }
 
-    offset = bestIndex + matchedOpen.length;
+      offset = idx + matchedOpen.length;
+    }
   }
 
-  return -1;
+  /* Also check role-marker prefixes (TOOL:, USER:, ASSISTANT:).
+   * When the model echoes "TOOL: <tool_result>..." from the prompt,
+   * we need to start capturing at the "TOOL:" so it doesn't leak. */
+  for (const marker of LEAK_ROLE_MARKERS) {
+    const markerLower = marker.toLowerCase();
+    let searchFrom = 0;
+    while (searchFrom < lower.length) {
+      const idx = lower.indexOf(markerLower, searchFrom);
+      if (idx < 0) break;
+
+      if (!isInsideCodeFence(state, text.slice(0, idx))) {
+        if (bestIndex === -1 || idx < bestIndex) {
+          bestIndex = idx;
+        }
+        break;
+      }
+      searchFrom = idx + markerLower.length;
+    }
+  }
+
+  return bestIndex;
 }
 
 function splitSafeContent(state, text, capturePairs) {
@@ -87,6 +144,51 @@ function splitSafeContent(state, text, capturePairs) {
 
 function consumeCapturedToolBlock(captured, allowedToolNames, capturePairs) {
   const lower = captured.toLowerCase();
+
+  /* FAST PATH: If the capture contains a drop-only tag (<tool_result>) or
+   * starts with a role-marker prefix (TOOL:), drop the block content without
+   * attempting to parse tool calls.  We still need to find the closing tag
+   * so that any text AFTER the block is preserved as suffix. */
+  const hasDropOnlyTag = Array.from(DROP_ONLY_CAPTURE_OPENS).some(open =>
+    lower.indexOf(open) >= 0
+  );
+  const startsWithRoleMarker = LEAK_ROLE_MARKERS.some(marker =>
+    lower.startsWith(marker.toLowerCase())
+  );
+  if (hasDropOnlyTag || startsWithRoleMarker) {
+    /* Find the closing tag for any drop-only capture pair so we can
+     * preserve text after the block as suffix. */
+    let closeEnd = 0;
+    for (const pair of capturePairs) {
+      if (!Array.from(DROP_ONLY_CAPTURE_OPENS).includes(pair.open)) continue;
+      const openIdx = lower.indexOf(pair.open);
+      if (openIdx < 0) continue;
+      for (const closeStr of pair.closes) {
+        const closeIdx = lower.lastIndexOf(closeStr);
+        if (closeIdx > openIdx) {
+          const end = closeIdx + closeStr.length;
+          if (end > closeEnd) closeEnd = end;
+        }
+      }
+    }
+    /* Also check for role-marker + drop-tag pattern:
+     * "TOOL: <tool_result>...</tool_result>" — find the </tool_result> end */
+    if (startsWithRoleMarker && closeEnd === 0) {
+      for (const pair of capturePairs) {
+        const openIdx = lower.indexOf(pair.open);
+        if (openIdx < 0) continue;
+        for (const closeStr of pair.closes) {
+          const closeIdx = lower.lastIndexOf(closeStr);
+          if (closeIdx > openIdx) {
+            const end = closeIdx + closeStr.length;
+            if (end > closeEnd) closeEnd = end;
+          }
+        }
+      }
+    }
+    const suffix = closeEnd < captured.length ? captured.slice(closeEnd) : "";
+    return { ready: true, prefix: "", calls: [], suffix };
+  }
 
   for (const pair of capturePairs) {
     const openIndex = lower.indexOf(pair.open);
