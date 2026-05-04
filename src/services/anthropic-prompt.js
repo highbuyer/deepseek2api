@@ -5,6 +5,52 @@ import { log } from "../utils/log.js";
 import { toStringSafe, toJsonText } from "../utils/safe-string.js";
 import { resolveOpenAiModel } from "./openai-request.js";
 
+/* ── Shared truncation helpers ── */
+
+function getToolResultBudget(totalContextChars) {
+  if (totalContextChars > 100000) return 4000;
+  if (totalContextChars > 60000) return 6000;
+  if (totalContextChars > 30000) return 10000;
+  return 12000;
+}
+
+function getToolTruncationCategory(toolName) {
+  const lower = (toolName || "").toLowerCase();
+  if (/^(read|read_file|readfile)$/i.test(lower)) return "read";
+  if (/^(bash|shell|execute_command|runcommand|run_command|terminal)$/i.test(lower)) return "bash";
+  if (/^(search|grep|find|glob|list)$/i.test(lower)) return "search";
+  if (/^(write|edit|apply_patch|applypatch|patch)$/i.test(lower)) return "write";
+  return "default";
+}
+
+const TOOL_TRUNCATION_STRATEGY = {
+  read:    { headRatio: 0.5, tailRatio: 0.3 },
+  bash:    { headRatio: 0.2, tailRatio: 0.6 },
+  search:  { headRatio: 0.7, tailRatio: 0.15 },
+  write:   { headRatio: 0.5, tailRatio: 0.3 },
+  default: { headRatio: 0.6, tailRatio: 0.4 }
+};
+
+function truncateToolResult(content, budget, toolName) {
+  if (content.length <= budget) return { text: content, truncated: false };
+
+  const cat = getToolTruncationCategory(toolName);
+  const strategy = TOOL_TRUNCATION_STRATEGY[cat] || TOOL_TRUNCATION_STRATEGY.default;
+  const headBudget = Math.floor(budget * strategy.headRatio);
+  const tailBudget = Math.floor(budget * strategy.tailRatio);
+  const omitted = content.length - headBudget - tailBudget;
+  const strategyLabel = toolName ? ` (${cat} strategy for ${toolName})` : "";
+
+  const text = content.slice(0, headBudget)
+    + `\n\n⚠️ TRUNCATED — ${omitted} chars (${Math.round(omitted / content.length * 100)}%) omitted${strategyLabel}. Showing first ${headBudget} + last ${tailBudget} of ${content.length} chars.\n`
+    + `💡 Use Grep to search within this file, or Read with offset/limit for specific sections.\n\n`
+    + content.slice(-tailBudget);
+
+  return { text, truncated: true };
+}
+
+let _anthropicContextChars = 0;
+
 /* ── Anthropic → DeepSeek prompt conversion ── */
 
 /* ── Slash-command Skill routing ── */
@@ -121,16 +167,10 @@ function contentBlockToText(block) {
     // Strip line-number prefixes (Claude Code Read format: "  1→code")
     // so the model doesn't learn to echo file content with line numbers
     content = content.replace(/^\s*\d+→/gm, "");
-    // Truncate very long tool results to save prompt budget —
-    // dropping old messages is worse than trimming one result
-    const MAX_TOOL_RESULT_CHARS = 12000;
-    if (content.length > MAX_TOOL_RESULT_CHARS) {
-      const omitted = content.length - MAX_TOOL_RESULT_CHARS;
-      content = `⚠️ FILE TRUNCATED — ${omitted} chars (${Math.round(omitted / content.length * 100)}%) omitted. Only first ${MAX_TOOL_RESULT_CHARS} chars shown.\n`
-        + `💡 To read the rest: use Grep to search for specific patterns, or Read with offset/limit to fetch later sections.\n\n`
-        + content.slice(0, MAX_TOOL_RESULT_CHARS)
-        + `\n\n⚠️ END — ${omitted} chars not shown. Use Grep for targeted search or Read with offset to continue.`;
-    }
+    // Dynamic budget + head-tail truncation (see openai-tool-prompt.js for rationale)
+    const budget = getToolResultBudget(_anthropicContextChars ?? 0);
+    const { text: truncated, truncated: wasTruncated } = truncateToolResult(content, budget, "");
+    content = truncated;
     const name = toStringSafe(block.tool_use_id).slice(-20);
     return `<tool_result id="${name}">\n${content}\n</tool_result>`;
   }
@@ -138,19 +178,29 @@ function contentBlockToText(block) {
 }
 
 function normalizeAnthropicMessages(messages) {
+  _anthropicContextChars = 0;
+
   return (messages ?? []).flatMap((message) => {
     const role = message?.role === "assistant" ? "assistant"
       : message?.role === "user" ? "user"
         : "user";
 
     const content = message?.content;
-    if (typeof content === "string") return [{ role, content }];
+    if (typeof content === "string") {
+      _anthropicContextChars += content.length;
+      return [{ role, content }];
+    }
     if (!Array.isArray(content)) return [];
 
-    const textBlocks = content.map(contentBlockToText).filter(Boolean);
+    const textBlocks = content.map(block => {
+      const text = contentBlockToText(block);
+      _anthropicContextChars += text.length;
+      return text;
+    }).filter(Boolean);
 
     if (role === "user") {
-      return [{ role: "user", content: textBlocks.join("\n") || " " }];
+      const combined = textBlocks.join("\n") || " ";
+      return [{ role: "user", content: combined }];
     }
 
     // assistant: keep tool calls as structured info

@@ -185,6 +185,15 @@ export async function handleOpenAiRequest(request, response, url) {
   const apiKeyRecord = apiKey ? getApiKeyRecord(apiKey) : null;
 
   if (!apiKeyRecord) {
+    // Allow embedding requests without API key (used by GitNexus analyze --embeddings)
+    if (url.pathname === "/v1/embeddings") {
+      const { readStore } = await import("../storage/store.js");
+      const firstKey = readStore().apiKeys[0];
+      if (firstKey) {
+        await handleEmbeddingsRequest(request, response, { ownerId: firstKey.ownerId });
+        return true;
+      }
+    }
     log.warn("route", `Unauthorized request to ${url.pathname}`);
     sendError(response, 401, "Invalid API key");
     return true;

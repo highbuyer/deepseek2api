@@ -89,20 +89,65 @@ function normalizeAssistantPromptContent(message, toolNameById) {
   return `${content}\n\n${toolHistory}`;
 }
 
-function normalizeToolPromptContent(message, toolNameById) {
+// 动态工具结果预算：上下文越大，每条结果越短，防止并行工具调用撑爆 prompt
+function getToolResultBudget(totalContextChars) {
+  if (totalContextChars > 100000) return 4000;
+  if (totalContextChars > 60000) return 6000;
+  if (totalContextChars > 30000) return 10000;
+  return 12000;
+}
+
+// 按工具类型差异化截断：不同工具的头/尾信息密度不同
+function getToolTruncationCategory(toolName) {
+  const lower = (toolName || "").toLowerCase();
+  if (/^(read|read_file|readfile)$/i.test(lower)) return "read";
+  if (/^(bash|shell|execute_command|runcommand|run_command|terminal)$/i.test(lower)) return "bash";
+  if (/^(search|grep|find|glob|list)$/i.test(lower)) return "search";
+  if (/^(write|edit|apply_patch|applypatch|patch)$/i.test(lower)) return "write";
+  return "default";
+}
+
+const TOOL_TRUNCATION_STRATEGY = {
+  read:    { headRatio: 0.5, tailRatio: 0.3 },
+  bash:    { headRatio: 0.2, tailRatio: 0.6 },
+  search:  { headRatio: 0.7, tailRatio: 0.15 },
+  write:   { headRatio: 0.5, tailRatio: 0.3 },
+  default: { headRatio: 0.6, tailRatio: 0.4 }
+};
+
+function truncateToolResult(content, budget, toolName) {
+  if (content.length <= budget) return { text: content, truncated: false };
+
+  const cat = getToolTruncationCategory(toolName);
+  const strategy = TOOL_TRUNCATION_STRATEGY[cat] || TOOL_TRUNCATION_STRATEGY.default;
+  const headBudget = Math.floor(budget * strategy.headRatio);
+  const tailBudget = Math.floor(budget * strategy.tailRatio);
+  const omitted = content.length - headBudget - tailBudget;
+  const strategyLabel = toolName ? ` (${cat} strategy for ${toolName})` : "";
+
+  const text = content.slice(0, headBudget)
+    + `\n\n⚠️ TRUNCATED — ${omitted} chars (${Math.round(omitted / content.length * 100)}%) omitted${strategyLabel}. Showing first ${headBudget} + last ${tailBudget} of ${content.length} chars.\n`
+    + `💡 Use Grep to search within this file, or Read with offset/limit for specific sections.\n\n`
+    + content.slice(-tailBudget);
+
+  return { text, truncated: true };
+}
+
+function normalizeToolPromptContent(message, toolNameById, totalContextChars = 0) {
   let content = normalizeContentText(message?.content).trim() || "null";
   // Strip line-number prefixes (Read output format: "  1→code")
   content = content.replace(/^\s*\d+→/gm, "");
-  // Truncate very long tool results
-  const MAX_TOOL_RESULT_CHARS = 12000;
-  if (content.length > MAX_TOOL_RESULT_CHARS) {
-    const omitted = content.length - MAX_TOOL_RESULT_CHARS;
-    content = `⚠️ FILE TRUNCATED — ${omitted} chars (${Math.round(omitted / content.length * 100)}%) omitted. Only first ${MAX_TOOL_RESULT_CHARS} chars shown.\n`
-      + `💡 To read the rest: use Grep to search for specific patterns, or Read with offset/limit to fetch later sections.\n\n`
-      + content.slice(0, MAX_TOOL_RESULT_CHARS)
-      + `\n\n⚠️ END — ${omitted} chars not shown. Use Grep for targeted search or Read with offset to continue.`;
-  }
+
+  // Truncate long tool results with dynamic budget + head-tail strategy
   const toolName = toolNameById.get(toStringSafe(message?.tool_call_id).trim()) || toStringSafe(message?.name).trim();
+  const budget = getToolResultBudget(totalContextChars);
+  const { text: truncated, truncated: wasTruncated } = truncateToolResult(content, budget, toolName);
+  content = truncated;
+
+  if (wasTruncated && !toolName) {
+    log.warn("prompt", `Tool result truncated: ${content.length}→${truncated.length} chars (no tool name, default strategy)`);
+  }
+
   return toolName ? `<tool_result id="${toolName}">\n${content}\n</tool_result>` : content;
 }
 
@@ -113,19 +158,27 @@ function normalizeMessageRole(role) {
 function normalizeMessagesForPrompt(messages) {
   const toolNameById = new Map();
 
+  // Accumulate running context size so tool result budgets tighten as prompt grows
+  let totalChars = 0;
+
   return (messages ?? []).flatMap((message) => {
     const role = normalizeMessageRole(toStringSafe(message?.role).trim().toLowerCase() || "user");
 
     if (role === "assistant") {
       const content = normalizeAssistantPromptContent(message, toolNameById);
+      if (content) totalChars += content.length;
       return content ? [{ role, content }] : [];
     }
 
     if (role === "tool" || role === "function") {
-      return [{ role: "tool", content: normalizeToolPromptContent(message, toolNameById) }];
+      const content = normalizeToolPromptContent(message, toolNameById, totalChars);
+      totalChars += content.length;
+      return [{ role: "tool", content }];
     }
 
-    return [{ role, content: normalizeContentText(message?.content) }];
+    const content = normalizeContentText(message?.content);
+    totalChars += content.length;
+    return [{ role, content }];
   });
 }
 

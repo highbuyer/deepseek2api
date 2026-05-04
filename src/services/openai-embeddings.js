@@ -52,7 +52,7 @@ export async function createEmbeddings({ body }) {
   const output = await extractor(inputs, { pooling: "mean", normalize: true });
 
   const data = Array.from(output.data ?? output);
-  const dims = tensor.dims ?? [data.length];
+  const dims = output.dims ?? [data.length];
   const vecSize = dims.length > 1 ? dims[1] : dims[0];
   const count = dims.length > 1 ? dims[0] : 1;
 
