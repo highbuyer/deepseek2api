@@ -70,8 +70,9 @@ export function stripLeakedMarkers(text) {
   // through as orphans or partials (opening/closing without a matching pair)
   result = result.replace(LEAK_TAG_REGEX, "");
 
-  // Strip echoed conversation role markers and TOOL: prefix
-  result = result.replace(/^(?:USER|ASSISTANT|TOOL):\s*/gmi, "");
+  // Strip leaked role markers — both at line start and mid-line
+  result = result.replace(/^(?:USER|ASSISTANT|TOOL):\s*[^\n]*/gmi, "");
+  result = result.replace(/\b(?:USER|ASSISTANT|TOOL):\s(?:File|Running|command|[A-Z])/gmi, (m) => m.slice(m.indexOf(":") + 1).trimStart());
 
   return result;
 }
