@@ -260,10 +260,16 @@ export async function streamOpenAiResponse(options) {
     writeSseChunk(response, buildChunkPayload(completionId, requestOptions.model.id, delta));
   };
 
+  const CORRECT_FORMAT = "<function_calls><invoke name=\"ToolName\"><parameter name=\"param\" string=\"true\">value</parameter></invoke></function_calls>";
+  const FORMAT_ERROR_MSG = `\n\n<tool_use_error>Your tool call format was incorrect. Use EXACTLY this XML format:\n${CORRECT_FORMAT}\nDo NOT use <tool_calls>, <tool_call>, <tool_name>, or <tool_type> tags. Only <function_calls> with <invoke name="..."> inside.</tool_use_error>`;
+
   const emitSieveEvents = (events, fallbackKind) => {
     for (const event of events) {
       if (event.type === "tool_calls") {
         emitToolCalls(event.calls ?? []);
+      } else if (event.type === "format_error") {
+        log.warn("bridge", `[stream] Format error detected (block preview: "${event.block?.slice(0, 80)}"), sending correction immediately`);
+        emitTextEvent(FORMAT_ERROR_MSG, "response");
       } else if (event.type === "text") {
         emitTextEvent(event.text, event.kind ?? fallbackKind);
       }

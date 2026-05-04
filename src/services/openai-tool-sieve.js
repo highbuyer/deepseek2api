@@ -129,6 +129,17 @@ export function createToolSieve(allowedToolNames = []) {
         const calls = parseToolCallsFromText(block, state.allowedToolNames);
         if (calls.length) {
           events.push({ type: "tool_calls", calls });
+        } else {
+          // Claude Code pattern: immediate error feedback on malformed tool call.
+          // Detected XML that looks like a tool block but parser couldn't extract
+          // any valid calls — the model used a wrong format variant.
+          // Emit format_error immediately so the bridge can abort the stream
+          // and tell the model to correct its format NOW, not next turn.
+          events.push({
+            type: "format_error",
+            block: block.slice(0, 200),
+            message: "Unrecognized tool call format"
+          });
         }
         state.capture = "";
         state.capturing = false;
