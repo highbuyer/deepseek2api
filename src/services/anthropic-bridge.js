@@ -210,10 +210,16 @@ export async function streamAnthropicMessage(options) {
 
   /* ── Sieve event dispatch ── */
 
+  const CORRECT_FORMAT = "<function_calls><invoke name=\"ToolName\"><parameter name=\"param\" string=\"true\">value</parameter></invoke></function_calls>";
+  const FORMAT_ERROR_MSG = `\n\n<tool_use_error>Your tool call format was incorrect. Use EXACTLY this XML format:\n${CORRECT_FORMAT}\nDo NOT use <tool_calls>, <tool_call>, <tool_name>, or <tool_type> tags.</tool_use_error>`;
+
   const emitSieveEvents = (events, fallbackKind) => {
     for (const event of events) {
       if (event.type === "tool_calls") {
         emitToolCalls(event.calls ?? []);
+      } else if (event.type === "format_error") {
+        log.warn("bridge", `[stream] Format error detected, sending correction immediately`);
+        emitTextEvent(FORMAT_ERROR_MSG, "response");
       } else if (event.type === "text") {
         emitTextEvent(event.text, event.kind ?? fallbackKind);
       }
