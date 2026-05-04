@@ -115,6 +115,22 @@ const TOOL_TRUNCATION_STRATEGY = {
   default: { headRatio: 0.6, tailRatio: 0.4 }
 };
 
+// Direct instruction to model when tool result exceeds budget.
+// Pattern from Claude Code's FileTooLargeError — tells the model exactly
+// what parameters to use instead of leaving it to guess.
+function formatTruncationHint(contentLen, headBudget, tailBudget, omitted, toolName) {
+  const cat = getToolTruncationCategory(toolName);
+  const label = toolName ? ` (${cat} strategy for ${toolName})` : "";
+  return (
+    `\n\n⚠️ FILE TOO LARGE — ${omitted} chars omitted (${Math.round(omitted / contentLen * 100)}% of ${contentLen} total).\n` +
+    `Showing first ${headBudget} + last ${tailBudget} chars${label}.\n\n` +
+    `DO NOT read this file again without offset/limit. Instead:\n` +
+    `- Read with offset and limit parameters to fetch specific sections\n` +
+    `- Grep for patterns to find exactly what you need before reading\n` +
+    `- The truncated content above shows the file structure; search it first\n\n`
+  );
+}
+
 function truncateToolResult(content, budget, toolName) {
   if (content.length <= budget) return { text: content, truncated: false };
 
@@ -123,11 +139,9 @@ function truncateToolResult(content, budget, toolName) {
   const headBudget = Math.floor(budget * strategy.headRatio);
   const tailBudget = Math.floor(budget * strategy.tailRatio);
   const omitted = content.length - headBudget - tailBudget;
-  const strategyLabel = toolName ? ` (${cat} strategy for ${toolName})` : "";
 
   const text = content.slice(0, headBudget)
-    + `\n\n⚠️ TRUNCATED — ${omitted} chars (${Math.round(omitted / content.length * 100)}%) omitted${strategyLabel}. Showing first ${headBudget} + last ${tailBudget} of ${content.length} chars.\n`
-    + `💡 Use Grep to search within this file, or Read with offset/limit for specific sections.\n\n`
+    + formatTruncationHint(content.length, headBudget, tailBudget, omitted, toolName)
     + content.slice(-tailBudget);
 
   return { text, truncated: true };
