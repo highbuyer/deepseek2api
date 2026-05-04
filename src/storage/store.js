@@ -1,4 +1,5 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 
 import { config } from "../config.js";
 
@@ -77,24 +78,54 @@ function normalizeState(value) {
   };
 }
 
-export function readStore() {
-  if (!existsSync(config.dataFile)) {
-    const state = defaultState();
-    writeStore(state);
-    return state;
-  }
+// ── In-memory cache + async disk flush ──
+// updateStore writes to memory immediately (sync) and marks dirty.
+// flushStore writes to disk asynchronously (called periodically).
+// This eliminates synchronous writeFileSync blocking the event loop
+// while keeping the updateStore API backward-compatible.
 
+let _cache = null;
+let _dirty = false;
+let _writing = false;
+
+function loadCache() {
+  if (_cache) return _cache;
+  if (!existsSync(config.dataFile)) {
+    _cache = defaultState();
+    _dirty = true;
+    return _cache;
+  }
   const raw = readFileSync(config.dataFile, "utf8");
-  return normalizeState(JSON.parse(raw));
+  _cache = normalizeState(JSON.parse(raw));
+  return _cache;
+}
+
+export function readStore() {
+  return loadCache();
 }
 
 export function writeStore(state) {
-  writeFileSync(config.dataFile, JSON.stringify(normalizeState(state), null, 2));
+  _cache = normalizeState(state ?? _cache);
+  _dirty = true;
 }
 
 export function updateStore(updater) {
-  const current = readStore();
-  const next = updater(current);
-  writeStore(next);
-  return next;
+  loadCache();
+  _cache = updater(_cache);
+  _dirty = true;
+  return _cache;
+}
+
+export async function flushStore() {
+  if (!_dirty || _writing) return;
+  _writing = true;
+  const data = JSON.stringify(normalizeState(_cache), null, 2);
+  try {
+    await writeFile(config.dataFile, data);
+    _dirty = false;
+  } catch {
+    // best-effort; next interval will retry
+  } finally {
+    _writing = false;
+  }
 }

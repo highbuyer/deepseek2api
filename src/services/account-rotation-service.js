@@ -2,6 +2,10 @@ import { listAccounts, listAccountsForOwner } from "./account-service.js";
 
 const nextAccountIndexes = new Map();
 
+export function clearAccountIndex(apiKeyId) {
+  nextAccountIndexes.delete(apiKeyId);
+}
+
 function listApiKeyAccounts(ownerId) {
   return ownerId === "admin" ? listAccounts() : listAccountsForOwner(ownerId);
 }

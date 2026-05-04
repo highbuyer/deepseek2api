@@ -129,11 +129,17 @@ export async function collectCompletionContent({ account, deleteAfterFinish = fa
     onComplete: async (sessionId) => {
       const { response } = await startCompletion({ account, requestOptions, sessionId });
       let content = "";
+      const MAX_COLLECT_CHARS = 200000;
 
       await consumeTaggedStream(response.body, (text) => {
-        content += text;
+        if (content.length < MAX_COLLECT_CHARS) {
+          content += text;
+        }
       });
 
+      if (content.length >= MAX_COLLECT_CHARS) {
+        log.warn("runner", `Response truncated at ${MAX_COLLECT_CHARS} chars (model=${requestOptions.model.id})`);
+      }
       if (!content.length) {
         log.warn("runner", `Empty response from DeepSeek (model=${requestOptions.model.id}, prompt=${requestOptions.prompt.length} chars)`);
       }

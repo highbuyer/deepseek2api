@@ -5,6 +5,18 @@ import { setGlobalDispatcher, ProxyAgent } from "undici";
 
 import { config } from "./config.js";
 import { preloadEmbeddingModel } from "./services/openai-embeddings.js";
+import { flushStore, readStore } from "./storage/store.js";
+
+// Load store at startup
+readStore();
+
+// Periodic async disk flush (avoids sync writeFileSync blocking event loop)
+setInterval(() => { flushStore(); }, 500);
+
+// Preload embedding model
+preloadEmbeddingModel().catch((err) => {
+  console.warn("Embedding model preload failed:", err.message);
+});
 
 // Node.js fetch doesn't respect system proxy — wire it up manually
 const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
