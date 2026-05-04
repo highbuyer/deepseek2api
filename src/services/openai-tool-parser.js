@@ -38,6 +38,9 @@ const TOOL_NAME_PATTERNS = Object.freeze([
   /<(?:[a-z0-9_:-]+:)?function[a-z0-9_]*name\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?function_name>/i,
   /<(?:[a-z0-9_:-]+:)?function[a-z0-9_]*name\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?function[a-z0-9_]*name>/i,
   /<(?:[a-z0-9_:-]+:)?function[a-z0-9_]*name\b[^>]*>([^<]+)/i,
+  // <tool_type> (model drift from <tool_name>/<invoke name="">)
+  /<(?:[a-z0-9_:-]+:)?tool_type\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?tool_type>/i,
+  /<(?:[a-z0-9_:-]+:)?tool_type\b[^>]*>([^<]+)/i,
   // standard <name> and <function>
   /<(?:[a-z0-9_:-]+:)?name\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?name>/i,
   /<(?:[a-z0-9_:-]+:)?function\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?function>/i
