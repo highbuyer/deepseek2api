@@ -4,61 +4,12 @@ import { config } from "../config.js";
 import { log } from "../utils/log.js";
 import { toStringSafe, toJsonText } from "../utils/safe-string.js";
 import { resolveOpenAiModel } from "./openai-request.js";
-
-/* ── Shared truncation helpers ── */
-
-function getToolResultBudget(totalContextChars) {
-  if (totalContextChars > 100000) return 4000;
-  if (totalContextChars > 60000) return 6000;
-  if (totalContextChars > 30000) return 10000;
-  return 12000;
-}
-
-function getToolTruncationCategory(toolName) {
-  const lower = (toolName || "").toLowerCase();
-  if (/^(read|read_file|readfile)$/i.test(lower)) return "read";
-  if (/^(bash|shell|execute_command|runcommand|run_command|terminal)$/i.test(lower)) return "bash";
-  if (/^(search|grep|find|glob|list)$/i.test(lower)) return "search";
-  if (/^(write|edit|apply_patch|applypatch|patch)$/i.test(lower)) return "write";
-  return "default";
-}
-
-const TOOL_TRUNCATION_STRATEGY = {
-  read:    { headRatio: 0.5, tailRatio: 0.3 },
-  bash:    { headRatio: 0.2, tailRatio: 0.6 },
-  search:  { headRatio: 0.7, tailRatio: 0.15 },
-  write:   { headRatio: 0.5, tailRatio: 0.3 },
-  default: { headRatio: 0.6, tailRatio: 0.4 }
-};
-
-function formatTruncationHint(contentLen, headBudget, tailBudget, omitted, toolName) {
-  const cat = getToolTruncationCategory(toolName);
-  const label = toolName ? ` (${cat} strategy for ${toolName})` : "";
-  return (
-    `\n\n⚠️ FILE TOO LARGE — ${omitted} chars omitted (${Math.round(omitted / contentLen * 100)}% of ${contentLen} total).\n` +
-    `Showing first ${headBudget} + last ${tailBudget} chars${label}.\n\n` +
-    `DO NOT read this file again without offset/limit. Instead:\n` +
-    `- Read with offset and limit parameters to fetch specific sections\n` +
-    `- Grep for patterns to find exactly what you need before reading\n` +
-    `- The truncated content above shows the file structure; search it first\n\n`
-  );
-}
-
-function truncateToolResult(content, budget, toolName) {
-  if (content.length <= budget) return { text: content, truncated: false };
-
-  const cat = getToolTruncationCategory(toolName);
-  const strategy = TOOL_TRUNCATION_STRATEGY[cat] || TOOL_TRUNCATION_STRATEGY.default;
-  const headBudget = Math.floor(budget * strategy.headRatio);
-  const tailBudget = Math.floor(budget * strategy.tailRatio);
-  const omitted = content.length - headBudget - tailBudget;
-
-  const text = content.slice(0, headBudget)
-    + formatTruncationHint(content.length, headBudget, tailBudget, omitted, toolName)
-    + content.slice(-tailBudget);
-
-  return { text, truncated: true };
-}
+import {
+  getToolResultBudget, getToolTruncationCategory, TOOL_TRUNCATION_STRATEGY,
+  formatTruncationHint, truncateToolResult,
+  PER_MESSAGE_TOOL_RESULT_BUDGET, BUDGET_PREVIEW_CHARS, buildBudgetPreview,
+  keepRecentMessages
+} from "../utils/tool-truncation.js";
 
 /* ── Anthropic → DeepSeek prompt conversion ── */
 
@@ -186,21 +137,6 @@ function contentBlockToText(block, _ctxChars = 0) {
   return "";
 }
 
-const PER_MESSAGE_TOOL_RESULT_BUDGET = 70000;
-const BUDGET_PREVIEW_CHARS = 500;
-
-function buildBudgetPreview(content, originalSize) {
-  const preview = content.slice(0, BUDGET_PREVIEW_CHARS);
-  const sizeKB = Math.round(originalSize / 1024);
-  return (
-    `Output too large (${sizeKB} KB) — replaced to stay within context budget.\n` +
-    `Use Grep to search within this file, or Read with offset/limit.\n\n` +
-    `Preview (first ${BUDGET_PREVIEW_CHARS} chars):\n` +
-    preview +
-    (originalSize > BUDGET_PREVIEW_CHARS ? "\n[...]" : "")
-  );
-}
-
 function normalizeAnthropicMessages(messages) {
   let totalChars = 0;
 
@@ -226,7 +162,7 @@ function normalizeAnthropicMessages(messages) {
         batchToolResultChars += raw.length;
         if (batchToolResultChars > PER_MESSAGE_TOOL_RESULT_BUDGET) {
           // Replace with preview instead of full content
-          const preview = buildBudgetPreview(raw, raw.length);
+          const preview = buildBudgetPreview(raw, raw.length, "");
           const name = toStringSafe(block.tool_use_id).slice(-20);
           const text = `<tool_result id="${name}">\n${preview}\n</tool_result>`;
           totalChars += text.length;
@@ -388,32 +324,6 @@ function injectAnthropicToolPrompt(messages, tools, policy) {
   return updated;
 }
 
-function keepRecentMessages(msgs, budget) {
-  const kept = [];
-  let used = 0;
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    const block = `${msgs[i].role.toUpperCase()}: ${msgs[i].content ?? ""}`;
-    const separator = i < msgs.length - 1 ? "\n\n" : "";
-    const entry = separator + block;
-    if (used + entry.length <= budget) {
-      used += entry.length;
-      kept.push(msgs[i]);
-      continue;
-    }
-    // Try to truncate this message to fit remaining budget
-    const header = separator + `${msgs[i].role.toUpperCase()}: `;
-    const contentBudget = budget - used - header.length;
-    if (contentBudget > 300) {
-      const truncated = {
-        ...msgs[i],
-        content: (msgs[i].content ?? "").slice(0, contentBudget) + "\n...[truncated]"
-      };
-      kept.push(truncated);
-    }
-    break;
-  }
-  return kept.reverse();
-}
 
 function truncatePrompt(messages, maxChars) {
   const systemMsgs = messages.filter((m) => m.role === "system");

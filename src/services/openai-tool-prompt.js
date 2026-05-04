@@ -3,6 +3,12 @@ import { getToolFunction, getToolName, resolveToolChoicePolicy } from "./openai-
 import { config } from "../config.js";
 import { log } from "../utils/log.js";
 import { toStringSafe, toJsonText } from "../utils/safe-string.js";
+import {
+  getToolResultBudget, getToolTruncationCategory, TOOL_TRUNCATION_STRATEGY,
+  formatTruncationHint, truncateToolResult,
+  PER_MESSAGE_TOOL_RESULT_BUDGET, BUDGET_PREVIEW_CHARS, buildBudgetPreview,
+  keepRecentMessages
+} from "../utils/tool-truncation.js";
 
 function toCdata(text) {
   const value = toStringSafe(text);
@@ -89,64 +95,6 @@ function normalizeAssistantPromptContent(message, toolNameById) {
   return `${content}\n\n${toolHistory}`;
 }
 
-// 动态工具结果预算：上下文越大，每条结果越短，防止并行工具调用撑爆 prompt
-function getToolResultBudget(totalContextChars) {
-  if (totalContextChars > 100000) return 4000;
-  if (totalContextChars > 60000) return 6000;
-  if (totalContextChars > 30000) return 10000;
-  return 12000;
-}
-
-// 按工具类型差异化截断：不同工具的头/尾信息密度不同
-function getToolTruncationCategory(toolName) {
-  const lower = (toolName || "").toLowerCase();
-  if (/^(read|read_file|readfile)$/i.test(lower)) return "read";
-  if (/^(bash|shell|execute_command|runcommand|run_command|terminal)$/i.test(lower)) return "bash";
-  if (/^(search|grep|find|glob|list)$/i.test(lower)) return "search";
-  if (/^(write|edit|apply_patch|applypatch|patch)$/i.test(lower)) return "write";
-  return "default";
-}
-
-const TOOL_TRUNCATION_STRATEGY = {
-  read:    { headRatio: 0.5, tailRatio: 0.3 },
-  bash:    { headRatio: 0.2, tailRatio: 0.6 },
-  search:  { headRatio: 0.7, tailRatio: 0.15 },
-  write:   { headRatio: 0.5, tailRatio: 0.3 },
-  default: { headRatio: 0.6, tailRatio: 0.4 }
-};
-
-// Direct instruction to model when tool result exceeds budget.
-// Pattern from Claude Code's FileTooLargeError — tells the model exactly
-// what parameters to use instead of leaving it to guess.
-function formatTruncationHint(contentLen, headBudget, tailBudget, omitted, toolName) {
-  const cat = getToolTruncationCategory(toolName);
-  const label = toolName ? ` (${cat} strategy for ${toolName})` : "";
-  return (
-    `\n\n⚠️ FILE TOO LARGE — ${omitted} chars omitted (${Math.round(omitted / contentLen * 100)}% of ${contentLen} total).\n` +
-    `Showing first ${headBudget} + last ${tailBudget} chars${label}.\n\n` +
-    `DO NOT read this file again without offset/limit. Instead:\n` +
-    `- Read with offset and limit parameters to fetch specific sections\n` +
-    `- Grep for patterns to find exactly what you need before reading\n` +
-    `- The truncated content above shows the file structure; search it first\n\n`
-  );
-}
-
-function truncateToolResult(content, budget, toolName) {
-  if (content.length <= budget) return { text: content, truncated: false };
-
-  const cat = getToolTruncationCategory(toolName);
-  const strategy = TOOL_TRUNCATION_STRATEGY[cat] || TOOL_TRUNCATION_STRATEGY.default;
-  const headBudget = Math.floor(budget * strategy.headRatio);
-  const tailBudget = Math.floor(budget * strategy.tailRatio);
-  const omitted = content.length - headBudget - tailBudget;
-
-  const text = content.slice(0, headBudget)
-    + formatTruncationHint(content.length, headBudget, tailBudget, omitted, toolName)
-    + content.slice(-tailBudget);
-
-  return { text, truncated: true };
-}
-
 function normalizeToolPromptContent(message, toolNameById, totalContextChars = 0) {
   let content = normalizeContentText(message?.content).trim() || "null";
   // Strip line-number prefixes (Read output format: "  1→code")
@@ -167,27 +115,6 @@ function normalizeToolPromptContent(message, toolNameById, totalContextChars = 0
 
 function normalizeMessageRole(role) {
   return role === "developer" ? "system" : role;
-}
-
-// Per-message tool result budget — when aggregate tool results between two
-// user messages exceed this, the largest are replaced with previews telling
-// the model to use Grep/offset.  Pattern from Claude Code's enforceToolResultBudget.
-const PER_MESSAGE_TOOL_RESULT_BUDGET = 70000;
-const BUDGET_PREVIEW_CHARS = 500;
-
-function buildBudgetReplacement(content, toolName, originalSize) {
-  const preview = content.slice(0, BUDGET_PREVIEW_CHARS);
-  const sizeKB = Math.round(originalSize / 1024);
-  return [
-    "Output too large — this result was replaced to stay within the context budget.",
-    `Original size: ${sizeKB} KB. To read this content, use:`,
-    `- Grep to search for specific patterns within this file`,
-    `- Read with offset/limit parameters to fetch relevant sections`,
-    "",
-    `Preview (first ${BUDGET_PREVIEW_CHARS} chars):`,
-    preview,
-    originalSize > BUDGET_PREVIEW_CHARS ? "[...]" : ""
-  ].join("\n");
 }
 
 function normalizeMessagesForPrompt(messages) {
@@ -226,7 +153,7 @@ function normalizeMessagesForPrompt(messages) {
       const rawLen = rawContent.length;
 
       if (batchToolResultChars + rawLen > PER_MESSAGE_TOOL_RESULT_BUDGET && batchToolResultChars > 0) {
-        const replacement = buildBudgetReplacement(rawContent, toolName, rawLen);
+        const replacement = buildBudgetPreview(rawContent, rawLen, toolName);
         const content = toolName ? `<tool_result id="${toolName}">\n${replacement}\n</tool_result>` : replacement;
         log.warn("prompt", `Per-message tool result budget exceeded (${batchToolResultChars} + ${rawLen} > ${PER_MESSAGE_TOOL_RESULT_BUDGET}), replacing "${toolName}" with preview`);
         totalChars += content.length;
@@ -440,33 +367,6 @@ function injectToolPrompt(messages, tools, policy) {
     content: [updated[systemIndex].content, toolPrompt].filter(Boolean).join("\n\n")
   };
   return updated;
-}
-
-function keepRecentMessages(msgs, budget) {
-  const kept = [];
-  let used = 0;
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    const block = `${msgs[i].role.toUpperCase()}: ${msgs[i].content ?? ""}`;
-    const separator = i < msgs.length - 1 ? "\n\n" : "";
-    const entry = separator + block;
-    if (used + entry.length <= budget) {
-      used += entry.length;
-      kept.push(msgs[i]);
-      continue;
-    }
-    // Try to truncate this message to fit remaining budget
-    const header = separator + `${msgs[i].role.toUpperCase()}: `;
-    const contentBudget = budget - used - header.length;
-    if (contentBudget > 300) {
-      const truncated = {
-        ...msgs[i],
-        content: (msgs[i].content ?? "").slice(0, contentBudget) + "\n...[truncated]"
-      };
-      kept.push(truncated);
-    }
-    break;
-  }
-  return kept.reverse();
 }
 
 function truncatePromptMessages(messages, maxChars) {
