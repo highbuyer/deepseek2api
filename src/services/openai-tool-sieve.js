@@ -5,13 +5,13 @@ import { log } from "../utils/log.js";
 
 // Shared format error message — used by all bridge layers when the model
 // drifts to an unrecognized tool call XML format (Claude Code tool_use_error pattern).
-// Uses HTML entities for angle brackets so the format example survives
-// stripLeakedMarkers (which strips raw XML tags).
+// NOTE: Contains raw XML tags that must survive stripLeakedMarkers.
+// Bridge layers pass this directly to emitTextEvent with skipStrip=true.
 export const FORMAT_ERROR_MSG =
   "<tool_use_error>Your tool call format was incorrect. " +
-  "Use EXACTLY: &lt;function_calls&gt;&lt;invoke name=\"ToolName\"&gt;" +
-  "&lt;parameter name=\"key\" string=\"true\"&gt;value&lt;/parameter&gt;" +
-  "&lt;/invoke&gt;&lt;/function_calls&gt; " +
+  "Use EXACTLY: <function_calls><invoke name=\"ToolName\">" +
+  "<parameter name=\"key\" string=\"true\">value</parameter>" +
+  "</invoke></function_calls> " +
   "Do NOT use tool_calls, tool_call, tool_name, or tool_type tags.</tool_use_error>";
 
 /* ── Tag detection ──

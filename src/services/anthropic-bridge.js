@@ -191,8 +191,8 @@ export async function streamAnthropicMessage(options) {
 
   /* ── Text emission ── */
 
-  const emitTextEvent = (text, kind) => {
-    const cleaned = stripLeakedMarkers(text);
+  const emitTextEvent = (text, kind, skipStrip = false) => {
+    const cleaned = skipStrip ? text : stripLeakedMarkers(text);
     if (!cleaned) return;
 
     if (kind === "thinking") {
@@ -216,7 +216,7 @@ export async function streamAnthropicMessage(options) {
         emitToolCalls(event.calls ?? []);
       } else if (event.type === "format_error") {
         log.warn("bridge", `[stream] Format error detected, sending correction immediately`);
-        emitTextEvent(FORMAT_ERROR_MSG, "response");
+        emitTextEvent(FORMAT_ERROR_MSG, "response", true);
       } else if (event.type === "text") {
         emitTextEvent(event.text, event.kind ?? fallbackKind);
       }

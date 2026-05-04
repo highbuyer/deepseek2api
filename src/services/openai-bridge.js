@@ -247,8 +247,8 @@ export async function streamOpenAiResponse(options) {
 
   let streamChars = 0;
 
-  const emitTextEvent = (text, kind) => {
-    const cleaned = stripLeakedMarkers(text);
+  const emitTextEvent = (text, kind, skipStrip = false) => {
+    const cleaned = skipStrip ? text : stripLeakedMarkers(text);
     if (!cleaned) return;
     streamChars += cleaned.length;
     if (streamChars > 0 && streamChars <= cleaned.length) {
@@ -266,7 +266,7 @@ export async function streamOpenAiResponse(options) {
         emitToolCalls(event.calls ?? []);
       } else if (event.type === "format_error") {
         log.warn("bridge", `[stream] Format error detected (block preview: "${event.block?.slice(0, 80)}"), sending correction immediately`);
-        emitTextEvent(FORMAT_ERROR_MSG, "response");
+        emitTextEvent(FORMAT_ERROR_MSG, "response", true);
       } else if (event.type === "text") {
         emitTextEvent(event.text, event.kind ?? fallbackKind);
       }

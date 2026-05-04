@@ -100,8 +100,8 @@ export async function streamResponsesResponse({
     });
   };
 
-  const emitText = (text, kind) => {
-    const cleaned = stripLeakedMarkers(text);
+  const emitText = (text, kind, skipStrip = false) => {
+    const cleaned = skipStrip ? text : stripLeakedMarkers(text);
     if (!cleaned) {
       return;
     }
@@ -188,7 +188,7 @@ export async function streamResponsesResponse({
           return;
         }
         if (event.type === "format_error") {
-          emitText(FORMAT_ERROR_MSG, "response");
+          emitText(FORMAT_ERROR_MSG, "response", true);
           return;
         }
         emitText(event.text, event.kind ?? kind);
@@ -204,7 +204,7 @@ export async function streamResponsesResponse({
         return;
       }
       if (event.type === "format_error") {
-        emitText(FORMAT_ERROR_MSG, "response");
+        emitText(FORMAT_ERROR_MSG, "response", true);
         return;
       }
       emitText(event.text, event.kind);
