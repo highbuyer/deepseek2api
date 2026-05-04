@@ -10,6 +10,7 @@ import { log } from "../utils/log.js";
 const TOOL_BLOCK_OPENS = [
   "<function_calls",
   "<tool_calls",
+  "<tool_result",
   "<tool_call_name",
   "<tool_call",
   "<function_call_name",
@@ -22,6 +23,7 @@ const TOOL_BLOCK_OPENS = [
 const TOOL_BLOCK_CLOSES = [
   "</function_calls>",
   "</tool_calls>",
+  "</tool_result>",
   "</tool_call_name>",
   "</tool_call>",
   "</function_call_name>",
@@ -121,6 +123,21 @@ export function createToolSieve(allowedToolNames = []) {
         return events;
       }
 
+      // Drop <tool_result> blocks — they are echoed prompt content, never valid tool calls.
+      // Without this, large tool results overflow and leak file content into the SSE stream.
+      if (/<tool_result\b/i.test(state.capture)) {
+        const closeEnd = state.capture.toLowerCase().lastIndexOf("</tool_result>");
+        if (closeEnd >= 0) {
+          const suffix = state.capture.slice(closeEnd + "</tool_result>".length);
+          state.capture = "";
+          state.capturing = false;
+          if (suffix) state.hold = suffix;
+          if (suffix) { const more = drain(); events.push(...more); }
+          return events;
+        }
+        // Close not found, keep buffering (will overflow-flush if too large)
+      }
+
       // Try to find close tag
       const closeEnd = findCloseEnd(state.capture, state.closes);
       if (closeEnd > 0) {
@@ -130,11 +147,6 @@ export function createToolSieve(allowedToolNames = []) {
         if (calls.length) {
           events.push({ type: "tool_calls", calls });
         } else {
-          // Claude Code pattern: immediate error feedback on malformed tool call.
-          // Detected XML that looks like a tool block but parser couldn't extract
-          // any valid calls — the model used a wrong format variant.
-          // Emit format_error immediately so the bridge can abort the stream
-          // and tell the model to correct its format NOW, not next turn.
           events.push({
             type: "format_error",
             block: block.slice(0, 200),
@@ -143,9 +155,7 @@ export function createToolSieve(allowedToolNames = []) {
         }
         state.capture = "";
         state.capturing = false;
-        // Process suffix for more tool blocks
         if (suffix) state.hold = suffix;
-        // Recurse: suffix might contain another tool block
         if (suffix) {
           const more = drain();
           events.push(...more);
