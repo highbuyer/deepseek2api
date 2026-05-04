@@ -500,10 +500,50 @@ function truncatePromptMessages(messages, maxChars) {
   return result;
 }
 
+// Check if Read tool results are bloating the context (Claude Code checkReadResultBloat).
+// When Read results exceed a threshold, inject a system reminder telling the model
+// to stop re-reading and use Grep or offset/limit instead.
+function injectReadBloatHint(promptMessages) {
+  let readResultChars = 0;
+  let totalChars = 0;
+  for (const msg of promptMessages) {
+    totalChars += (msg.content ?? "").length;
+    if (msg.role === "tool") {
+      const m = (msg.content ?? "").match(/<tool_result id="(read|read_file|readfile)"/i);
+      if (m) readResultChars += msg.content.length;
+    }
+  }
+
+  const readPct = totalChars > 0 ? (readResultChars / totalChars) * 100 : 0;
+  if (readPct < 5 || readResultChars < 10000) return promptMessages;
+
+  const hint = [
+    "<system-reminder>",
+    `File read results are using ${Math.round(readPct)}% of the context window.`,
+    "If you are re-reading files, reference earlier reads instead.",
+    "For large files, use Grep to search for patterns or Read with offset/limit to fetch specific sections.",
+    "Avoid reading entire files unless you need the full content.",
+    "</system-reminder>"
+  ].join("\n");
+
+  log.warn("prompt", `Read results at ${Math.round(readPct)}% of context (${readResultChars}/${totalChars} chars), injecting bloat hint`);
+
+  const sysIdx = promptMessages.findIndex(m => m.role === "system");
+  if (sysIdx >= 0) {
+    const updated = [...promptMessages];
+    updated[sysIdx] = { ...updated[sysIdx], content: updated[sysIdx].content + "\n\n" + hint };
+    return updated;
+  }
+  return [{ role: "system", content: hint }, ...promptMessages];
+}
+
 export function buildOpenAiPrompt({ messages, toolChoice, tools }) {
   const policy = resolveToolChoicePolicy({ tools, toolChoice });
   const normalizedMessages = normalizeMessagesForPrompt(messages);
-  const promptMessages = injectToolPrompt(normalizedMessages, tools ?? [], policy);
+  let promptMessages = injectToolPrompt(normalizedMessages, tools ?? [], policy);
+
+  // Check for Read result bloat (Claude Code checkReadResultBloat pattern)
+  promptMessages = injectReadBloatHint(promptMessages);
 
   let prompt = buildPromptFromMessages(promptMessages);
 
