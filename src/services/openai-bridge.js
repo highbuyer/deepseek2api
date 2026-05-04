@@ -9,6 +9,7 @@ import { ensureToolChoiceSatisfied, hasChatToolingRequest } from "./openai-tool-
 import { createOpenAiError } from "./openai-error.js";
 import { stripLeakedMarkers } from "../utils/strip-markers.js";
 import { isRefusal, CLAUDE_IDENTITY_RESPONSE } from "./openai-refusal-detector.js";
+import { createRequestLogger } from "./request-logger.js";
 import { log } from "../utils/log.js";
 
 function createCompletionId() {
@@ -195,6 +196,12 @@ export async function streamOpenAiResponse(options) {
   } = options;
   const completionId = createCompletionId();
   const requestOptions = resolveCompletionRequest(body, toolCallsEnabled);
+  const reqLogger = createRequestLogger({
+    requestId: completionId,
+    model: requestOptions.model.id,
+    toolNames: requestOptions.toolNames
+  });
+  reqLogger.startPhase("stream", "DeepSeek SSE stream");
   log.info("bridge", `[stream] model=${requestOptions.model.id}, accountId=${account.id}, toolNames=[${requestOptions.toolNames.join(",")}]`);
   const toolSieve = requestOptions.toolNames.length
     ? createToolSieve(requestOptions.toolNames)
@@ -219,6 +226,7 @@ export async function streamOpenAiResponse(options) {
   const emitToolCalls = (calls) => {
     if (!calls.length) return;
     sawToolCall = true;
+    reqLogger.recordToolCalls(calls.length);
     writeSseChunk(response, buildChunkPayload(
       completionId,
       requestOptions.model.id,
@@ -227,9 +235,15 @@ export async function streamOpenAiResponse(options) {
     toolCallIndex += calls.length;
   };
 
+  let streamChars = 0;
+
   const emitTextEvent = (text, kind) => {
     const cleaned = stripLeakedMarkers(text);
     if (!cleaned) return;
+    streamChars += cleaned.length;
+    if (streamChars > 0 && streamChars <= cleaned.length) {
+      reqLogger.recordTTFT();
+    }
     const delta = kind === "thinking"
       ? { reasoning_content: cleaned }
       : { content: cleaned };
@@ -292,6 +306,13 @@ export async function streamOpenAiResponse(options) {
       }
     }
   }
+
+  reqLogger.endPhase();
+  reqLogger.complete({
+    promptChars: requestOptions.prompt.length,
+    stopReason: sawToolCall ? "tool_calls" : "stop",
+    status: streamChars > 0 || sawToolCall ? "success" : "empty"
+  });
 
   response.end("data: [DONE]\n\n");
 }
