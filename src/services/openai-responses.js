@@ -50,6 +50,7 @@ export async function streamResponsesResponse({
   const requestOptions = resolveResponsesRequest(body, toolCallsEnabled);
   const responseId = createResponseId();
   const toolSieve = requestOptions.toolNames.length ? createToolSieve(requestOptions.toolNames) : null;
+  const CORRECT_FORMAT_MSG = "<tool_use_error>Your tool call format was incorrect. Use EXACTLY: <function_calls><invoke name=\"ToolName\"><parameter name=\"param\" string=\"true\">value</parameter></invoke></function_calls></tool_use_error>";
   let nextOutputIndex = 0;
   let outputText = "";
   let activeTextItem = null;
@@ -187,7 +188,10 @@ export async function streamResponsesResponse({
           emitToolCalls(event.calls ?? []);
           return;
         }
-
+        if (event.type === "format_error") {
+          emitText(CORRECT_FORMAT_MSG, "response");
+          return;
+        }
         emitText(event.text, event.kind ?? kind);
       });
     },
@@ -200,7 +204,10 @@ export async function streamResponsesResponse({
         emitToolCalls(event.calls ?? []);
         return;
       }
-
+      if (event.type === "format_error") {
+        emitText(CORRECT_FORMAT_MSG, "response");
+        return;
+      }
       emitText(event.text, event.kind);
     });
   }
