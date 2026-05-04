@@ -231,11 +231,6 @@ export async function streamOpenAiResponse(options) {
   ));
 
   if (requestOptions.toolNames.length && !sawToolCall && toolSieve) {
-    /* Last-ditch: the streaming sieve already tried hard to find tool calls
-     * via standard XML tags; if it found none, the parser's broader
-     * strategies (raw patch detection, etc.) might still pick something up
-     * from the full emitted text.  This pays for itself only when the model
-     * skipped XML entirely, which is rare. */
     const emittedText = toolSieve.emittedText;
     if (emittedText.length > 0) {
       const fallbackCalls = parseToolCallsFromText(emittedText, requestOptions.toolNames);
