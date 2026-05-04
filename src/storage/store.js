@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 
 import { config } from "../config.js";
+import { log } from "../utils/log.js";
 
 function defaultState() {
   return {
@@ -123,8 +124,8 @@ export async function flushStore() {
   try {
     await writeFile(config.dataFile, data);
     _dirty = false;
-  } catch {
-    // best-effort; next interval will retry
+  } catch (err) {
+    log.warn("store", `Async write failed: ${err.message} (data=${data.length} chars, will retry)`);
   } finally {
     _writing = false;
   }
