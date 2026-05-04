@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { log } from "../utils/log.js";
 import { toStringSafe } from "../utils/safe-string.js";
+import { tolerantParse, fixToolCallArguments, replaceSmartQuotes } from "./openai-tool-fixer.js";
 
 /* ── Single tool-call block patterns ── */
 /* Includes <tool> to handle models that output <tool name="Shell">...</tool> */
@@ -769,11 +770,21 @@ function fixApplyPatchArgs(input) {
 
 function buildParsedToolCall(name, argumentsText) {
   const normalizedArguments = argumentsText.trim() ? argumentsText.trim() : "{}";
-  const parsed = parseJsonObject(normalizedArguments) ?? parseMarkupInput(normalizedArguments);
+  let parsed = parseJsonObject(normalizedArguments) ?? parseMarkupInput(normalizedArguments);
+  // tolerantParse as extra fallback for badly malformed JSON
+  if (!parsed || (typeof parsed === "object" && Object.keys(parsed).length === 0)) {
+    const tolerant = tolerantParse(normalizedArguments);
+    if (tolerant && typeof tolerant === "object") {
+      // tolerantParse returns { tool, parameters } — standardize to flat args
+      parsed = tolerant.parameters ?? tolerant;
+    }
+  }
   const input = unwrapNestedJsonStrings(parsed, 3);
   // DeepSeek's ApplyPatch often misses target_directory and uses a custom
   // "*** Begin Patch" format instead of standard unified diff.  Fix both.
-  const fixed = name === "ApplyPatch" ? fixApplyPatchArgs(input) : input;
+  let fixed = name === "ApplyPatch" ? fixApplyPatchArgs(input) : input;
+  // cursor2api port: repair smart quotes + fuzzy old_string matching
+  fixed = fixToolCallArguments(name, fixed);
   return {
     id: `call_${randomUUID().replaceAll("-", "")}`,
     name,
@@ -1763,9 +1774,17 @@ export function parseToolCallsFromText(text, allowedToolNames = []) {
     log.warn("parser", `Stripped ${nullCount} control character(s) from input (including null bytes)`);
   }
 
+  // Step 1.1: Replace smart/curly quotes with ASCII before XML processing.
+  // Smart quotes inside tool call arguments break JSON.parse downstream.
+  const quoteFixed = replaceSmartQuotes(source);
+  if (quoteFixed !== source) {
+    const changed = [...source].filter((c, i) => c !== quoteFixed[i]).length;
+    log.debug("parser", `[preprocess] Replaced ${changed} smart quote(s) with ASCII`);
+  }
+
   // Step 1.2: Strip <think>/<thought>/<thinking> reasoning blocks so the
   // model's chain-of-thought never triggers a tool call.
-  const thinkStripped = source.replace(/<think\b[^>]*>[\s\S]*?<\/think\s*>/gi, '')
+  const thinkStripped = quoteFixed.replace(/<think\b[^>]*>[\s\S]*?<\/think\s*>/gi, '')
     .replace(/<\/?thought\b[^>]*>/gi, '')
     .replace(/<\/?think\b[^>]*>/gi, '')
     .replace(/<\/?thinking\b[^>]*>/gi, '')
