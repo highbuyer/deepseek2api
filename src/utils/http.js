@@ -34,8 +34,10 @@ export function sendJson(response, statusCode, payload) {
   response.end(body);
 }
 
-export function sendError(response, statusCode, message) {
-  sendJson(response, statusCode, { error: message });
+export function sendError(response, statusCode, message, code = "") {
+  const payload = { error: message };
+  if (code) payload.code = code;
+  sendJson(response, statusCode, payload);
 }
 
 export function parseCookies(request) {

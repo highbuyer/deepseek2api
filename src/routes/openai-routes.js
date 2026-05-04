@@ -1,3 +1,4 @@
+import { resolveLimitStatus } from "../services/api-error.js";
 import { getApiKeyRecord } from "../services/api-key-service.js";
 import { takeRoundRobinAccount } from "../services/account-rotation-service.js";
 import { isIncognitoEnabledForOwner } from "../services/incognito-service.js";
@@ -19,26 +20,22 @@ function getBearerToken(request) {
   return value.startsWith("Bearer ") ? value.slice(7) : "";
 }
 
-function resolveLimitStatus(error) {
-  return error.code === "USER_DISABLED" ? 403 : 429;
-}
-
 function handleOpenAiError(response, error) {
   if (error.code === "USER_DISABLED" || error.code === "REQUEST_LIMIT") {
     log.warn("route", `Request rejected: code=${error.code} msg=${error.message}`);
-    sendError(response, resolveLimitStatus(error), error.message);
+    sendError(response, resolveLimitStatus(error), error.message, error.code);
     return true;
   }
 
   if (error instanceof SyntaxError) {
     log.warn("route", "Invalid JSON body");
-    sendError(response, 400, "Invalid JSON body");
+    sendError(response, 400, "Invalid JSON body", "PARSE_ERROR");
     return true;
   }
 
   if (error.statusCode) {
     log.warn("route", `Error ${error.statusCode}: ${error.message}`);
-    sendError(response, error.statusCode, error.message);
+    sendError(response, error.statusCode, error.message, error.code);
     return true;
   }
 

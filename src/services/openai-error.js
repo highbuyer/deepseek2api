@@ -1,8 +1,5 @@
+import { ApiError } from "./api-error.js";
+
 export function createOpenAiError(statusCode, message, code = "") {
-  const error = new Error(message);
-  error.statusCode = statusCode;
-  if (code) {
-    error.code = code;
-  }
-  return error;
+  return new ApiError(message, { statusCode, code });
 }

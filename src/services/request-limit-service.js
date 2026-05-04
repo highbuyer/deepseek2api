@@ -1,14 +1,9 @@
 import { getLocalUserFromOwnerId } from "./user-service.js";
+import { createTaggedError } from "./api-error.js";
 
 const RATE_WINDOW_MS = 60_000;
 const activeRequests = new Map();
 const requestHistory = new Map();
-
-function createTaggedError(message, code) {
-  const error = new Error(message);
-  error.code = code;
-  return error;
-}
 
 function pruneHistory(ownerId, now) {
   const current = requestHistory.get(ownerId) ?? [];

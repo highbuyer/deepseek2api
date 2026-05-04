@@ -8,13 +8,10 @@ import {
 import { isIncognitoEnabledForOwner } from "../services/incognito-service.js";
 import { proxyDeepseekRequest } from "../services/deepseek-proxy.js";
 import { withOwnerRequestLimit } from "../services/request-limit-service.js";
+import { resolveLimitStatus } from "../services/api-error.js";
 import { parseJsonBody, readRequestBody, sendError, sendJson } from "../utils/http.js";
 
 const CHAT_COMPLETION_PATH = "/api/v0/chat/completion";
-
-function resolveLimitStatus(error) {
-  return error.code === "USER_DISABLED" ? 403 : 429;
-}
 
 function getForwardHeaders(request) {
   const headers = {};
@@ -168,7 +165,7 @@ export async function handleProxyRequest(request, response, url, allowedProxyPat
     });
   } catch (error) {
     if (error.statusCode) {
-      sendError(response, error.statusCode, error.message);
+      sendError(response, error.statusCode, error.message, error.code);
       return true;
     }
 
@@ -176,7 +173,7 @@ export async function handleProxyRequest(request, response, url, allowedProxyPat
       throw error;
     }
 
-    sendError(response, resolveLimitStatus(error), error.message);
+    sendError(response, resolveLimitStatus(error), error.message, error.code);
   }
 
   return true;
