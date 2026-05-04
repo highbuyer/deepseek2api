@@ -1955,7 +1955,7 @@ export function parseToolCallsFromText(text, allowedToolNames = []) {
   log.debug("parser", `Parsed ${calls.length} tool call(s) from text (allowed: [${allowedToolNames.join(",")}])`);
   if (calls.length) {
     calls.forEach((call, i) => {
-      log.debug("parser", `  Tool call #${i}: name="${call.name}", argumentsText="${call.previewForLog(argumentsText, 300)}"`);
+      log.debug("parser", `  Tool call #${i}: name="${call.name}", argumentsText="${previewForLog(call.argumentsText, 300)}"`);
     });
   } else {
     log.warn("parser", `XML tool tags found but no valid calls parsed. Stripped preview: ${previewForLog(stripped, 500)}`);
