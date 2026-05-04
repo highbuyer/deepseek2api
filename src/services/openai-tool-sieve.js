@@ -167,8 +167,8 @@ export function createToolSieve(allowedToolNames = []) {
       if (lastLt >= 0 && !text.slice(lastLt).includes(">")) {
         // Partial tag at end — hold only the partial portion
         const partialLen = text.length - lastLt;
-        if (partialLen <= LOOKBEHIND && lastLt > 0) {
-          pushTextEvent(events, text.slice(0, lastLt), state.lastKind);
+        if (partialLen <= LOOKBEHIND) {
+          if (lastLt > 0) pushTextEvent(events, text.slice(0, lastLt), state.lastKind);
           state.hold = text.slice(lastLt);
         } else {
           pushTextEvent(events, text, state.lastKind);
