@@ -188,6 +188,21 @@ function contentBlockToText(block) {
   return "";
 }
 
+const PER_MESSAGE_TOOL_RESULT_BUDGET = 70000;
+const BUDGET_PREVIEW_CHARS = 500;
+
+function buildBudgetPreview(content, originalSize) {
+  const preview = content.slice(0, BUDGET_PREVIEW_CHARS);
+  const sizeKB = Math.round(originalSize / 1024);
+  return (
+    `Output too large (${sizeKB} KB) — replaced to stay within context budget.\n` +
+    `Use Grep to search within this file, or Read with offset/limit.\n\n` +
+    `Preview (first ${BUDGET_PREVIEW_CHARS} chars):\n` +
+    preview +
+    (originalSize > BUDGET_PREVIEW_CHARS ? "\n[...]" : "")
+  );
+}
+
 function normalizeAnthropicMessages(messages) {
   _anthropicContextChars = 0;
 
@@ -203,7 +218,23 @@ function normalizeAnthropicMessages(messages) {
     }
     if (!Array.isArray(content)) return [];
 
+    // Per-message tool result budget (Claude Code enforceToolResultBudget pattern)
+    let batchToolResultChars = 0;
+
     const textBlocks = content.map(block => {
+      if (block?.type === "tool_result") {
+        const raw = typeof block.content === "string" ? block.content
+          : Array.isArray(block.content) ? block.content.map(c => c?.text ?? "").join("\n") : "";
+        batchToolResultChars += raw.length;
+        if (batchToolResultChars > PER_MESSAGE_TOOL_RESULT_BUDGET) {
+          // Replace with preview instead of full content
+          const preview = buildBudgetPreview(raw, raw.length);
+          const name = toStringSafe(block.tool_use_id).slice(-20);
+          const text = `<tool_result id="${name}">\n${preview}\n</tool_result>`;
+          _anthropicContextChars += text.length;
+          return text;
+        }
+      }
       const text = contentBlockToText(block);
       _anthropicContextChars += text.length;
       return text;

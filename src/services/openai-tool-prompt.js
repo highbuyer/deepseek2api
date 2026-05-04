@@ -169,23 +169,72 @@ function normalizeMessageRole(role) {
   return role === "developer" ? "system" : role;
 }
 
+// Per-message tool result budget — when aggregate tool results between two
+// user messages exceed this, the largest are replaced with previews telling
+// the model to use Grep/offset.  Pattern from Claude Code's enforceToolResultBudget.
+const PER_MESSAGE_TOOL_RESULT_BUDGET = 70000;
+const BUDGET_PREVIEW_CHARS = 500;
+
+function buildBudgetReplacement(content, toolName, originalSize) {
+  const preview = content.slice(0, BUDGET_PREVIEW_CHARS);
+  const sizeKB = Math.round(originalSize / 1024);
+  return [
+    "Output too large — this result was replaced to stay within the context budget.",
+    `Original size: ${sizeKB} KB. To read this content, use:`,
+    `- Grep to search for specific patterns within this file`,
+    `- Read with offset/limit parameters to fetch relevant sections`,
+    "",
+    `Preview (first ${BUDGET_PREVIEW_CHARS} chars):`,
+    preview,
+    originalSize > BUDGET_PREVIEW_CHARS ? "[...]" : ""
+  ].join("\n");
+}
+
 function normalizeMessagesForPrompt(messages) {
   const toolNameById = new Map();
 
   // Accumulate running context size so tool result budgets tighten as prompt grows
   let totalChars = 0;
+  // Per-batch tool result tracking — reset when a user message is encountered
+  let batchToolResultChars = 0;
 
   return (messages ?? []).flatMap((message) => {
     const role = normalizeMessageRole(toStringSafe(message?.role).trim().toLowerCase() || "user");
 
+    if (role === "user") {
+      batchToolResultChars = 0;
+      const content = normalizeContentText(message?.content);
+      totalChars += content.length;
+      return [{ role, content }];
+    }
+
     if (role === "assistant") {
+      batchToolResultChars = 0;
       const content = normalizeAssistantPromptContent(message, toolNameById);
       if (content) totalChars += content.length;
       return content ? [{ role, content }] : [];
     }
 
     if (role === "tool" || role === "function") {
+      const toolName = toolNameById.get(toStringSafe(message?.tool_call_id).trim()) || toStringSafe(message?.name).trim();
+
+      // Per-message budget enforcement: if adding this result would exceed
+      // the batch budget, replace it with a preview instead of truncation.
+      // Pattern from Claude Code's enforceToolResultBudget.
+      let rawContent = normalizeContentText(message?.content).trim() || "null";
+      rawContent = rawContent.replace(/^\s*\d+→/gm, "");
+      const rawLen = rawContent.length;
+
+      if (batchToolResultChars + rawLen > PER_MESSAGE_TOOL_RESULT_BUDGET && batchToolResultChars > 0) {
+        const replacement = buildBudgetReplacement(rawContent, toolName, rawLen);
+        const content = toolName ? `<tool_result id="${toolName}">\n${replacement}\n</tool_result>` : replacement;
+        log.warn("prompt", `Per-message tool result budget exceeded (${batchToolResultChars} + ${rawLen} > ${PER_MESSAGE_TOOL_RESULT_BUDGET}), replacing "${toolName}" with preview`);
+        totalChars += content.length;
+        return [{ role: "tool", content }];
+      }
+
       const content = normalizeToolPromptContent(message, toolNameById, totalChars);
+      batchToolResultChars += rawLen;
       totalChars += content.length;
       return [{ role: "tool", content }];
     }
