@@ -1,6 +1,6 @@
 import { parseToolCallsFromText } from "./openai-tool-parser.js";
 import { toStringSafe } from "../utils/safe-string.js";
-import { stripLeakedMarkers } from "../utils/strip-markers.js";
+import { stripLeakedMarkers, finalStrip } from "../utils/strip-markers.js";
 import { log } from "../utils/log.js";
 
 /* ── Tag detection ──
@@ -251,11 +251,14 @@ export function splitToolAwareEvents(text, allowedToolNames = []) {
 
 export function extractToolAwareOutput(text, allowedToolNames = []) {
   const events = splitToolAwareEvents(text, allowedToolNames);
-  const content = events
+  let content = events
     .filter((event) => event.type === "text")
     .map((event) => stripLeakedMarkers(event.text))
     .join("")
     .trimStart();
+  // Final post-stream cleanup — strips any XML fragments that leaked
+  // across chunk boundaries during streaming (Claude Code pattern).
+  content = finalStrip(content);
   return {
     events,
     content,

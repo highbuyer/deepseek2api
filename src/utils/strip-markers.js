@@ -76,3 +76,26 @@ export function stripLeakedMarkers(text) {
 
   return result;
 }
+
+// Post-stream cleanup: run on the complete text after streaming ends.
+// Catches any XML fragments that leaked across SSE chunk boundaries.
+export function finalStrip(text) {
+  if (!text) return text;
+
+  let result = text;
+
+  // Strip any unclosed XML opens (e.g. "<function_calls", "<tool_call")
+  // that leaked because the close tag arrived in a separate chunk
+  result = result.replace(/<(?:function_calls|tool_calls|tool_call|function_call|invoke|tool_use|tool_name)\b[^>]*\/?\s*>/gi, "");
+
+  // Strip orphan close tags
+  result = result.replace(/<\/(?:function_calls|tool_calls|tool_call|function_call|invoke|tool_use|tool_name|tool_call_name|function_call_name)\s*>/gi, "");
+
+  // Strip leaked CDATA wrappers
+  result = result.replace(/<!\[CDATA\[|\]\]>/gi, "");
+
+  // Collapse multiple blank lines from stripping
+  result = result.replace(/\n{3,}/g, "\n\n");
+
+  return result.trim();
+}
