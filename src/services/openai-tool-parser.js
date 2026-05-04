@@ -182,7 +182,8 @@ function stripSurroundingQuotes(value) {
 
 function decodeXmlText(text) {
   const raw = toStringSafe(text).trim();
-  const cdataMatch = raw.match(/^<!\[CDATA\[([\s\S]*?)]]>$/i);
+  // Match CDATA even if trailed by garbage or inner close tags like </parameter>
+  const cdataMatch = raw.match(/^<!\[CDATA\[([\s\S]*?)]]>/i);
   const source = cdataMatch?.[1] ?? raw;
   return source
     .replaceAll("&amp;", "&")
@@ -1810,7 +1811,9 @@ export function parseToolCallsFromText(text, allowedToolNames = []) {
     /<(?:[a-z0-9_:-]+:)?tool_params[\s>]/i.test(thinkStripped) ||  // Step 1.57
     /<[a-z0-9_.-]+"\s*:\s*"/i.test(thinkStripped) ||  // Step 1.65 JSON-in-XML
     /<parameter\s+name="[^"]+"\s+value="/i.test(thinkStripped) ||  // Step 1.68
-    /<(?:[a-z0-9_:-]+:)?tool_calls\s+(?:name|function|tool)\s*=\s*"/i.test(thinkStripped);  // Step 1.7
+    /<(?:[a-z0-9_:-]+:)?tool_calls\s+(?:name|function|tool)\s*=\s*"/i.test(thinkStripped) ||  // Step 1.7
+    /<\/parameter\b/i.test(thinkStripped) ||  // Step 1: </parameter> instead of </parameters>
+    /\]\]>\}+/i.test(thinkStripped);  // Step 0: garbage after CDATA closing
   if (!hasGarbledTags) {
     const fastCalls = parseMarkupToolCalls(thinkStripped, allowedToolNames);
     if (fastCalls.length) {
