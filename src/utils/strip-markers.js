@@ -70,9 +70,9 @@ export function stripLeakedMarkers(text) {
   // through as orphans or partials (opening/closing without a matching pair)
   result = result.replace(LEAK_TAG_REGEX, "");
 
-  // Strip leaked role markers — both at line start and mid-line
-  result = result.replace(/^(?:USER|ASSISTANT|TOOL):\s*[^\n]*/gmi, "");
-  result = result.replace(/\b(?:USER|ASSISTANT|TOOL):\s(?:File|Running|command|[A-Z])/gmi, (m) => m.slice(m.indexOf(":") + 1).trimStart());
+  // Strip leaked role markers — anywhere in text
+  result = result.replace(/^(?:USER|ASSISTANT|TOOL):[^\n]*/gmi, "");
+  result = result.replace(/\b(?:USER|ASSISTANT|TOOL):\s*/gmi, "");
 
   return result;
 }
