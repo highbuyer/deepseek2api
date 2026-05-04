@@ -101,7 +101,8 @@ export function createToolSieve(allowedToolNames = []) {
     capturing: false,
     emittedText: "",
     hold: "",      // small lookbehind for chunk-boundary detection
-    lastKind: "response"
+    lastKind: "response",
+    formatErrorEmitted: false
   };
 
   function pushTextEvent(events, text, kind) {
@@ -158,11 +159,16 @@ export function createToolSieve(allowedToolNames = []) {
         if (calls.length) {
           events.push({ type: "tool_calls", calls });
         } else {
-          events.push({
-            type: "format_error",
-            block: block.slice(0, 200),
-            message: "Unrecognized tool call format"
-          });
+          // Only emit one format_error per stream — the model may echo the error
+          // message back, triggering an infinite correction loop.
+          if (!state.formatErrorEmitted) {
+            state.formatErrorEmitted = true;
+            events.push({
+              type: "format_error",
+              block: block.slice(0, 200),
+              message: "Unrecognized tool call format"
+            });
+          }
         }
         state.capture = "";
         state.capturing = false;

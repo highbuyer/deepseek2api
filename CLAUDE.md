@@ -50,6 +50,7 @@ DeepSeek SSE 使用 `type` 字段区分内容类型：
 - 捕获限制 `50_000` 字符，超过后 flush 为文本
 - chunk 边界检测（LOOKBEHIND=30）：保留尾部 `<` 片段防止标签被截断
 - 解析失败时 emit `format_error` 事件，桥接层即时返回纠正指令（Claude Code `tool_use_error` 模式）
+- **`formatErrorEmitted` 标记**：每个流只发一次 `format_error`，防止模型回显纠正文本导致无限循环
 
 ## 解析器（Parser）预处理步骤
 
