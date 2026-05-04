@@ -60,8 +60,6 @@ function truncateToolResult(content, budget, toolName) {
   return { text, truncated: true };
 }
 
-let _anthropicContextChars = 0;
-
 /* ── Anthropic → DeepSeek prompt conversion ── */
 
 /* ── Slash-command Skill routing ── */
@@ -157,7 +155,7 @@ function normalizeSystemPrompt(system) {
   return [];
 }
 
-function contentBlockToText(block) {
+function contentBlockToText(block, _ctxChars = 0) {
   if (!block || typeof block !== "object") return "";
   if (block.type === "text") return toStringSafe(block.text);
   if (block.type === "thinking") return ""; //  thinking content removed from prompt to save budget
@@ -179,7 +177,7 @@ function contentBlockToText(block) {
     // so the model doesn't learn to echo file content with line numbers
     content = content.replace(/^\s*\d+→/gm, "");
     // Dynamic budget + head-tail truncation (see openai-tool-prompt.js for rationale)
-    const budget = getToolResultBudget(_anthropicContextChars ?? 0);
+    const budget = getToolResultBudget(_ctxChars ?? 0);
     const { text: truncated, truncated: wasTruncated } = truncateToolResult(content, budget, "");
     content = truncated;
     const name = toStringSafe(block.tool_use_id).slice(-20);
@@ -204,7 +202,7 @@ function buildBudgetPreview(content, originalSize) {
 }
 
 function normalizeAnthropicMessages(messages) {
-  _anthropicContextChars = 0;
+  let totalChars = 0;
 
   return (messages ?? []).flatMap((message) => {
     const role = message?.role === "assistant" ? "assistant"
@@ -213,7 +211,7 @@ function normalizeAnthropicMessages(messages) {
 
     const content = message?.content;
     if (typeof content === "string") {
-      _anthropicContextChars += content.length;
+      totalChars += content.length;
       return [{ role, content }];
     }
     if (!Array.isArray(content)) return [];
@@ -231,12 +229,12 @@ function normalizeAnthropicMessages(messages) {
           const preview = buildBudgetPreview(raw, raw.length);
           const name = toStringSafe(block.tool_use_id).slice(-20);
           const text = `<tool_result id="${name}">\n${preview}\n</tool_result>`;
-          _anthropicContextChars += text.length;
+          totalChars += text.length;
           return text;
         }
       }
-      const text = contentBlockToText(block);
-      _anthropicContextChars += text.length;
+      const text = contentBlockToText(block, totalChars);
+      totalChars += text.length;
       return text;
     }).filter(Boolean);
 

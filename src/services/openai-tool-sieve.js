@@ -61,10 +61,10 @@ function buildBlockTags(allowedToolNames) {
 
 /* ── Find the first tool block open tag in text ── */
 function findFirstOpen(text, opens) {
-  const lower = text.toLowerCase();
+  // Text is already lowercased by caller to avoid per-call copy
   let best = -1;
   for (const tag of opens) {
-    const idx = lower.indexOf(tag);
+    const idx = text.indexOf(tag);
     if (idx >= 0 && (best === -1 || idx < best)) {
       best = idx;
     }
@@ -74,10 +74,9 @@ function findFirstOpen(text, opens) {
 
 /* ── Find furthest close tag end position ── */
 function findCloseEnd(text, closes) {
-  const lower = text.toLowerCase();
   let best = -1;
   for (const tag of closes) {
-    const idx = lower.lastIndexOf(tag);
+    const idx = text.lastIndexOf(tag);
     if (idx >= 0) {
       const end = idx + tag.length;
       if (end > best) best = end;
@@ -132,8 +131,9 @@ export function createToolSieve(allowedToolNames = []) {
 
       // Drop <tool_result> blocks — they are echoed prompt content, never valid tool calls.
       // Without this, large tool results overflow and leak file content into the SSE stream.
-      if (/<tool_result\b/i.test(state.capture)) {
-        const closeEnd = state.capture.toLowerCase().lastIndexOf("</tool_result>");
+      const captureLower = state.capture.toLowerCase();
+      if (captureLower.indexOf("<tool_result") >= 0) {
+        const closeEnd = captureLower.lastIndexOf("</tool_result>");
         if (closeEnd >= 0) {
           const suffix = state.capture.slice(closeEnd + "</tool_result>".length);
           state.capture = "";
@@ -146,7 +146,7 @@ export function createToolSieve(allowedToolNames = []) {
       }
 
       // Try to find close tag
-      const closeEnd = findCloseEnd(state.capture, state.closes);
+      const closeEnd = findCloseEnd(captureLower, state.closes);
       if (closeEnd > 0) {
         const block = state.capture.slice(0, closeEnd);
         const suffix = state.capture.slice(closeEnd);
@@ -178,7 +178,7 @@ export function createToolSieve(allowedToolNames = []) {
     state.hold = "";
     if (!text) return events;
 
-    const open = findFirstOpen(text, state.opens);
+    const open = findFirstOpen(text.toLowerCase(), state.opens);
     if (open) {
       // Emit text before the block
       if (open.index > 0) {
