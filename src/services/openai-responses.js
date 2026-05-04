@@ -1,6 +1,6 @@
 import { collectCompletionContent, streamCompletionContent } from "./openai-completion-runner.js";
 import { getOpenAiResponse, storeOpenAiResponse } from "./openai-response-store.js";
-import { createToolSieve } from "./openai-tool-sieve.js";
+import { createToolSieve, FORMAT_ERROR_MSG } from "./openai-tool-sieve.js";
 import { ensureToolChoiceSatisfied } from "./openai-tool-policy.js";
 import { stripLeakedMarkers } from "../utils/strip-markers.js";
 import {
@@ -50,7 +50,6 @@ export async function streamResponsesResponse({
   const requestOptions = resolveResponsesRequest(body, toolCallsEnabled);
   const responseId = createResponseId();
   const toolSieve = requestOptions.toolNames.length ? createToolSieve(requestOptions.toolNames) : null;
-  const CORRECT_FORMAT_MSG = "<tool_use_error>Your tool call format was incorrect. Use EXACTLY: <function_calls><invoke name=\"ToolName\"><parameter name=\"param\" string=\"true\">value</parameter></invoke></function_calls></tool_use_error>";
   let nextOutputIndex = 0;
   let outputText = "";
   let activeTextItem = null;
@@ -189,7 +188,7 @@ export async function streamResponsesResponse({
           return;
         }
         if (event.type === "format_error") {
-          emitText(CORRECT_FORMAT_MSG, "response");
+          emitText(FORMAT_ERROR_MSG, "response");
           return;
         }
         emitText(event.text, event.kind ?? kind);
@@ -205,7 +204,7 @@ export async function streamResponsesResponse({
         return;
       }
       if (event.type === "format_error") {
-        emitText(CORRECT_FORMAT_MSG, "response");
+        emitText(FORMAT_ERROR_MSG, "response");
         return;
       }
       emitText(event.text, event.kind);

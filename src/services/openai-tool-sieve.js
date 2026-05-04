@@ -3,6 +3,13 @@ import { toStringSafe } from "../utils/safe-string.js";
 import { stripLeakedMarkers, finalStrip } from "../utils/strip-markers.js";
 import { log } from "../utils/log.js";
 
+// Shared format error message — used by all bridge layers when the model
+// drifts to an unrecognized tool call XML format (Claude Code tool_use_error pattern).
+export const FORMAT_ERROR_MSG =
+  "<tool_use_error>Your tool call format was incorrect. " +
+  "Use EXACTLY: <function_calls><invoke name=\"ToolName\"><parameter name=\"param\" string=\"true\">value</parameter></invoke></function_calls> " +
+  "Do NOT use <tool_calls>, <tool_call>, <tool_name>, or <tool_type> tags.</tool_use_error>";
+
 /* ── Tag detection ──
  * We only need to detect BLOCK-LEVEL tool containers.  The parser handles
  * individual <tool_call>/<invoke> extraction from the captured block. */

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { collectCompletionContent, streamCompletionContent } from "./openai-completion-runner.js";
 import { assertNoLegacySearchOptions, resolveOpenAiModel } from "./openai-request.js";
-import { createToolSieve, extractToolAwareOutput } from "./openai-tool-sieve.js";
+import { createToolSieve, extractToolAwareOutput, FORMAT_ERROR_MSG } from "./openai-tool-sieve.js";
 import { parseToolCallsFromText } from "./openai-tool-parser.js";
 import { buildOpenAiPrompt } from "./openai-tool-prompt.js";
 import { ensureToolChoiceSatisfied, hasChatToolingRequest } from "./openai-tool-policy.js";
@@ -259,9 +259,6 @@ export async function streamOpenAiResponse(options) {
       : { content: cleaned };
     writeSseChunk(response, buildChunkPayload(completionId, requestOptions.model.id, delta));
   };
-
-  const CORRECT_FORMAT = "<function_calls><invoke name=\"ToolName\"><parameter name=\"param\" string=\"true\">value</parameter></invoke></function_calls>";
-  const FORMAT_ERROR_MSG = `\n\n<tool_use_error>Your tool call format was incorrect. Use EXACTLY this XML format:\n${CORRECT_FORMAT}\nDo NOT use <tool_calls>, <tool_call>, <tool_name>, or <tool_type> tags. Only <function_calls> with <invoke name="..."> inside.</tool_use_error>`;
 
   const emitSieveEvents = (events, fallbackKind) => {
     for (const event of events) {

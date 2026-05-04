@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { buildAnthropicPrompt, resolveAnthropicModel } from "./anthropic-prompt.js";
 import { collectCompletionContent, streamCompletionContent } from "./openai-completion-runner.js";
-import { createToolSieve, extractToolAwareOutput } from "./openai-tool-sieve.js";
+import { createToolSieve, extractToolAwareOutput, FORMAT_ERROR_MSG } from "./openai-tool-sieve.js";
 import { parseToolCallsFromText } from "./openai-tool-parser.js";
 import { ensureToolChoiceSatisfied } from "./openai-tool-policy.js";
 import { stripLeakedMarkers } from "../utils/strip-markers.js";
@@ -209,9 +209,6 @@ export async function streamAnthropicMessage(options) {
   };
 
   /* ── Sieve event dispatch ── */
-
-  const CORRECT_FORMAT = "<function_calls><invoke name=\"ToolName\"><parameter name=\"param\" string=\"true\">value</parameter></invoke></function_calls>";
-  const FORMAT_ERROR_MSG = `\n\n<tool_use_error>Your tool call format was incorrect. Use EXACTLY this XML format:\n${CORRECT_FORMAT}\nDo NOT use <tool_calls>, <tool_call>, <tool_name>, or <tool_type> tags.</tool_use_error>`;
 
   const emitSieveEvents = (events, fallbackKind) => {
     for (const event of events) {
