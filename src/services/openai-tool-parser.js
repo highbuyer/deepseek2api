@@ -867,6 +867,14 @@ function parseToolCallInner(attrs, inner, allowedToolNames = []) {
     if (allowedName) name = allowedName;
   } else {
     const allNames = findAllTagValues(inner, TOOL_NAME_PATTERNS);
+    // Also check for name attribute on tool_name/function_name tags
+    // e.g. <tool_name name="read"> — name is an attr, not content
+    if (!allNames.length || !allNames[0]?.trim()) {
+      const nameAttrMatch = inner.match(/<(?:[a-z0-9_:-]+:)?(?:tool_name|function_name)\b[^>]*\bname\s*=\s*"([^"<>]+)"/i);
+      if (nameAttrMatch) {
+        allNames.unshift(nameAttrMatch[1].trim());
+      }
+    }
     const allowedLookup = buildAllowedLookup(allowedToolNames);
     if (allowedLookup.size > 0) {
       // Prefer the first name that's in the allowed list (case-insensitive)
