@@ -19,6 +19,17 @@ const SMART_SINGLE_QUOTES = new Set([
 ]);
 
 export function replaceSmartQuotes(text) {
+  // Fast check: avoid spread+map for the common case (no smart quotes)
+  let hasSmart = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (SMART_DOUBLE_QUOTES.has(ch) || SMART_SINGLE_QUOTES.has(ch)) {
+      hasSmart = true;
+      break;
+    }
+  }
+  if (!hasSmart) return text;
+
   const chars = [...text];
   return chars.map(ch => {
     if (SMART_DOUBLE_QUOTES.has(ch)) return '"';
