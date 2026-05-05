@@ -66,14 +66,12 @@ function buildChatCompletionPayload(completionId, requestOptions, content) {
     const thinkMatch = content.match(/<think>([\s\S]*?)<\/think>/);
     const thinkLen = thinkMatch ? thinkMatch[1].length : 0;
     const respText = content.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-    // Detect garbled XML: model tried tool calls but format was wrong
     if (/<(?:function_calls|tool_calls|invoke|tool_call|tool_name)\b/i.test(respText)) {
-      log.warn("bridge", `[collect] Garbled tool XML detected — feeding error back to model`);
-      parsed.content = (parsed.content || "") +
-        "\n\n[ERROR: Your tool call format was incorrect. " +
-        "Use EXACTLY: <function_calls><invoke name=\"ToolName\"><parameter name=\"param\" string=\"true\">value</parameter></invoke></function_calls> " +
-        "Do NOT use <tool_calls>, <tool_call>, or <tool_name> tags.]";
-      log.debug("bridge", `[collect] Self-correction hint appended. ${content.length} chars total (think: ${thinkLen}, response: ${content.length - thinkLen}).`);
+      log.warn("bridge", `[collect] Garbled tool XML detected but no valid calls — check parser`);
+      const head = respText.slice(0, 300);
+      const tail = respText.length > 600 ? respText.slice(-200) : "";
+      const summary = tail ? `${head}\n...\n${tail}` : head;
+      log.debug("bridge", `[collect] No tool calls (allowed: [${requestOptions.toolNames.join(",")}]). ${content.length} chars total (think: ${thinkLen}, response: ${content.length - thinkLen}).\n${summary}`);
     } else {
       const head = respText.slice(0, 300);
       const tail = respText.length > 600 ? respText.slice(-200) : "";
@@ -324,15 +322,10 @@ export async function streamOpenAiResponse(options) {
         // Detect model tried tool calls but format was wrong (XML present, no valid calls)
         const hasToolXml = /<(?:function_calls|tool_calls|invoke|tool_call|tool_name)\b/i.test(respText);
         if (hasToolXml) {
-          log.warn("bridge", `[stream] Garbled tool XML detected — feeding error back to model for self-correction`);
-          emitTextEvent(
-            "\n\n[ERROR: Your tool call format was incorrect. " +
-            "Use EXACTLY this format:\n" +
-            "<function_calls>\n  <invoke name=\"ToolName\">\n    <parameter name=\"param\" string=\"true\">value</parameter>\n  </invoke>\n</function_calls>\n" +
-            "Do NOT use <tool_calls>, <tool_call>, <tool_name>, or any other XML variant.]",
-            "response"
-          );
-          log.debug("bridge", `[stream] Self-correction hint sent. ${emittedText.length} chars total (think: ${thinkLen}, response: ${emittedText.length - thinkLen}).`);
+          // Sieve already sent FORMAT_ERROR_MSG during streaming if this was a real
+          // malformed attempt.  If we reach here the XML was likely part of prose
+          // (model discussing code), not an actual tool call — just log it.
+          log.debug("bridge", `[stream] Unparsed XML-like text in stream fallback (likely prose). ${emittedText.length} chars total (think: ${thinkLen}, response: ${emittedText.length - thinkLen}).`);
         } else {
           const head = respText.slice(0, 300);
           const tail = respText.length > 600 ? respText.slice(-200) : "";
