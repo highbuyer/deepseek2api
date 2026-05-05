@@ -27,7 +27,7 @@ const debugEnabled = debugEnv === "1" || debugEnv === "true" || debugEnv.include
 // DeepSeek accepts prompts up to ~150K chars; beyond that it returns empty streams.
 // 96K is a safe default that keeps system prompt + recent conversation within limits.
 // Override with MAX_PROMPT_CHARS=128000 etc. if you need larger prompts.
-const maxPromptChars = Number(process.env.MAX_PROMPT_CHARS ?? 96000);
+const maxPromptChars = Number(process.env.MAX_PROMPT_CHARS ?? 128000);
 const maxToolDescChars = Number(process.env.MAX_TOOL_DESC_CHARS ?? 200);
 
 export const config = Object.freeze({

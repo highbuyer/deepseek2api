@@ -54,6 +54,9 @@ function formatPromptToolCalls(toolCalls, toolNameById) {
     return "";
   }
 
+  // DEBUG: log tool_calls structure to diagnose ID mismatch
+  log.debug("prompt", `[formatPromptToolCalls] tool_calls count=${toolCalls.length}, ids=[${toolCalls.map(c => toStringSafe(c?.id).trim()).filter(Boolean).join(",")}]`);
+
   const blocks = toolCalls
     .map((call) => {
       const name = getToolName(call);
@@ -61,6 +64,7 @@ function formatPromptToolCalls(toolCalls, toolNameById) {
       const argumentsText = toJsonText(getToolFunction(call)?.arguments ?? getToolFunction(call)?.input);
 
       if (!name) {
+        log.debug("prompt", `[formatPromptToolCalls] SKIP: no name for id="${callId}", call keys=[${Object.keys(call || {}).join(",")}], raw_call="${JSON.stringify(call).slice(0, 300)}"`);
         return "";
       }
 
@@ -143,7 +147,9 @@ function normalizeMessagesForPrompt(messages) {
     }
 
     if (role === "tool" || role === "function") {
-      const toolName = toolNameById.get(toStringSafe(message?.tool_call_id).trim()) || toStringSafe(message?.name).trim();
+      const callId = toStringSafe(message?.tool_call_id).trim();
+      const fallbackName = toStringSafe(message?.name).trim();
+      const toolName = toolNameById.get(callId) || fallbackName;
 
       // Per-message budget enforcement: if adding this result would exceed
       // the batch budget, replace it with a preview instead of truncation.
@@ -151,6 +157,10 @@ function normalizeMessagesForPrompt(messages) {
       let rawContent = normalizeContentText(message?.content).trim() || "null";
       rawContent = rawContent.replace(/^\s*\d+→/gm, "");
       const rawLen = rawContent.length;
+
+      if (!toolName) {
+        log.debug("prompt", `Tool result missing name: tool_call_id="${callId}" not found in map (map has ${toolNameById.size} entries: [${[...toolNameById.entries()].map(([k,v]) => `${k}→${v}`).join(", ")}]), fallback name="${fallbackName}", content preview="${rawContent.slice(0, 80)}"`);
+      }
 
       if (batchToolResultChars + rawLen > PER_MESSAGE_TOOL_RESULT_BUDGET && batchToolResultChars > 0) {
         const replacement = buildBudgetPreview(rawContent, rawLen, toolName);
@@ -381,20 +391,31 @@ function truncatePromptMessages(messages, maxChars) {
     const systemBudget = maxChars - MIN_USER_BUDGET;
     const systemPartTrimmed = systemPart.slice(0, Math.max(0, systemBudget));
     const budget = maxChars - systemPartTrimmed.length;
+    // keepRecentMessages now preserves tool_call/tool_result pairs via round grouping
+    // and repairs orphaned tool results after truncation (ensureToolResultPairing pattern)
     const kept = keepRecentMessages(nonSystemMsgs, budget);
     const dropped = nonSystemMsgs.length - kept.length;
-    const result = systemPartTrimmed + (kept.length ? "\n\n" + buildPromptFromMessages(kept) : "");
-    log.warn("prompt", `System prompt alone (${systemLen} chars) exceeds limit (${maxChars}), trimmed to ${systemBudget} + ${kept.length}/${nonSystemMsgs.length} recent messages (dropped ${dropped}), total ${result.length} chars`);
+    const keptPart = buildPromptFromMessages(kept);
+    // Final repair: after system + non-system reassembly, check for any orphaned pairs
+    // that may have been introduced at the boundary (Claude Code ensureToolResultPairing)
+    const result = systemPartTrimmed + (kept.length ? "\n\n" + keptPart : "");
+    if (dropped > 0) {
+      log.warn("prompt", `System prompt alone (${systemLen} chars) exceeds limit (${maxChars}), trimmed system to ${systemBudget}, kept ${kept.length}/${nonSystemMsgs.length} messages (dropped ${dropped}), total ${result.length} chars`);
+    }
     return result;
   }
 
   const budget = maxChars - systemLen;
+  // keepRecentMessages preserves tool_call/tool_result pairings via round grouping,
+  // keeps the first user round for grounding, and repairs orphaned results (Claude Code pattern)
   const kept = keepRecentMessages(nonSystemMsgs, budget);
   const dropped = nonSystemMsgs.length - kept.length;
-  const result = systemPart + "\n\n" + buildPromptFromMessages(kept);
+  const keptPart = buildPromptFromMessages(kept);
+  const result = systemPart + "\n\n" + keptPart;
 
   if (dropped > 0) {
-    log.warn("prompt", `Prompt truncated: kept system (${systemLen} chars) + ${kept.length}/${nonSystemMsgs.length} messages, dropped ${dropped} oldest, total ${result.length} chars`);
+    const droppedRounds = dropped > 0 ? Math.max(1, Math.round(dropped / 3)) : 0; // approximate rounds dropped
+    log.warn("prompt", `Prompt truncated: kept system (${systemLen} chars) + ${kept.length}/${nonSystemMsgs.length} messages (~${droppedRounds} round(s) dropped from head), total ${result.length}/${maxChars} chars`);
   }
 
   return result;
@@ -453,6 +474,19 @@ export function buildOpenAiPrompt({ messages, toolChoice, tools }) {
   }
 
   log.debug("prompt", `Final prompt length: ${prompt.length} chars, toolNames: [${policy.allowedToolNames.join(",")}]`);
+
+  // DEBUG: log TOOL result blocks to diagnose "No result provided (cross-provider handoff)"
+  const toolResultBlocks = [...prompt.matchAll(/TOOL:[\s\S]*?(?=\n\n(?:USER|ASSISTANT|SYSTEM):|\n*$)/g)];
+  if (toolResultBlocks.length > 0) {
+    log.debug("prompt", `=== TOOL RESULT BLOCKS (${toolResultBlocks.length} total) ===`);
+    toolResultBlocks.forEach((match, i) => {
+      const block = match[0];
+      const truncated = block.length > 300 ? block.slice(0, 300) + `...[${block.length} chars total]` : block;
+      log.debug("prompt", `  Block #${i+1}: ${truncated}`);
+    });
+  } else {
+    log.debug("prompt", `No TOOL result blocks found in prompt (${prompt.length} chars)`);
+  }
 
   return {
     prompt,

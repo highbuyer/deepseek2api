@@ -212,6 +212,19 @@ export async function streamOpenAiResponse(options) {
     toolNames: requestOptions.toolNames
   });
   reqLogger.startPhase("stream", "DeepSeek SSE stream");
+  // DEBUG: dump full messages structure from Cursor to diagnose tool_call_id mismatch
+  const msgs = body?.messages ?? [];
+  log.debug("bridge", `[raw-msgs] total=${msgs.length}, roles=[${msgs.map(m => `${m.role}(${m.tool_call_id || ""})${m.tool_calls ? `[tc:${m.tool_calls.length}]` : ""}`).join(", ")}]`);
+  const rawToolMsgs = msgs.filter(m => m.role === "tool");
+  if (rawToolMsgs.length) {
+    rawToolMsgs.forEach((m, i) => {
+      const contentPreview = typeof m.content === "string"
+        ? m.content.slice(0, 150)
+        : JSON.stringify(m.content).slice(0, 150);
+      log.debug("bridge", `[raw-tool-msg #${i+1}] tool_call_id="${m.tool_call_id || ""}" name="${m.name || ""}" role="${m.role}" content_preview="${contentPreview}"`);
+    });
+  }
+
   log.info("bridge", `[stream] model=${requestOptions.model.id}, accountId=${account.id}, toolNames=[${requestOptions.toolNames.join(",")}]`);
   const toolSieve = requestOptions.toolNames.length
     ? createToolSieve(requestOptions.toolNames)

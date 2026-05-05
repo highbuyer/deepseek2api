@@ -8,11 +8,13 @@ import { log } from "../utils/log.js";
 // NOTE: Contains raw XML tags that must survive stripLeakedMarkers.
 // Bridge layers pass this directly to emitTextEvent with skipStrip=true.
 export const FORMAT_ERROR_MSG =
-  "<tool_use_error>Your tool call format was incorrect. " +
-  "Use EXACTLY: <function_calls><invoke name=\"ToolName\">" +
-  "<parameter name=\"key\" string=\"true\">value</parameter>" +
-  "</invoke></function_calls> " +
-  "Do NOT use tool_calls, tool_call, tool_name, or tool_type tags.</tool_use_error>";
+  "<tool_use_error>Your tool call format was incorrect. Use EXACTLY:" +
+  "\n<function_calls>" +
+  "\n<invoke name=\"ToolName\">" +
+  "\n<parameter name=\"key\" string=\"true\">value</parameter>" +
+  "\n</invoke>" +
+  "\n</function_calls>" +
+  "\n</tool_use_error>";
 
 /* ── Tag detection ──
  * We only need to detect BLOCK-LEVEL tool containers.  The parser handles
@@ -159,9 +161,15 @@ export function createToolSieve(allowedToolNames = []) {
         if (calls.length) {
           events.push({ type: "tool_calls", calls });
         } else {
-          // Only emit one format_error per stream — the model may echo the error
-          // message back, triggering an infinite correction loop.
-          if (!state.formatErrorEmitted) {
+          // Only emit format_error if the block looks like a genuine but malformed
+          // tool call attempt — not if the model just mentioned XML tags in prose.
+          // Without this check, code-analysis replies like "the parser supports
+          // <function_calls>" trigger false-positive corrections.
+          const isRealAttempt = /<(?:[a-z0-9_:-]+:)?invoke\s+name=/i.test(block)
+            || /<(?:[a-z0-9_:-]+:)?tool_name\b[^>]*>/i.test(block)
+            || /<(?:[a-z0-9_:-]+:)?parameter\s+name=/i.test(block)
+            || /<(?:[a-z0-9_:-]+:)?tool_call\s+name=/i.test(block);
+          if (isRealAttempt && !state.formatErrorEmitted) {
             state.formatErrorEmitted = true;
             events.push({
               type: "format_error",

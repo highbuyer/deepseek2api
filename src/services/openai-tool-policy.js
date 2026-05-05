@@ -15,7 +15,48 @@ export function getToolFunction(tool) {
 }
 
 export function getToolName(tool) {
-  return toStringSafe(getToolFunction(tool)?.name).trim();
+  // Prefer function.name (OpenAI standard), fall back to top-level name
+  // Cursor stores tool name at top level: {name: "ReadFile", function: {arguments: "..."}}
+  const func = getToolFunction(tool);
+  const fromFunc = toStringSafe(func?.name).trim();
+  const fromTop = toStringSafe(tool?.name).trim();
+  if (fromFunc) return fromFunc;
+  if (fromTop) return fromTop;
+
+  // Cursor sometimes clears function.name to "" when reconstructing tool_calls
+  // from the SSE stream. Infer the tool name from the arguments signature.
+  // E.g. {"command": "ls"} → Shell, {"path": "/x"} → ReadFile
+  return inferToolNameFromArguments(func?.arguments ?? tool?.arguments);
+}
+
+/**
+ * Infer tool name from argument keys when the tool's name field is empty.
+ * Cursor may clear function.name during SSE reconstruction; the parameter
+ * keys are preserved and provide a reliable signal for tool identity.
+ */
+function inferToolNameFromArguments(args) {
+  const raw = toStringSafe(args).trim();
+  if (!raw || !raw.startsWith("{")) return "";
+
+  let params;
+  try { params = JSON.parse(raw); } catch { return ""; }
+  if (!params || typeof params !== "object") return "";
+
+  const keys = new Set(Object.keys(params).map(k => k.toLowerCase()));
+
+  if (keys.has("command")) return "Shell";
+  if (keys.has("pattern") && (keys.has("path") || keys.has("paths"))) return "rg";
+  if (keys.has("path") || keys.has("file_path")) return "ReadFile";
+  if (keys.has("glob_pattern") || keys.has("glob")) return "Glob";
+  if (keys.has("pattern")) return "Glob";
+  if (keys.has("query")) return "WebSearch";
+  if (keys.has("url")) return "WebFetch";
+  if (keys.has("patch")) return "ApplyPatch";
+  if (keys.has("new_str") || keys.has("old_str")) return "Edit";
+  if (keys.has("name") && keys.has("repo")) return ""; // MCP tool — can't infer which
+  if (keys.has("paths")) return "ReadLints";
+
+  return "";
 }
 
 function extractDeclaredToolNames(tools) {
