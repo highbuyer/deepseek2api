@@ -7,15 +7,14 @@ import { log } from "../utils/log.js";
 // drifts to an unrecognized tool call XML format (Claude Code tool_use_error pattern).
 // NOTE: Contains raw XML tags that must survive stripLeakedMarkers.
 // Bridge layers pass this directly to emitTextEvent with skipStrip=true.
-// FORMAT_ERROR_MSG MUST NOT contain literal XML tags (<function_calls>, <invoke>, etc.)
-// — the sieve will re-capture the model's echo of this message, causing a self-loop.
-// Use text-safe markers [tag] instead of XML <tag> to prevent re-capture.
+// FORMAT_ERROR_MSG must use only plain text — no XML tags, no bracket markers
+// that the model could "helpfully" convert back to XML and re-trigger the sieve.
 export const FORMAT_ERROR_MSG =
   "[TOOL_FORMAT_ERROR] Your tool call format was incorrect. " +
-  "Use EXACTLY: [function_calls][invoke name=\"ToolName\"]" +
-  "[parameter name=\"key\" string=\"true\"]value[/parameter]" +
-  "[/invoke][/function_calls] " +
-  "(Replace brackets with angle brackets — use XML tags, not text markers.)";
+  "Use the standard format: a function_calls block containing " +
+  "one or more invoke elements, each with a name attribute and " +
+  "parameter child elements with name and string attributes. " +
+  "Example: invoke name=ToolName with parameter name=key string=true value.";
 
 /* ── Tag detection ──
  * We only need to detect BLOCK-LEVEL tool containers.  The parser handles
@@ -164,8 +163,6 @@ export function createToolSieve(allowedToolNames = []) {
         } else {
           // Only emit format_error if the block looks like a genuine but malformed
           // tool call attempt — not if the model just mentioned XML tags in prose.
-          // Without this check, code-analysis replies like "the parser supports
-          // <function_calls>" trigger false-positive corrections.
           const isRealAttempt = /<(?:[a-z0-9_:-]+:)?invoke\s+name=/i.test(block)
             || /<(?:[a-z0-9_:-]+:)?tool_name\b[^>]*>/i.test(block)
             || /<(?:[a-z0-9_:-]+:)?parameter\s+name=/i.test(block)
@@ -177,6 +174,12 @@ export function createToolSieve(allowedToolNames = []) {
               block: block.slice(0, 200),
               message: "Unrecognized tool call format"
             });
+          } else if (!isRealAttempt) {
+            // Not a tool call attempt — model mentioned XML tags in prose.
+            // Replay the captured text as normal content instead of silently
+            // discarding it.  The model's discussion of tool formats is
+            // legitimate prose and should be visible to the user.
+            pushTextEvent(events, state.capture, state.lastKind);
           }
         }
         state.capture = "";
