@@ -93,11 +93,16 @@ DeepSeek SSE 使用 `type` 字段区分内容类型：
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **deepseek2api** (2,043 symbols, 4,629 relationships, 177 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
-
-Also indexed for reference: **claude-code-source** (52,242 symbols) — search for implementation patterns before designing solutions.
+This project is indexed by GitNexus as **deepseek2api** (2096 symbols, 4716 relationships, 182 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
+
+## SSE Streaming Constraints
+
+- **`emitToolCalls` MUST keep `id`/`type`/`function.name`/`function.arguments` in ONE delta chunk.** Splitting function fields across chunks causes Cursor's SSE merger to replace `{name}` with `{arguments}` (Cursor does shallow replace, not deep merge). The resulting empty `function.name` manifests as "unsupported local tool."
+- **Fallback tool call detection MUST run BEFORE `finish_reason`.** If `parseToolCallsFromText` finds tool calls the sieve missed, they must be emitted before the final SSE chunk. Sending tool_calls after `finish_reason:"stop"` violates the protocol — clients stop processing after receiving finish_reason.
+- **`getToolName` fallback chain**: `function.name` → `tool.name` → argument-based inference. Cursor clears `function.name` to `""` when reconstructing tool_calls from SSE; the inference layer recovers the tool name from parameter keys (`command`→Shell, `path`→ReadFile, `pattern`+`path`→rg, etc.).
+- **`FORMAT_ERROR_MSG` is the single authoritative correction message** (in `openai-tool-sieve.js`). Do NOT add duplicate hardcoded `[ERROR:]` messages in the bridge — they create inconsistent UI rendering across clients.
 
 ## Always Do
 
