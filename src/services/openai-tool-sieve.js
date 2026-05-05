@@ -176,10 +176,11 @@ export function createToolSieve(allowedToolNames = []) {
             });
           } else if (!isRealAttempt) {
             // Not a tool call attempt — model mentioned XML tags in prose.
-            // Replay the captured text as normal content instead of silently
-            // discarding it.  The model's discussion of tool formats is
-            // legitimate prose and should be visible to the user.
-            pushTextEvent(events, state.capture, state.lastKind);
+            // Replay only the captured block (before the close tag), not the
+            // full state.capture.  The suffix (after close) will be handled
+            // by the drain() recursion below — using state.capture here
+            // would emit suffix twice.
+            pushTextEvent(events, block, state.lastKind);
           }
         }
         state.capture = "";
