@@ -1097,4 +1097,67 @@ describe("Sieve+strip: orphan close tags split across chunks", () => {
     const out = collectText(all);
     assert.ok(!out.includes("</tool_name>"));
   });
+
+  /* ── Prose-replay: model mentions XML tags but not a real tool call ── */
+
+  const collectProseText = (events) => events
+    .filter(e => e.type === "text")
+    .map(e => e.text)
+    .join("");
+
+  it("replays prose containing <function_calls> mention (not a tool call)", () => {
+    // Model discussing code: "the <function_calls> tag is used to wrap..."
+    // Sieve should NOT silently discard this text.
+    const sieve = createToolSieve(ALL_TOOLS);
+    const events = [
+      ...sieve.push("I will use the "),
+      ...sieve.push("<function_calls> tag "),
+      ...sieve.push("to format tool calls"),
+      ...sieve.flush(),
+    ];
+    const text = collectProseText(events);
+    assert.ok(text.includes("<function_calls>"), "prose containing <function_calls> should be replayed, not discarded");
+    const toolEvents = events.filter(e => e.type === "tool_calls");
+    assert.equal(toolEvents.length, 0, "prose mention should not produce tool_calls");
+  });
+
+  it("replays prose containing <invoke> mention (not a real attempt)", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    const events = [
+      ...sieve.push("Each tool call starts with "),
+      ...sieve.push("<invoke name=\"ReadFile\"> and includes "),
+      ...sieve.push("<parameter name=\"path\"> tags"),
+      ...sieve.flush(),
+    ];
+    const text = collectProseText(events);
+    assert.ok(text.includes("<invoke name=\"ReadFile\">"), "prose with invoke mention should be replayed");
+    assert.ok(text.includes("<parameter name=\"path\">"), "prose with parameter mention should be replayed");
+  });
+
+  it("does not double-emit suffix after close tag in prose replay", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    const events = [
+      ...sieve.push("<tool_calls>formatted</tool_calls> and then more text after"),
+      ...sieve.flush(),
+    ];
+    const text = collectProseText(events);
+    const suffix = " and then more text after";
+    const escaped = suffix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const occurrences = (text.match(new RegExp(escaped, "g")) || []).length;
+    assert.equal(occurrences, 1, `suffix "${suffix}" should appear exactly once, got ${occurrences}`);
+  });
+
+  it("handles multiple successive prose mentions without losing text", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    const events = [
+      ...sieve.push("First I'll use <function_calls> to wrap "),
+      ...sieve.push("the invocation. Then I'll check "),
+      ...sieve.push("<tool_calls> for the response container."),
+      ...sieve.flush(),
+    ];
+    const text = collectProseText(events);
+    assert.ok(text.includes("First I'll use"), "leading prose should be present");
+    assert.ok(text.includes("the invocation."), "middle prose should be present");
+    assert.ok(text.includes("for the response container."), "trailing prose should be present");
+  });
 });

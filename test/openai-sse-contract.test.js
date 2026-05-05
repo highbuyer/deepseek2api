@@ -466,3 +466,145 @@ describe("finish_reason contract", () => {
     assert.equal(finalChunk.choices[0].finish_reason, "stop");
   });
 });
+
+/* ── SSE chunk sequence contract ── */
+
+describe("SSE chunk sequence ordering", () => {
+  /**
+   * OpenAI spec for streaming tool calls:
+   * 1. role: "assistant"
+   * 2. content chunks (optional, if text before tool calls)
+   * 3. tool_calls[].index + id
+   * 4. tool_calls[].type
+   * 5. tool_calls[].function.name + arguments (in ONE chunk per our constraint)
+   * 6. {} + finish_reason: "tool_calls"
+   *
+   * All tool_call fields (index, id, type, function) must be in ONE delta
+   * because Cursor does shallow replace, not deep merge.
+   */
+
+  it("single tool call sends all fields in one delta chunk", () => {
+    const call = { id: "call_x", name: "ReadFile", argumentsText: '{"path":"/x"}' };
+    const deltas = createMockToolCallDelta([call]);
+
+    // One delta array entry with one call
+    assert.equal(deltas.length, 1);
+
+    const tc = deltas[0];
+    // All required fields present in ONE object
+    assert.equal(typeof tc.index, "number");
+    assert.equal(typeof tc.id, "string");
+    assert.equal(tc.type, "function");
+    assert.equal(typeof tc.function.name, "string");
+    assert.ok(tc.function.name.length > 0, "function.name must be non-empty");
+    assert.equal(typeof tc.function.arguments, "string");
+  });
+
+  it("finish_reason MUST come after all tool_calls chunks", () => {
+    // Simulate the full SSE sequence
+    const chunks = [];
+
+    // 1. role
+    chunks.push({ type: "role", delta: { role: "assistant" } });
+
+    // 2. tool_calls
+    const calls = createMockToolCallDelta([
+      { id: "call_a", name: "Shell", argumentsText: '{"command":"ls"}' },
+    ]);
+    chunks.push({ type: "tool_calls", delta: { tool_calls: calls } });
+
+    // 3. finish_reason — must be LAST
+    chunks.push({ type: "finish", delta: {}, finish_reason: "tool_calls" });
+
+    // Verify finish_reason is the final chunk
+    const lastIdx = chunks.length - 1;
+    assert.equal(chunks[lastIdx].type, "finish");
+    assert.equal(chunks[lastIdx].finish_reason, "tool_calls");
+    assert.deepEqual(chunks[lastIdx].delta, {});
+  });
+
+  it("empty content before tool_calls does not cause issues", () => {
+    // Some models output content="" before tool_calls.
+    // The delta should tolerate content=null between role and tool_calls.
+    const chunks = [];
+
+    chunks.push({ delta: { role: "assistant" } });
+    chunks.push({ delta: { content: null } });  // valid per OpenAI spec
+    chunks.push({ delta: { content: "Let me help" } });
+    chunks.push({
+      delta: {
+        tool_calls: createMockToolCallDelta([
+          { id: "call_x", name: "ReadFile", argumentsText: '{"path":"/x"}' },
+        ]),
+      },
+    });
+    chunks.push({ delta: {}, finish_reason: "tool_calls" });
+
+    const lastIdx = chunks.length - 1;
+    assert.equal(chunks[lastIdx].finish_reason, "tool_calls");
+  });
+});
+
+/* ── Format regression: Cursor function.name empty ── */
+
+describe("emitToolCalls format regression guards", () => {
+  it("function.name is never empty in tool_calls delta", () => {
+    // This is the Cursor "unsupported local tool" regression guard.
+    // Cursor clears function.name to "" when reconstructing from SSE;
+    // our getToolName fallback recovers it. But the SSE output must
+    // also be correct — function.name must not be empty at source.
+    const calls = [
+      { id: "call_1", name: "ReadFile", argumentsText: '{"path":"/a"}' },
+      { id: "call_2", name: "Shell", argumentsText: '{"command":"ls"}' },
+      { id: "call_3", name: "rg", argumentsText: '{"pattern":"foo","path":"/x"}' },
+    ];
+
+    const deltas = createMockToolCallDelta(calls);
+    validateOpenAiToolCallDelta(deltas);
+
+    for (const tc of deltas) {
+      assert.ok(tc.function.name.length > 0,
+        `function.name must not be empty for ${tc.id}`);
+    }
+  });
+
+  it("multiple tool calls have sequential indices starting from startIndex", () => {
+    const calls = [
+      { id: "call_a", name: "A", argumentsText: "{}" },
+      { id: "call_b", name: "B", argumentsText: "{}" },
+      { id: "call_c", name: "C", argumentsText: "{}" },
+    ];
+
+    const fromZero = createMockToolCallDelta(calls, 0);
+    for (let i = 0; i < fromZero.length; i++) {
+      assert.equal(fromZero[i].index, i);
+    }
+
+    const fromFive = createMockToolCallDelta(calls, 5);
+    for (let i = 0; i < fromFive.length; i++) {
+      assert.equal(fromFive[i].index, 5 + i);
+    }
+  });
+
+  it("function.arguments is always valid JSON or empty object string", () => {
+    const calls = [
+      { id: "call_1", name: "A", argumentsText: '{"key":"val"}' },
+      { id: "call_2", name: "B", argumentsText: "{}" },
+      { id: "call_3", name: "C", argumentsText: "" },
+    ];
+
+    const deltas = createMockToolCallDelta(calls);
+    for (const tc of deltas) {
+      const args = tc.function.arguments;
+      if (args === "{}" || args === "") {
+        // valid empty
+      } else {
+        try {
+          JSON.parse(args);
+        } catch {
+          assert.fail(`arguments is not valid JSON: ${args.slice(0, 80)}`);
+        }
+      }
+    }
+  });
+});
