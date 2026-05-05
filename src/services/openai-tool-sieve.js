@@ -7,14 +7,15 @@ import { log } from "../utils/log.js";
 // drifts to an unrecognized tool call XML format (Claude Code tool_use_error pattern).
 // NOTE: Contains raw XML tags that must survive stripLeakedMarkers.
 // Bridge layers pass this directly to emitTextEvent with skipStrip=true.
+// FORMAT_ERROR_MSG MUST NOT contain literal XML tags (<function_calls>, <invoke>, etc.)
+// — the sieve will re-capture the model's echo of this message, causing a self-loop.
+// Use text-safe markers [tag] instead of XML <tag> to prevent re-capture.
 export const FORMAT_ERROR_MSG =
-  "<tool_use_error>Your tool call format was incorrect. Use EXACTLY:" +
-  "\n<function_calls>" +
-  "\n<invoke name=\"ToolName\">" +
-  "\n<parameter name=\"key\" string=\"true\">value</parameter>" +
-  "\n</invoke>" +
-  "\n</function_calls>" +
-  "\n</tool_use_error>";
+  "[TOOL_FORMAT_ERROR] Your tool call format was incorrect. " +
+  "Use EXACTLY: [function_calls][invoke name=\"ToolName\"]" +
+  "[parameter name=\"key\" string=\"true\"]value[/parameter]" +
+  "[/invoke][/function_calls] " +
+  "(Replace brackets with angle brackets — use XML tags, not text markers.)";
 
 /* ── Tag detection ──
  * We only need to detect BLOCK-LEVEL tool containers.  The parser handles
