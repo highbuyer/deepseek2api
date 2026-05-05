@@ -301,13 +301,10 @@ export async function streamOpenAiResponse(options) {
     emitSieveEvents(toolSieve.flush());
   }
 
-  writeSseChunk(response, buildChunkPayload(
-    completionId,
-    requestOptions.model.id,
-    {},
-    sawToolCall ? "tool_calls" : "stop"
-  ));
-
+  // Fallback parse: if the sieve missed tool calls that are present in the
+  // emitted text, detect them BEFORE sending finish_reason.
+  // Sending tool_calls after finish_reason violates SSE protocol:
+  // clients that receive finish_reason="stop" will ignore subsequent chunks.
   if (requestOptions.toolNames.length && !sawToolCall && toolSieve) {
     const emittedText = toolSieve.emittedText;
     if (emittedText.length > 0) {
@@ -315,26 +312,35 @@ export async function streamOpenAiResponse(options) {
       if (fallbackCalls.length) {
         log.info("bridge", `[stream] Fallback parse found ${fallbackCalls.length} tool call(s) the sieve missed`);
         emitToolCalls(fallbackCalls);
+      }
+    }
+  }
+
+  writeSseChunk(response, buildChunkPayload(
+    completionId,
+    requestOptions.model.id,
+    {},
+    sawToolCall ? "tool_calls" : "stop"
+  ));
+
+  // Post-finish diagnostics only — no more SSE chunks after this point
+  if (requestOptions.toolNames.length && !sawToolCall && toolSieve) {
+    const emittedText = toolSieve.emittedText;
+    if (emittedText.length > 0) {
+      const thinkMatch = emittedText.match(/<think>([\s\S]*?)<\/think>/);
+      const thinkLen = thinkMatch ? thinkMatch[1].length : 0;
+      const respText = emittedText.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+      const hasToolXml = /<(?:function_calls|tool_calls|invoke|tool_call|tool_name)\b/i.test(respText);
+      if (hasToolXml) {
+        log.debug("bridge", `[stream] Unparsed XML-like text in stream fallback (likely prose). ${emittedText.length} chars total (think: ${thinkLen}, response: ${emittedText.length - thinkLen}).`);
       } else {
-        const thinkMatch = emittedText.match(/<think>([\s\S]*?)<\/think>/);
-        const thinkLen = thinkMatch ? thinkMatch[1].length : 0;
-        const respText = emittedText.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-        // Detect model tried tool calls but format was wrong (XML present, no valid calls)
-        const hasToolXml = /<(?:function_calls|tool_calls|invoke|tool_call|tool_name)\b/i.test(respText);
-        if (hasToolXml) {
-          // Sieve already sent FORMAT_ERROR_MSG during streaming if this was a real
-          // malformed attempt.  If we reach here the XML was likely part of prose
-          // (model discussing code), not an actual tool call — just log it.
-          log.debug("bridge", `[stream] Unparsed XML-like text in stream fallback (likely prose). ${emittedText.length} chars total (think: ${thinkLen}, response: ${emittedText.length - thinkLen}).`);
-        } else {
-          const head = respText.slice(0, 300);
-          const tail = respText.length > 600 ? respText.slice(-200) : "";
-          const summary = tail ? `${head}\n...\n${tail}` : head;
-          log.debug("bridge", `[stream] No tool calls (allowed: [${requestOptions.toolNames.join(",")}]). ${emittedText.length} chars total (think: ${thinkLen}, response: ${emittedText.length - thinkLen}).\n${summary}`);
-        }
-        if (isRefusal(emittedText)) {
-          log.warn("bridge", `[stream] Model refusal detected — response matches refusal pattern`);
-        }
+        const head = respText.slice(0, 300);
+        const tail = respText.length > 600 ? respText.slice(-200) : "";
+        const summary = tail ? `${head}\n...\n${tail}` : head;
+        log.debug("bridge", `[stream] No tool calls (allowed: [${requestOptions.toolNames.join(",")}]). ${emittedText.length} chars total (think: ${thinkLen}, response: ${emittedText.length - thinkLen}).\n${summary}`);
+      }
+      if (isRefusal(emittedText)) {
+        log.warn("bridge", `[stream] Model refusal detected — response matches refusal pattern`);
       }
     }
   }
