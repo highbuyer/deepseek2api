@@ -445,14 +445,9 @@ const FAIL_LOOP_THRESHOLD = 3;
 function buildLoopInterruption(toolName, streakCount) {
   return [
     "<system-reminder>",
-    "!!! CRITICAL: STOP REPEATING FAILED TOOL CALLS !!!",
-    `You have called "${toolName}" with the same arguments ${streakCount} times in a row, and each attempt failed.`,
-    `Do NOT call "${toolName}" with these same parameters again.`,
-    "You MUST switch to a completely different approach:",
-    "- Use a different tool to accomplish the goal",
-    "- Change the arguments (e.g., different file path, different command)",
-    "- Or provide your best answer based on the information you already have",
-    "The definition of insanity is doing the same thing and expecting different results.",
+    `STOP: "${toolName}" with these arguments has failed ${streakCount} times in a row.`,
+    `Do NOT call "${toolName}" with these parameters again.`,
+    "Switch approach: try a different tool, change arguments, or answer with what you have.",
     "</system-reminder>"
   ].join("\n");
 }
