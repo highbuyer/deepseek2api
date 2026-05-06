@@ -7,7 +7,8 @@ import {
   getToolResultBudget, getToolTruncationCategory, TOOL_TRUNCATION_STRATEGY,
   formatTruncationHint, truncateToolResult,
   PER_MESSAGE_TOOL_RESULT_BUDGET, BUDGET_PREVIEW_CHARS, buildBudgetPreview,
-  keepRecentMessages
+  keepRecentMessages, injectReadBloatHint, estimateTokens,
+  detectRepeatedToolFailures
 } from "../utils/tool-truncation.js";
 
 function toCdata(text) {
@@ -106,7 +107,7 @@ function normalizeToolPromptContent(message, toolNameById, totalContextChars = 0
 
   // Truncate long tool results with dynamic budget + head-tail strategy
   const toolName = toolNameById.get(toStringSafe(message?.tool_call_id).trim()) || toStringSafe(message?.name).trim();
-  const budget = getToolResultBudget(totalContextChars);
+  const budget = getToolResultBudget(totalContextChars, config.maxPromptChars);
   const { text: truncated, truncated: wasTruncated } = truncateToolResult(content, budget, toolName);
   content = truncated;
 
@@ -114,7 +115,33 @@ function normalizeToolPromptContent(message, toolNameById, totalContextChars = 0
     log.warn("prompt", `Tool result truncated: ${content.length}→${truncated.length} chars (no tool name, default strategy)`);
   }
 
+  // Detect Cursor IDE placeholder results — tool execution failure on the client
+  // side.  If passed through, the model sees a fake result and retries in a loop.
+  // Replace with a clear error so the model stops retrying the same broken tool.
+  if (!toolName || isHandoffPlaceholder(content)) {
+    const toolLabel = toolName || `call_${toStringSafe(message?.tool_call_id).trim().slice(0, 8) || "unknown"}`;
+    log.warn("prompt", `Handoff placeholder detected for "${toolLabel}", replacing with tool error notification (content preview: "${content.slice(0, 80)}")`);
+    return `<tool_result id="${toolLabel}">\nTool execution failed: result was not provided (cross-provider or client-side error). Do NOT retry this tool call — try a completely different approach to accomplish the task.\n</tool_result>`;
+  }
+
   return toolName ? `<tool_result id="${toolName}">\n${content}\n</tool_result>` : content;
+}
+
+// Known placeholder patterns from Cursor IDE / cross-provider handoffs that
+// indicate a tool call was NOT actually executed.
+const HANDOFF_PLACEHOLDER_RE = /\b(?:no\s+result\s+provided|cross[-\s]?provider\s+handoff|not\s+executed|execution\s+failed)\b/i;
+
+// Max length for a text to be considered a handoff placeholder.
+// Short text containing the pattern is dominated by it and almost certainly
+// a placeholder. Long text that happens to mention these phrases in passing
+// (e.g. "subprocess error: no result provided by worker") is legitimate.
+const HANDOFF_MAX_LENGTH = 200;
+
+function isHandoffPlaceholder(text) {
+  if (text.length === 0 || text === "null") return true;
+  // Only flag if the text is short — the placeholder pattern must dominate.
+  if (text.length > HANDOFF_MAX_LENGTH) return false;
+  return HANDOFF_PLACEHOLDER_RE.test(text);
 }
 
 function normalizeMessageRole(role) {
@@ -123,9 +150,16 @@ function normalizeMessageRole(role) {
 
 function normalizeMessagesForPrompt(messages) {
   const toolNameById = new Map();
+  const readPathByCallId = new Map();  // callId → file path for Read tools
+  const readPathCount = new Map();     // path → count (across all rounds)
 
-  // Accumulate running context size so tool result budgets tighten as prompt grows
+  // Two accumulators: rawTotalChars tracks pre-truncation content size
+  // for budget decisions; totalChars tracks post-truncation size for
+  // final prompt length.  Without rawTotalChars, the budget stays at
+  // the 20K tier for early tool results while the actual data volume
+  // is already near the limit — producing 350K prompts from 100+ tool results.
   let totalChars = 0;
+  let rawTotalChars = 0;
   // Per-batch tool result tracking — reset when a user message is encountered
   let batchToolResultChars = 0;
 
@@ -136,13 +170,34 @@ function normalizeMessagesForPrompt(messages) {
       batchToolResultChars = 0;
       const content = normalizeContentText(message?.content);
       totalChars += content.length;
+      rawTotalChars += content.length;
       return [{ role, content }];
     }
 
     if (role === "assistant") {
       batchToolResultChars = 0;
+      // Track Read tool paths for repeated-read detection across rounds
+      const toolCalls = message?.tool_calls;
+      if (Array.isArray(toolCalls)) {
+        for (const tc of toolCalls) {
+          if (toStringSafe(tc?.function?.name) === "Read") {
+            const callId = toStringSafe(tc?.id).trim();
+            try {
+              const args = JSON.parse(tc.function.arguments || "{}");
+              const path = args.file_path || args.path;
+              if (path && callId) {
+                readPathByCallId.set(callId, path);
+                readPathCount.set(path, (readPathCount.get(path) || 0) + 1);
+              }
+            } catch { /* malformed JSON — skip */ }
+          }
+        }
+      }
       const content = normalizeAssistantPromptContent(message, toolNameById);
-      if (content) totalChars += content.length;
+      if (content) {
+        totalChars += content.length;
+        rawTotalChars += content.length;
+      }
       return content ? [{ role, content }] : [];
     }
 
@@ -162,22 +217,44 @@ function normalizeMessagesForPrompt(messages) {
         log.debug("prompt", `Tool result missing name: tool_call_id="${callId}" not found in map (map has ${toolNameById.size} entries: [${[...toolNameById.entries()].map(([k,v]) => `${k}→${v}`).join(", ")}]), fallback name="${fallbackName}", content preview="${rawContent.slice(0, 80)}"`);
       }
 
+      // Repeated read detection: if this Read result is for a file already read
+      // in this session, replace with a short warning so the model references
+      // the earlier result instead of wasting context on duplicate content.
+      if (/^read$/i.test(toolName)) {
+        const readPath = readPathByCallId.get(callId);
+        if (readPath && (readPathCount.get(readPath) || 0) > 1) {
+          const count = readPathCount.get(readPath);
+          const warning = `⚠️ REPEATED READ #${count}: "${readPath}" has already been read in this session.\nReference the earlier result. If you need a specific section, use Read with offset/limit.\n`;
+          const content = toolName ? `<tool_result id="${toolName}">\n${warning}\n</tool_result>` : warning;
+          log.warn("prompt", `Repeated read detected: "${readPath}" (read ${count} times), replacing result with warning`);
+          totalChars += content.length;
+          rawTotalChars += rawLen;
+          return [{ role: "tool", content }];
+        }
+      }
+
       if (batchToolResultChars + rawLen > PER_MESSAGE_TOOL_RESULT_BUDGET && batchToolResultChars > 0) {
         const replacement = buildBudgetPreview(rawContent, rawLen, toolName);
         const content = toolName ? `<tool_result id="${toolName}">\n${replacement}\n</tool_result>` : replacement;
         log.warn("prompt", `Per-message tool result budget exceeded (${batchToolResultChars} + ${rawLen} > ${PER_MESSAGE_TOOL_RESULT_BUDGET}), replacing "${toolName}" with preview`);
         totalChars += content.length;
+        rawTotalChars += rawLen;
         return [{ role: "tool", content }];
       }
 
-      const content = normalizeToolPromptContent(message, toolNameById, totalChars);
+      // Use rawTotalChars for budget so it tightens as real data volume grows.
+      // Without this, totalChars (truncated) lags far behind raw data volume,
+      // keeping the budget too generous for early tool results.
+      const content = normalizeToolPromptContent(message, toolNameById, rawTotalChars);
       batchToolResultChars += rawLen;
+      rawTotalChars += rawLen;
       totalChars += content.length;
       return [{ role: "tool", content }];
     }
 
     const content = normalizeContentText(message?.content);
     totalChars += content.length;
+    rawTotalChars += content.length;
     return [{ role, content }];
   });
 }
@@ -379,88 +456,62 @@ function injectToolPrompt(messages, tools, policy) {
   return updated;
 }
 
-function truncatePromptMessages(messages, maxChars) {
+function truncatePromptMessages(messages, maxBudget, measure) {
+  const len = measure || (s => s.length);
+  const units = measure ? "tokens" : "chars";
   const systemMsgs = messages.filter((m) => m.role === "system");
   const nonSystemMsgs = messages.filter((m) => m.role !== "system");
 
   const systemPart = buildPromptFromMessages(systemMsgs);
-  const systemLen = systemPart.length;
+  const systemLen = len(systemPart);
 
-  if (systemLen >= maxChars) {
-    const MIN_USER_BUDGET = Math.min(2000, Math.floor(maxChars * 0.1));
-    const systemBudget = maxChars - MIN_USER_BUDGET;
+  if (systemLen >= maxBudget) {
+    const MIN_USER_BUDGET = Math.min(2000, Math.floor(maxBudget * 0.1));
+    const systemBudget = maxBudget - MIN_USER_BUDGET;
     const systemPartTrimmed = systemPart.slice(0, Math.max(0, systemBudget));
-    const budget = maxChars - systemPartTrimmed.length;
-    // keepRecentMessages now preserves tool_call/tool_result pairs via round grouping
-    // and repairs orphaned tool results after truncation (ensureToolResultPairing pattern)
-    const kept = keepRecentMessages(nonSystemMsgs, budget);
+    const budget = maxBudget - len(systemPartTrimmed);
+    const kept = keepRecentMessages(nonSystemMsgs, budget, measure);
     const dropped = nonSystemMsgs.length - kept.length;
     const keptPart = buildPromptFromMessages(kept);
-    // Final repair: after system + non-system reassembly, check for any orphaned pairs
-    // that may have been introduced at the boundary (Claude Code ensureToolResultPairing)
     const result = systemPartTrimmed + (kept.length ? "\n\n" + keptPart : "");
     if (dropped > 0) {
-      log.warn("prompt", `System prompt alone (${systemLen} chars) exceeds limit (${maxChars}), trimmed system to ${systemBudget}, kept ${kept.length}/${nonSystemMsgs.length} messages (dropped ${dropped}), total ${result.length} chars`);
+      log.warn("prompt", `System prompt alone (${systemLen} ${units}) exceeds limit (${maxBudget}), trimmed system to ${systemBudget}, kept ${kept.length}/${nonSystemMsgs.length} messages (dropped ${dropped}), total ${len(result)} ${units}`);
     }
     return result;
   }
 
-  const budget = maxChars - systemLen;
-  // keepRecentMessages preserves tool_call/tool_result pairings via round grouping,
-  // keeps the first user round for grounding, and repairs orphaned results (Claude Code pattern)
-  const kept = keepRecentMessages(nonSystemMsgs, budget);
+  const budget = maxBudget - systemLen;
+  const kept = keepRecentMessages(nonSystemMsgs, budget, measure);
   const dropped = nonSystemMsgs.length - kept.length;
   const keptPart = buildPromptFromMessages(kept);
   const result = systemPart + "\n\n" + keptPart;
 
   if (dropped > 0) {
-    const droppedRounds = dropped > 0 ? Math.max(1, Math.round(dropped / 3)) : 0; // approximate rounds dropped
-    log.warn("prompt", `Prompt truncated: kept system (${systemLen} chars) + ${kept.length}/${nonSystemMsgs.length} messages (~${droppedRounds} round(s) dropped from head), total ${result.length}/${maxChars} chars`);
+    const droppedRounds = dropped > 0 ? Math.max(1, Math.round(dropped / 3)) : 0;
+    log.warn("prompt", `Prompt truncated: kept system (${systemLen} ${units}) + ${kept.length}/${nonSystemMsgs.length} messages (~${droppedRounds} round(s) dropped from head), total ${len(result)}/${maxBudget} ${units}`);
   }
 
   return result;
 }
 
-// Check if Read tool results are bloating the context (Claude Code checkReadResultBloat).
-// When Read results exceed a threshold, inject a system reminder telling the model
-// to stop re-reading and use Grep or offset/limit instead.
-function injectReadBloatHint(promptMessages) {
-  let readResultChars = 0;
-  let totalChars = 0;
-  for (const msg of promptMessages) {
-    totalChars += (msg.content ?? "").length;
-    if (msg.role === "tool") {
-      const m = (msg.content ?? "").match(/<tool_result id="(read|read_file|readfile)"/i);
-      if (m) readResultChars += msg.content.length;
-    }
-  }
-
-  const readPct = totalChars > 0 ? (readResultChars / totalChars) * 100 : 0;
-  if (readPct < 5 || readResultChars < 10000) return promptMessages;
-
-  const hint = [
-    "<system-reminder>",
-    `File read results are using ${Math.round(readPct)}% of the context window.`,
-    "If you are re-reading files, reference earlier reads instead.",
-    "For large files, use Grep to search for patterns or Read with offset/limit to fetch specific sections.",
-    "Avoid reading entire files unless you need the full content.",
-    "</system-reminder>"
-  ].join("\n");
-
-  log.warn("prompt", `Read results at ${Math.round(readPct)}% of context (${readResultChars}/${totalChars} chars), injecting bloat hint`);
-
-  const sysIdx = promptMessages.findIndex(m => m.role === "system");
-  if (sysIdx >= 0) {
-    const updated = [...promptMessages];
-    updated[sysIdx] = { ...updated[sysIdx], content: updated[sysIdx].content + "\n\n" + hint };
-    return updated;
-  }
-  return [{ role: "system", content: hint }, ...promptMessages];
-}
-
 export function buildOpenAiPrompt({ messages, toolChoice, tools }) {
   const policy = resolveToolChoicePolicy({ tools, toolChoice });
   const normalizedMessages = normalizeMessagesForPrompt(messages);
+
+  // Loop circuit breaker: if the model is calling the same tool with the
+  // same arguments and getting the same error, inject a hard interrupt
+  // to force a strategy change before the prompt explodes.
+  const loopInterruption = detectRepeatedToolFailures(messages);
+  if (loopInterruption) {
+    log.warn("prompt", "Repeated failed tool call loop detected — injecting circuit breaker");
+    const sysIdx = normalizedMessages.findIndex(m => m.role === "system");
+    if (sysIdx >= 0) {
+      normalizedMessages.splice(sysIdx + 1, 0, { role: "system", content: loopInterruption });
+    } else {
+      normalizedMessages.unshift({ role: "system", content: loopInterruption });
+    }
+  }
+
   let promptMessages = injectToolPrompt(normalizedMessages, tools ?? [], policy);
 
   // Check for Read result bloat (Claude Code checkReadResultBloat pattern)
@@ -468,9 +519,13 @@ export function buildOpenAiPrompt({ messages, toolChoice, tools }) {
 
   let prompt = buildPromptFromMessages(promptMessages);
 
-  if (prompt.length > config.maxPromptChars) {
-    log.warn("prompt", `Prompt too long: ${prompt.length} chars (limit: ${config.maxPromptChars}), truncating conversation history while preserving system prompt`);
-    prompt = truncatePromptMessages(promptMessages, config.maxPromptChars);
+  const promptLen = config.maxPromptTokens ? estimateTokens(prompt) : prompt.length;
+  const promptLimit = config.maxPromptTokens || config.maxPromptChars;
+  const measure = config.maxPromptTokens ? estimateTokens : undefined;
+
+  if (promptLen > promptLimit) {
+    log.warn("prompt", `Prompt too long: ${promptLen} ${config.maxPromptTokens ? "tokens" : "chars"} (limit: ${promptLimit}), truncating conversation history while preserving system prompt`);
+    prompt = truncatePromptMessages(promptMessages, promptLimit, measure);
   }
 
   log.debug("prompt", `Final prompt length: ${prompt.length} chars, toolNames: [${policy.allowedToolNames.join(",")}]`);

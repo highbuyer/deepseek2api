@@ -8,7 +8,8 @@ import {
   getToolResultBudget, getToolTruncationCategory, TOOL_TRUNCATION_STRATEGY,
   formatTruncationHint, truncateToolResult,
   PER_MESSAGE_TOOL_RESULT_BUDGET, BUDGET_PREVIEW_CHARS, buildBudgetPreview,
-  keepRecentMessages
+  keepRecentMessages, injectReadBloatHint, estimateTokens,
+  detectRepeatedToolFailures
 } from "../utils/tool-truncation.js";
 
 /* ── Anthropic → DeepSeek prompt conversion ── */
@@ -106,7 +107,7 @@ function normalizeSystemPrompt(system) {
   return [];
 }
 
-function contentBlockToText(block, _ctxChars = 0) {
+function contentBlockToText(block, toolNameById, _ctxChars = 0) {
   if (!block || typeof block !== "object") return "";
   if (block.type === "text") return toStringSafe(block.text);
   if (block.type === "thinking") return ""; //  thinking content removed from prompt to save budget
@@ -127,18 +128,44 @@ function contentBlockToText(block, _ctxChars = 0) {
     // Strip line-number prefixes (Claude Code Read format: "  1→code")
     // so the model doesn't learn to echo file content with line numbers
     content = content.replace(/^\s*\d+→/gm, "");
-    // Dynamic budget + head-tail truncation (see openai-tool-prompt.js for rationale)
-    const budget = getToolResultBudget(_ctxChars ?? 0);
-    const { text: truncated, truncated: wasTruncated } = truncateToolResult(content, budget, "");
+    // Dynamic budget + head-tail truncation with category-aware strategy
+    const toolName = toolNameById?.get(toStringSafe(block.tool_use_id)) || "";
+    const budget = getToolResultBudget(_ctxChars ?? 0, config.maxPromptChars);
+    const { text: truncated, truncated: wasTruncated } = truncateToolResult(content, budget, toolName);
     content = truncated;
-    const name = toStringSafe(block.tool_use_id).slice(-20);
+    // Use tool name as id so injectReadBloatHint / repeated-read regexes can match
+    const name = toolName || toStringSafe(block.tool_use_id).slice(-20);
     return `<tool_result id="${name}">\n${content}\n</tool_result>`;
   }
   return "";
 }
 
 function normalizeAnthropicMessages(messages) {
+  // Build tool_use_id → tool_name map and read-path tracker from all
+  // assistant messages for category-aware truncation and repeated-read detection.
+  const toolNameById = new Map();
+  const readPathByCallId = new Map();
+  const readPathCount = new Map();
+  for (const message of (messages ?? [])) {
+    if (message?.role === "assistant" && Array.isArray(message?.content)) {
+      for (const block of message.content) {
+        if (block?.type === "tool_use" && block.id) {
+          const name = toStringSafe(block.name);
+          toolNameById.set(toStringSafe(block.id), name);
+          if (/^read$/i.test(name)) {
+            const path = toStringSafe(block.input?.file_path || block.input?.path);
+            if (path) {
+              readPathByCallId.set(toStringSafe(block.id), path);
+              readPathCount.set(path, (readPathCount.get(path) || 0) + 1);
+            }
+          }
+        }
+      }
+    }
+  }
+
   let totalChars = 0;
+  let rawTotalChars = 0;  // pre-truncation size for budget decisions
 
   return (messages ?? []).flatMap((message) => {
     const role = message?.role === "assistant" ? "assistant"
@@ -148,6 +175,7 @@ function normalizeAnthropicMessages(messages) {
     const content = message?.content;
     if (typeof content === "string") {
       totalChars += content.length;
+      rawTotalChars += content.length;
       return [{ role, content }];
     }
     if (!Array.isArray(content)) return [];
@@ -160,19 +188,51 @@ function normalizeAnthropicMessages(messages) {
         const raw = typeof block.content === "string" ? block.content
           : Array.isArray(block.content) ? block.content.map(c => c?.text ?? "").join("\n") : "";
         batchToolResultChars += raw.length;
+
+        // Repeated read detection: if this Read result is for a file already
+        // read in this session, replace with short warning so the model
+        // references the earlier result instead of wasting context.
+        const callId = toStringSafe(block.tool_use_id);
+        const toolName = toolNameById.get(callId);
+        if (/^read$/i.test(toolName)) {
+          const readPath = readPathByCallId.get(callId);
+          if (readPath && (readPathCount.get(readPath) || 0) > 1) {
+            const count = readPathCount.get(readPath);
+            const name = toStringSafe(block.tool_use_id).slice(-20);
+            const warning = `⚠️ REPEATED READ #${count}: "${readPath}" has already been read in this session.\nReference the earlier result. If you need a specific section, use Read with offset/limit.\n`;
+            const text = `<tool_result id="${name}">\n${warning}\n</tool_result>`;
+            log.warn("prompt", `[anthropic] Repeated read detected: "${readPath}" (read ${count} times), replacing result with warning`);
+            totalChars += text.length;
+            rawTotalChars += raw.length;
+            return text;
+          }
+        }
+
         if (batchToolResultChars > PER_MESSAGE_TOOL_RESULT_BUDGET) {
           // Replace with preview instead of full content
           const preview = buildBudgetPreview(raw, raw.length, "");
           const name = toStringSafe(block.tool_use_id).slice(-20);
           const text = `<tool_result id="${name}">\n${preview}\n</tool_result>`;
           totalChars += text.length;
+          rawTotalChars += raw.length;
           return text;
         }
       }
-      const text = contentBlockToText(block, totalChars);
+      // Use rawTotalChars for budget so it tightens with real data volume
+      const text = contentBlockToText(block, toolNameById, rawTotalChars);
       totalChars += text.length;
+      if (block?.type === "tool_result") {
+        const raw = typeof block.content === "string" ? block.content
+          : Array.isArray(block.content) ? block.content.map(c => c?.text ?? "").join("\n") : "";
+        rawTotalChars += raw.length;
+      }
       return text;
     }).filter(Boolean);
+
+    // For non-tool blocks whose length wasn't tracked in rawTotalChars
+    if (role === "user" && !content.some(b => b?.type === "tool_result")) {
+      textBlocks.forEach(t => { rawTotalChars += t.length; });
+    }
 
     if (role === "user") {
       const combined = textBlocks.join("\n") || " ";
@@ -183,12 +243,12 @@ function normalizeAnthropicMessages(messages) {
     const toolCalls = content.filter((b) => b?.type === "tool_use");
     const textContent = content
       .filter((b) => b?.type === "text" || b?.type === "thinking")
-      .map(contentBlockToText)
+      .map(b => contentBlockToText(b, toolNameById))
       .filter(Boolean)
       .join("\n");
 
     const toolHistory = toolCalls.length
-      ? `<tool_calls>\n${toolCalls.map(contentBlockToText).filter(Boolean).join("\n")}\n</tool_calls>`
+      ? `<tool_calls>\n${toolCalls.map(b => contentBlockToText(b, toolNameById)).filter(Boolean).join("\n")}\n</tool_calls>`
       : "";
 
     const combined = [textContent, toolHistory].filter(Boolean).join("\n\n");
@@ -325,30 +385,32 @@ function injectAnthropicToolPrompt(messages, tools, policy) {
 }
 
 
-function truncatePrompt(messages, maxChars) {
+function truncatePrompt(messages, maxBudget, measure) {
+  const len = measure || (s => s.length);
+  const units = measure ? "tokens" : "chars";
   const systemMsgs = messages.filter((m) => m.role === "system");
   const nonSystemMsgs = messages.filter((m) => m.role !== "system");
 
   const systemPart = buildPromptFromMessages(systemMsgs);
-  const systemLen = systemPart.length;
+  const systemLen = len(systemPart);
 
-  if (systemLen >= maxChars) {
-    const minUserBudget = Math.min(2000, Math.floor(maxChars * 0.1));
-    const systemBudget = maxChars - minUserBudget;
+  if (systemLen >= maxBudget) {
+    const minUserBudget = Math.min(2000, Math.floor(maxBudget * 0.1));
+    const systemBudget = maxBudget - minUserBudget;
     const trimmed = systemPart.slice(0, Math.max(0, systemBudget));
-    const budget = maxChars - trimmed.length;
-    const kept = keepRecentMessages(nonSystemMsgs, budget);
+    const budget = maxBudget - len(trimmed);
+    const kept = keepRecentMessages(nonSystemMsgs, budget, measure);
     const result = trimmed + (kept.length ? "\n\n" + buildPromptFromMessages(kept) : "");
-    log.warn("prompt", `[anthropic] System prompt trimmed: ${systemLen} → ${trimmed.length} chars, kept ${kept.length} messages, total ${result.length}`);
+    log.warn("prompt", `[anthropic] System prompt trimmed: ${systemLen} → ${len(trimmed)} ${units}, kept ${kept.length} messages, total ${len(result)}`);
     return result;
   }
 
-  const budget = maxChars - systemLen;
-  const kept = keepRecentMessages(nonSystemMsgs, budget);
+  const budget = maxBudget - systemLen;
+  const kept = keepRecentMessages(nonSystemMsgs, budget, measure);
   const result = systemPart + "\n\n" + buildPromptFromMessages(kept);
 
   if (kept.length < nonSystemMsgs.length) {
-    log.warn("prompt", `[anthropic] Truncated: dropped ${nonSystemMsgs.length - kept.length} oldest messages, total ${result.length} chars`);
+    log.warn("prompt", `[anthropic] Truncated: dropped ${nonSystemMsgs.length - kept.length} oldest messages, total ${len(result)} ${units}`);
   }
 
   return result;
@@ -375,6 +437,19 @@ export function buildAnthropicPrompt({ messages, system, tools, toolChoice }) {
   const normalizedMessages = normalizeAnthropicMessages(messages);
   const allMessages = [...systemMsgs, ...normalizedMessages];
 
+  // Loop circuit breaker: if the model is calling the same tool with the
+  // same arguments and getting the same error, inject a hard interrupt.
+  const loopInterruption = detectRepeatedToolFailures(messages);
+  if (loopInterruption) {
+    log.warn("prompt", "[anthropic] Repeated failed tool call loop detected — injecting circuit breaker");
+    const sysIdx = allMessages.findIndex(m => m.role === "system");
+    if (sysIdx >= 0) {
+      allMessages.splice(sysIdx + 1, 0, { role: "system", content: loopInterruption });
+    } else {
+      allMessages.unshift({ role: "system", content: loopInterruption });
+    }
+  }
+
   // Route slash commands to Skill tool (deepseek models may not follow system prompt)
   const skillCommand = injectSkillRoutingHint(allMessages, tools ?? []);
 
@@ -396,11 +471,18 @@ export function buildAnthropicPrompt({ messages, system, tools, toolChoice }) {
   const policy = resolveToolChoicePolicy({ tools: anthropicTools, toolChoice: effectiveToolChoice });
   const promptMessages = injectAnthropicToolPrompt(allMessages, tools ?? [], policy);
 
-  let prompt = buildPromptFromMessages(promptMessages);
+  // Check for Read result bloat (Claude Code checkReadResultBloat pattern)
+  const hintedMessages = injectReadBloatHint(promptMessages);
 
-  if (prompt.length > config.maxPromptChars) {
-    log.warn("prompt", `[anthropic] Prompt too long: ${prompt.length} chars (limit: ${config.maxPromptChars})`);
-    prompt = truncatePrompt(promptMessages, config.maxPromptChars);
+  let prompt = buildPromptFromMessages(hintedMessages);
+
+  const promptLen = config.maxPromptTokens ? estimateTokens(prompt) : prompt.length;
+  const promptLimit = config.maxPromptTokens || config.maxPromptChars;
+  const measure = config.maxPromptTokens ? estimateTokens : undefined;
+
+  if (promptLen > promptLimit) {
+    log.warn("prompt", `[anthropic] Prompt too long: ${promptLen} ${config.maxPromptTokens ? "tokens" : "chars"} (limit: ${promptLimit})`);
+    prompt = truncatePrompt(hintedMessages, promptLimit, measure);
   }
 
   log.debug("prompt", `[anthropic] Final prompt length: ${prompt.length} chars, toolNames: [${policy.allowedToolNames.join(",")}]`);
