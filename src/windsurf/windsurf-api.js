@@ -17,7 +17,7 @@
 
 import http from 'http';
 import https from 'https';
-import { log } from '../../utils/log.js';
+import { log } from '../utils/log.js';
 
 const SERVER_HOSTS = [
   'server.codeium.com',

@@ -11,7 +11,7 @@
 import { createHash, randomUUID, timingSafeEqual } from 'crypto';
 import { readFileSync, writeFileSync, existsSync, renameSync, unlinkSync, readdirSync } from 'fs';
 import { config } from './config.js';
-import { log } from '../../utils/log.js';
+import { log } from '../utils/log.js';
 import { getEffectiveProxy } from './dashboard/proxy-config.js';
 import { getTierModels, getModelKeysByEnum, MODELS, registerDiscoveredFreeModel } from './models.js';
 

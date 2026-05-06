@@ -10,7 +10,7 @@ import https from 'https';
 import { randomUUID, createHash } from 'crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { execSync } from 'child_process';
-import { log } from '../../utils/log.js';
+import { log } from '../utils/log.js';
 import { extractImages } from './image.js';
 import { closeSessionForPort, grpcFrame, grpcUnary, grpcStream } from './grpc.js';
 import { getLsEntryByPort } from './langserver.js';

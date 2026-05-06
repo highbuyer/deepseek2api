@@ -14,7 +14,7 @@ import { scryptSync, randomBytes, timingSafeEqual } from 'crypto';
 import { writeJsonAtomic } from './fs-atomic.js';
 import { resolve } from 'path';
 import { config } from './config.js';
-import { log } from '../../utils/log.js';
+import { log } from '../utils/log.js';
 
 const FILE = resolve(config.dataDir, 'runtime-config.json');
 

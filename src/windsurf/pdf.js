@@ -8,7 +8,7 @@
  */
 
 import { inflateSync } from 'zlib';
-import { log } from '../../utils/log.js';
+import { log } from '../utils/log.js';
 
 const MAX_STREAMS = 200;
 const MAX_STREAM_DECODED = 5 * 1024 * 1024;

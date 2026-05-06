@@ -10,7 +10,7 @@
  */
 
 import http2 from 'http2';
-import { log } from '../../utils/log.js';
+import { log } from '../utils/log.js';
 import { wrapRequest, StreamingFrameParser } from './connect.js';
 
 const USE_CONNECT = process.env.GRPC_PROTOCOL === 'connect';

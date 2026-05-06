@@ -15,7 +15,7 @@ import http2 from 'http2';
 import net from 'net';
 import { randomUUID } from 'crypto';
 import { resolve } from 'path';
-import { log } from '../../utils/log.js';
+import { log } from '../utils/log.js';
 import { closeSessionForPort } from './grpc.js';
 
 const DEFAULT_BINARY = '/opt/windsurf/language_server_linux_x64';

@@ -1,7 +1,7 @@
 import https from 'node:https';
 import http from 'node:http';
 import { lookup as dnsLookup } from 'node:dns';
-import { log } from '../../utils/log.js';
+import { log } from '../utils/log.js';
 import { tryExtractPdf } from './pdf.js';
 import { isPrivateIp, resolvePublicAddresses } from './net-safety.js';
 

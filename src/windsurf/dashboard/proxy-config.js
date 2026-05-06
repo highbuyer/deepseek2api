@@ -7,7 +7,7 @@ import { readFileSync, existsSync } from 'fs';
 import { writeJsonAtomic } from '../fs-atomic.js';
 import { join } from 'path';
 import { config } from '../config.js';
-import { log } from '../../../utils/log.js';
+import { log } from '../../utils/log.js';
 
 const PROXY_FILE = join(config.dataDir, 'proxy.json');
 
