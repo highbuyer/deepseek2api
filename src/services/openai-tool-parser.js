@@ -3,17 +3,9 @@ import { log } from "../utils/log.js";
 import { toStringSafe } from "../utils/safe-string.js";
 import { tolerantParse, fixToolCallArguments, replaceSmartQuotes } from "./openai-tool-fixer.js";
 
-/* ── Single tool-call block patterns ── */
-/* Includes <tool> to handle models that output <tool name="Shell">...</tool> */
-/* Two patterns needed because DeepSeek sometimes closes <tool_call ...> with </tool_call_name>
- * (backreference \1 can't express "tool_call" OR "tool_call_name" as valid close) */
-const TOOL_BLOCK_PATTERNS = Object.freeze([
-  // Garbled close: <tool_call ...>...</tool_call_name> (DeepSeek fallback)
-  /<(?:[a-z0-9_:-]+:)?(tool_call|function_call|invoke|tool)\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1_name\s*>/gi,
-  // Exact close tag match (e.g. <tool_call ...>...</tool_call>).
-  /<(?:[a-z0-9_:-]+:)?(tool_call|function_call|invoke|tool)\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1\s*>/gi,
-]);
-const TOOL_SELFCLOSE_PATTERN = /<(?:[a-z0-9_:-]+:)?invoke\b([^>]*)\/>/gi;
+/* ── Block boundary extraction is now done by splitIntoBlocks (stack-based,
+   tolerant close matching) instead of regex backreference patterns. See the
+   function definition above parseStandaloneSingularBlocks. ── */
 
 /* ── Container patterns: <tool_calls>...</tool_calls> (plural) ── */
 const TOOL_CALLS_CONTAINER_PATTERN = /<(?:[a-z0-9_:-]+:)?(tool_calls|function_calls)\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1\s*>/gi;
@@ -65,7 +57,7 @@ const PARAMETER_NAME_ATTR_PATTERN = /<(?:[a-z0-9_:-]+:)?param(?:eter)?\b[^>]*\bn
 
 /* ── Known structural tag names (not tool names) ── */
 /* NOTE: "tool" is NOT here because <tool name="Shell"> is a valid tool call wrapper.
-   It's handled directly by TOOL_BLOCK_PATTERNS and findNamedToolBlocks instead. */
+   It's handled directly by splitIntoBlocks and findNamedToolBlocks instead. */
 const KNOWN_STRUCTURAL_TAGS = new Set([
   "tool_calls", "tool_call", "function_calls", "function_call", "invoke", "tool_use",
   "tool_name", "function_name", "name", "function",
@@ -672,6 +664,19 @@ function unwrapNestedJsonStrings(obj, depth) {
   return result;
 }
 
+// Normalize ApplyPatch / apply_patch — Claude Code sends lowercase
+// but DeepSeek may generate either form.  Both must be recognized.
+function isApplyPatchTool(name) {
+  return name === "ApplyPatch" || name === "apply_patch";
+}
+
+function resolveApplyPatchName(allowedToolNames) {
+  const lookup = buildAllowedLookup(allowedToolNames);
+  if (lookup.has("apply_patch")) return lookup.get("apply_patch");
+  if (lookup.has("ApplyPatch")) return lookup.get("ApplyPatch");
+  return null;
+}
+
 function fixApplyPatchArgs(input) {
   if (!input || typeof input !== "object") return input;
 
@@ -786,7 +791,7 @@ function buildParsedToolCall(name, argumentsText) {
   const input = unwrapNestedJsonStrings(parsed, 3);
   // DeepSeek's ApplyPatch often misses target_directory and uses a custom
   // "*** Begin Patch" format instead of standard unified diff.  Fix both.
-  let fixed = name === "ApplyPatch" ? fixApplyPatchArgs(input) : input;
+  let fixed = isApplyPatchTool(name) ? fixApplyPatchArgs(input) : input;
   // cursor2api port: repair smart quotes + fuzzy old_string matching
   fixed = fixToolCallArguments(name, fixed);
   return {
@@ -944,34 +949,125 @@ function parseToolCallInner(attrs, inner, allowedToolNames = []) {
 }
 
 /**
+ * Stack-based block boundary extraction.
+ * Uses tolerant close matching: any known close tag pops the stack, so
+ * `<invoke>...</tool_call>` works naturally without backreference \1.
+ *
+ * Returns { tagName, attrs, inner, start, end, unclosed, selfClose } for
+ * each outer block in depth-first order.
+ */
+function splitIntoBlocks(text) {
+  const source = toStringSafe(text);
+  const blocks = [];
+  const stack = []; // { tagName, attrs, startPos, innerStart }
+  let pos = 0;
+
+  // Open tags that can start a tool call block (with optional namespace prefix).
+  // \b ensures tool_call does NOT also match tool_calls (container).
+  const OPEN_RE = /^<([a-z0-9_:-]+:)?(tool_call|function_call|invoke|tool)\b([^>]*)>/i;
+
+  // Self-closing tag — only invoke supports this currently.
+  const SELFCLOSE_RE = /^<([a-z0-9_:-]+:)?invoke\b([^>]*)\/>/i;
+
+  // Close tags — block-wrapper closes + container closes.
+  // _call_name / _function_name variants (tool_call_name, function_call_name)
+  // are included because DeepSeek often closes <tool_call> with </tool_call_name>.
+  // _name-only variants (tool_name, invoke_name, function_name) are excluded —
+  // they close name-indicator tags that were never pushed onto the stack.
+  // Container closes (tool_calls, function_calls) are included for tolerance.
+  const CLOSE_RE = /^<\/([a-z0-9_:-]+:)?(tool_calls|tool_call|tool_call_name|function_calls|function_call|function_call_name|invoke|tool|tool_use)\s*>/i;
+
+  while (pos < source.length) {
+    const lt = source.indexOf("<", pos);
+    if (lt < 0) break;
+
+    const remaining = source.slice(lt);
+
+    // Close tag — pop the topmost open block (tolerant: any known close works).
+    const closeMatch = remaining.match(CLOSE_RE);
+    if (closeMatch) {
+      if (stack.length > 0) {
+        const top = stack.pop();
+        blocks.push({
+          tagName: top.tagName,
+          attrs: top.attrs,
+          inner: source.slice(top.innerStart, lt),
+          start: top.startPos,
+          end: lt + closeMatch[0].length,
+          unclosed: false
+        });
+      }
+      pos = lt + closeMatch[0].length;
+      continue;
+    }
+
+    // Self-closing tag — extract immediately without stacking.
+    const selfCloseMatch = remaining.match(SELFCLOSE_RE);
+    if (selfCloseMatch) {
+      blocks.push({
+        tagName: "invoke",
+        attrs: selfCloseMatch[2].trim(),
+        inner: "",
+        start: lt,
+        end: lt + selfCloseMatch[0].length,
+        unclosed: false,
+        selfClose: true
+      });
+      pos = lt + selfCloseMatch[0].length;
+      continue;
+    }
+
+    // Open tag — push onto stack.
+    const openMatch = remaining.match(OPEN_RE);
+    if (openMatch) {
+      const tagName = openMatch[2].toLowerCase();
+      const attrs = openMatch[3].trim();
+      stack.push({
+        tagName,
+        attrs,
+        startPos: lt,
+        innerStart: lt + openMatch[0].length
+      });
+      pos = lt + openMatch[0].length;
+      continue;
+    }
+
+    // Not a recognized tag — advance past "<" and keep scanning.
+    pos = lt + 1;
+  }
+
+  // Remaining unclosed blocks on the stack (model truncated, stream ended, etc.).
+  while (stack.length > 0) {
+    const top = stack.pop();
+    blocks.push({
+      tagName: top.tagName,
+      attrs: top.attrs,
+      inner: source.slice(top.innerStart),
+      start: top.startPos,
+      end: source.length,
+      unclosed: true
+    });
+  }
+
+  return blocks;
+}
+
+/**
  * Parse standalone <tool_call name="..."> blocks.
  */
 function parseStandaloneSingularBlocks(text, allowedToolNames = []) {
   const output = [];
   const source = toStringSafe(text).trim();
 
-  // 1. Try <tool_call name="..."> / <invoke name="..."> blocks
-  //    Try both _name close and exact-match close patterns
-  for (const pattern of TOOL_BLOCK_PATTERNS) {
-    for (const match of source.matchAll(pattern)) {
-      const parsed = parseToolCallInner(toStringSafe(match[2]).trim(), toStringSafe(match[3]).trim(), allowedToolNames);
-      if (parsed) {
-        output.push(parsed);
-      }
-    }
-    // Pattern 1 (</tool_call_name>) can match the inner <tool_call_name> tag
-    // instead of the real close, producing tool calls with short inners and
-    // empty args.  When all calls from pattern 1 have empty args, fall through
-    // to pattern 2 (</tool_call>) which sees the full inner.
-    const allEmptyArgs = output.length > 0 && output.every(c => !c.input || Object.keys(c.input).length === 0);
-    if (output.length && !allEmptyArgs) break;
-    // Otherwise discard the empty-args results and try the next pattern
-    output.length = 0;
-  }
-
-  // 2. Try self-closing <invoke name="..." /> blocks
-  for (const match of source.matchAll(TOOL_SELFCLOSE_PATTERN)) {
-    const parsed = parseToolCallInner(toStringSafe(match[1]).trim(), "", allowedToolNames);
+  // 1. Stack-based block extraction — handles <invoke>, <tool_call>,
+  //    <function_call>, <tool> with tolerant close matching.
+  const blocks = splitIntoBlocks(source);
+  for (const block of blocks) {
+    // Skip unclosed blocks — prose mentions of XML tags during streaming
+    // can produce blocks with no close tag. Only closed blocks represent
+    // genuine tool call attempts.
+    if (block.unclosed) continue;
+    const parsed = parseToolCallInner(block.attrs, block.inner, allowedToolNames);
     if (parsed) {
       output.push(parsed);
     }
@@ -1108,7 +1204,7 @@ function inferToolNameFromParams(params, allowedToolNames) {
   // Parameter name → candidate tool names (ordered by specificity)
   const HINTS = [
     { param: "command", tools: ["Shell", "Bash"] },
-    { param: "patch", tools: ["ApplyPatch"] },
+    { param: "patch", tools: ["ApplyPatch", "apply_patch"] },
     { param: "pattern", tools: ["Glob"] },
     { param: "path", tools: ["ReadFile", "Read"] },
     { param: "query", tools: ["WebSearch"] },
@@ -1172,7 +1268,7 @@ function fixMismatchedWrapperClosings(text) {
 /**
  * Close unclosed tool wrapper tags like <tool>, <tool_call, <function_call, <invoke>.
  * When the model omits the closing tag (stream truncation, etc.), this appends
- * synthetic closing tags so that TOOL_BLOCK_PATTERNS and findNamedToolBlocks can match.
+ * synthetic closing tags so that splitIntoBlocks can match.
  * Only closes tags that are genuinely unclosed (more opens than closes).
  */
 function closeUnclosedToolWrapperTags(text) {
@@ -1482,7 +1578,7 @@ function parseContainerToolBlocks(text, allowedToolNames = []) {
             if (markupArgs && Object.keys(markupArgs).length > 0) {
               parsedArgs = JSON.stringify(markupArgs);
             } else {
-              parsedArgs = toolArgs;
+              parsedArgs = "{}";
             }
           }
         }
@@ -1625,7 +1721,7 @@ function parseMarkupToolCalls(text, allowedToolNames = []) {
               if (markupArgs && Object.keys(markupArgs).length > 0) {
                 parsedArgs = JSON.stringify(markupArgs);
               } else {
-                parsedArgs = toolArgs;
+                parsedArgs = "{}";
               }
             }
             results.push(buildParsedToolCall(toolName, parsedArgs));
@@ -1688,8 +1784,8 @@ function parseMarkupToolCalls(text, allowedToolNames = []) {
 function tryParseRawPatchFormat(text, allowedToolNames) {
   if (!allowedToolNames?.length) return null;
 
-  const allowedLookup = buildAllowedLookup(allowedToolNames);
-  if (!allowedLookup.has("ApplyPatch")) return null;
+  const patchToolName = resolveApplyPatchName(allowedToolNames);
+  if (!patchToolName) return null;
 
   const source = toStringSafe(text).trim();
   if (!source) return null;
@@ -1703,10 +1799,8 @@ function tryParseRawPatchFormat(text, allowedToolNames) {
   //   *** End Patch
   if (source.includes("*** Begin Patch") || source.includes("*** Add File") || source.includes("*** Delete File") || source.includes("*** Modify File")) {
     log.debug("parser", `[tryParseRawPatchFormat] Detected Claude-style patch format (*** Begin/Modify/Add/Delete)`);
-    // The patch content is the entire source — the model outputted it as-is
-    const patchContent = source;
-    const argumentsText = JSON.stringify({ patch: patchContent });
-    return buildParsedToolCall("ApplyPatch", argumentsText);
+    const argumentsText = JSON.stringify({ patch: source });
+    return buildParsedToolCall(patchToolName, argumentsText);
   }
 
   // Pattern 2: Unified diff format
@@ -1721,13 +1815,10 @@ function tryParseRawPatchFormat(text, allowedToolNames) {
   if (hasDiffHeader && hasHunkHeader) {
     log.debug("parser", `[tryParseRawPatchFormat] Detected unified diff format (---/+++ headers + @@ hunks)`);
     const argumentsText = JSON.stringify({ patch: source });
-    return buildParsedToolCall("ApplyPatch", argumentsText);
+    return buildParsedToolCall(patchToolName, argumentsText);
   }
 
   // Pattern 3: Partial patch content with diff markers
-  // Sometimes the model outputs the patch without proper headers, just
-  // lines with -/+ prefixes in a code-block-like structure, preceded by
-  // text mentioning "patch" or "edit"
   const hasPatchKeyword = /\b(patch|diff|edit file|modify file|apply patch)\b/i.test(source.slice(0, 500));
   const lines = source.split("\n");
   let removedLines = 0;
@@ -1736,12 +1827,10 @@ function tryParseRawPatchFormat(text, allowedToolNames) {
     if (/^-[^-]/.test(line)) removedLines++;
     if (/^\+[^+]/.test(line)) addedLines++;
   }
-  // Heuristic: if there are both removals and additions, and at least 3 diff lines total,
-  // and the text mentions "patch" or similar, treat it as a patch
   if (hasPatchKeyword && removedLines >= 1 && addedLines >= 1 && (removedLines + addedLines) >= 3) {
     log.debug("parser", `[tryParseRawPatchFormat] Detected informal diff format (${removedLines} removals, ${addedLines} additions, patch keyword present)`);
     const argumentsText = JSON.stringify({ patch: source });
-    return buildParsedToolCall("ApplyPatch", argumentsText);
+    return buildParsedToolCall(patchToolName, argumentsText);
   }
 
   return null;
@@ -1857,21 +1946,6 @@ export function parseToolCallsFromText(text, allowedToolNames = []) {
   fixed = fixed.replace(/<tool_params>/gi, '<parameters>').replace(/<\/tool_params>/gi, '</parameters>');
   if (fixed !== beforeToolCallName) {
     log.debug("parser", `Preprocessed <tool_call_name="X"> and/or <tool_params> tags`);
-  }
-
-  // Step 1.58: Fix <tool_call>...</invoke> — model mixed tool_call open with invoke close.
-  // Also <tool_call>...</tool> and <function_call>...</invoke> etc.
-  // Normalize the closing tag to match the opening tag so blocks parse cleanly.
-  const beforeMixedClose = fixed;
-  fixed = fixed.replace(
-    /<((?:[a-z0-9_:-]+:)?(?:tool_call|function_call|tool))\b([^>]*)>([\s\S]*?)<\/((?:[a-z0-9_:-]+:)?invoke)\s*>/gi,
-    (full, openTag, attrs, content, closeTag) => {
-      log.debug("parser", `[preprocess] Fixed mixed close: <${openTag}>...</${closeTag}> → <${openTag}>...</${openTag}>`);
-      return `<${openTag}${attrs}>${content}</${openTag}>`;
-    }
-  );
-  if (fixed !== beforeMixedClose) {
-    log.debug("parser", `Preprocessed mixed close tags (<tool_call>...</invoke> → <tool_call>...</tool_call>)`);
   }
 
   // Step 1.65: Fix JSON-in-XML malformed tags like <target_directory": "/path"</target_directory>
