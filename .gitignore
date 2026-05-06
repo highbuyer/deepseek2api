@@ -7,3 +7,4 @@ data/*.log
 release/
 Thumbs.db
 .gitnexus
+data/windsurf-accounts.json
