@@ -104,7 +104,7 @@ export function createToolSieve(allowedToolNames = []) {
     emittedText: "",
     hold: "",      // small lookbehind for chunk-boundary detection
     lastKind: "response",
-    formatErrorEmitted: false
+    inCodeFence: false  // true when text is inside a ``` fenced code block
   };
 
   function pushTextEvent(events, text, kind) {
@@ -161,27 +161,12 @@ export function createToolSieve(allowedToolNames = []) {
         if (calls.length) {
           events.push({ type: "tool_calls", calls });
         } else {
-          // Only emit format_error if the block looks like a genuine but malformed
-          // tool call attempt — not if the model just mentioned XML tags in prose.
-          const isRealAttempt = /<(?:[a-z0-9_:-]+:)?invoke\s+name=/i.test(block)
-            || /<(?:[a-z0-9_:-]+:)?tool_name\b[^>]*>/i.test(block)
-            || /<(?:[a-z0-9_:-]+:)?parameter\s+name=/i.test(block)
-            || /<(?:[a-z0-9_:-]+:)?tool_call\s+name=/i.test(block);
-          if (isRealAttempt && !state.formatErrorEmitted) {
-            state.formatErrorEmitted = true;
-            events.push({
-              type: "format_error",
-              block: block.slice(0, 200),
-              message: "Unrecognized tool call format"
-            });
-          } else if (!isRealAttempt) {
-            // Not a tool call attempt — model mentioned XML tags in prose.
-            // Replay only the captured block (before the close tag), not the
-            // full state.capture.  The suffix (after close) will be handled
-            // by the drain() recursion below — using state.capture here
-            // would emit suffix twice.
-            pushTextEvent(events, block, state.lastKind);
-          }
+          // Parse returned nothing — replay as text so the model stays
+          // in its normal flow.  Previously we tried to detect "real attempts"
+          // and emit a FORMAT_ERROR, but isRealAttempt heuristics caused false
+          // positives on valid tool calls (tool name filtered, parse edge case,
+          // etc.), confusing the model.
+          pushTextEvent(events, block, state.lastKind);
         }
         state.capture = "";
         state.capturing = false;
@@ -201,22 +186,59 @@ export function createToolSieve(allowedToolNames = []) {
     state.hold = "";
     if (!text) return events;
 
+    // If the whole chunk is inside a ``` fence, emit as-is (no tool scanning).
+    if (state.inCodeFence) {
+      // Check if this chunk closes the fence
+      const fenceClose = text.indexOf("```");
+      if (fenceClose < 0) {
+        // Still inside — emit all, keep partial-tag hold
+        const lastLt = text.lastIndexOf("<");
+        if (lastLt >= 0 && !text.slice(lastLt).includes(">") && text.length - lastLt <= LOOKBEHIND) {
+          if (lastLt > 0) pushTextEvent(events, text.slice(0, lastLt), state.lastKind);
+          state.hold = text.slice(lastLt);
+        } else {
+          pushTextEvent(events, text, state.lastKind);
+        }
+        return events;
+      }
+      // Fence closes in this chunk — emit up to + including ```, then
+      // process the rest normally.
+      const before = text.slice(0, fenceClose + 3);
+      const after = text.slice(fenceClose + 3);
+      pushTextEvent(events, before, state.lastKind);
+      state.inCodeFence = false;
+      // Recurse with the remaining text
+      if (after) { state.hold = after; const more = drain(); events.push(...more); }
+      return events;
+    }
+
+    // Outside fence — check if a ``` opens a code block
+    const fenceOpen = text.indexOf("```");
+    if (fenceOpen >= 0) {
+      const before = text.slice(0, fenceOpen);
+      const after = text.slice(fenceOpen + 3);
+      // Process the text before the fence normally
+      if (before) { state.hold = before; const more = drain(); events.push(...more); }
+      // Emit the ``` marker and enter fence mode
+      pushTextEvent(events, "```", state.lastKind);
+      state.inCodeFence = true;
+      // Recurse with the remaining text (now inside fence)
+      if (after) { state.hold = after; const more = drain(); events.push(...more); }
+      return events;
+    }
+
     const open = findFirstOpen(text.toLowerCase(), state.opens);
     if (open) {
-      // Emit text before the block
       if (open.index > 0) {
         pushTextEvent(events, text.slice(0, open.index), state.lastKind);
       }
       state.capture = text.slice(open.index);
       state.capturing = true;
-      // Recurse to process the capture
       const more = drain();
       events.push(...more);
     } else {
-      // No tool block start — check if text ends with '<' (possible partial tag)
       const lastLt = text.lastIndexOf("<");
       if (lastLt >= 0 && !text.slice(lastLt).includes(">")) {
-        // Partial tag at end — hold only the partial portion
         const partialLen = text.length - lastLt;
         if (partialLen <= LOOKBEHIND) {
           if (lastLt > 0) pushTextEvent(events, text.slice(0, lastLt), state.lastKind);

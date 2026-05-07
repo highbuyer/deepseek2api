@@ -5,7 +5,7 @@ import { collectCompletionContent, streamCompletionContent } from "./openai-comp
 import { createToolSieve, extractToolAwareOutput, FORMAT_ERROR_MSG } from "./openai-tool-sieve.js";
 import { parseToolCallsFromText } from "./openai-tool-parser.js";
 import { ensureToolChoiceSatisfied } from "./openai-tool-policy.js";
-import { stripLeakedMarkers } from "../utils/strip-markers.js";
+import { stripLeakedMarkers, createStreamTextStripper } from "../utils/strip-markers.js";
 import { log } from "../utils/log.js";
 
 function createMessageId() {
@@ -107,6 +107,7 @@ export async function streamAnthropicMessage(options) {
   // When tool_choice is forced, buffer text until we confirm a valid tool call
   const isForcedMode = promptRequest.toolChoicePolicy.mode === "forced";
   const textBuffer = [];
+  const textStripper = createStreamTextStripper();
 
   response.writeHead(200, {
     "cache-control": "no-cache, no-transform",
@@ -180,6 +181,21 @@ export async function streamAnthropicMessage(options) {
     }
 
     sawToolCall = true;
+
+    // Flush text stripper before closing the current text block,
+    // so the last 6 chars aren't delayed until after the tool call
+    const pending = textStripper.flush();
+    if (pending) {
+      if (currentBlockType === "text") {
+        emitDelta("text_delta", "text", pending);
+      } else if (currentBlockType === "thinking") {
+        emitDelta("thinking_delta", "thinking", pending);
+      } else {
+        startBlock("text", { text: "" });
+        emitDelta("text_delta", "text", pending);
+      }
+    }
+
     finishCurrentBlock();
 
     for (const call of calls) {
@@ -192,7 +208,7 @@ export async function streamAnthropicMessage(options) {
   /* ── Text emission ── */
 
   const emitTextEvent = (text, kind, skipStrip = false) => {
-    const cleaned = skipStrip ? text : stripLeakedMarkers(text);
+    const cleaned = skipStrip ? text : textStripper.push(text);
     if (!cleaned) return;
 
     if (kind === "thinking") {
@@ -240,6 +256,19 @@ export async function streamAnthropicMessage(options) {
 
   if (toolSieve) {
     emitSieveEvents(toolSieve.flush());
+  }
+
+  // Flush text stripper before closing the final block
+  const trailingText = textStripper.flush();
+  if (trailingText) {
+    if (currentBlockType === "text") {
+      emitDelta("text_delta", "text", trailingText);
+    } else if (currentBlockType === "thinking") {
+      emitDelta("thinking_delta", "thinking", trailingText);
+    } else {
+      startBlock("text", { text: "" });
+      emitDelta("text_delta", "text", trailingText);
+    }
   }
 
   finishCurrentBlock();

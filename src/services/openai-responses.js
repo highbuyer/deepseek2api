@@ -2,7 +2,7 @@ import { collectCompletionContent, streamCompletionContent } from "./openai-comp
 import { getOpenAiResponse, storeOpenAiResponse } from "./openai-response-store.js";
 import { createToolSieve, FORMAT_ERROR_MSG } from "./openai-tool-sieve.js";
 import { ensureToolChoiceSatisfied } from "./openai-tool-policy.js";
-import { stripLeakedMarkers } from "../utils/strip-markers.js";
+import { stripLeakedMarkers, createStreamTextStripper } from "../utils/strip-markers.js";
 import {
   buildResponseObject,
   createFunctionCallItem,
@@ -52,6 +52,7 @@ export async function streamResponsesResponse({
   const toolSieve = requestOptions.toolNames.length ? createToolSieve(requestOptions.toolNames) : null;
   let nextOutputIndex = 0;
   let outputText = "";
+  const textStripper = createStreamTextStripper();
   let activeTextItem = null;
   const outputItems = [];
   const toolCalls = [];
@@ -101,7 +102,7 @@ export async function streamResponsesResponse({
   };
 
   const emitText = (text, kind, skipStrip = false) => {
-    const cleaned = skipStrip ? text : stripLeakedMarkers(text);
+    const cleaned = skipStrip ? text : textStripper.push(text);
     if (!cleaned) {
       return;
     }
@@ -143,6 +144,23 @@ export async function streamResponsesResponse({
   };
 
   const emitToolCalls = (calls) => {
+    // Flush text stripper buffer so tool calls don't split
+    // the last 6 chars of text from the preceding output item
+    const pending = textStripper.flush();
+    if (pending) {
+      openTextOutput();
+      activeTextItem.text += pending;
+      outputText += pending;
+      writeResponsesEvent(response, "response.output_text.delta", {
+        type: "response.output_text.delta",
+        response_id: responseId,
+        item_id: activeTextItem.id,
+        output_index: activeTextItem.outputIndex,
+        content_index: 0,
+        delta: pending
+      });
+    }
+
     closeTextOutput();
     calls.forEach((call) => {
       toolCalls.push(call);
@@ -231,6 +249,22 @@ export async function streamResponsesResponse({
     });
     response.end("data: [DONE]\n\n");
     return;
+  }
+
+  // Flush any remaining buffered text before closing
+  const trailingText = textStripper.flush();
+  if (trailingText) {
+    openTextOutput();
+    activeTextItem.text += trailingText;
+    outputText += trailingText;
+    writeResponsesEvent(response, "response.output_text.delta", {
+      type: "response.output_text.delta",
+      response_id: responseId,
+      item_id: activeTextItem.id,
+      output_index: activeTextItem.outputIndex,
+      content_index: 0,
+      delta: trailingText
+    });
   }
 
   closeTextOutput();

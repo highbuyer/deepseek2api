@@ -259,6 +259,34 @@ function normalizeMessagesForPrompt(messages) {
   });
 }
 
+function normalizeApplyPatchParams(params) {
+  const props = params?.properties ?? {};
+  if (Object.keys(props).length > 0) return params;
+
+  return {
+    type: "object",
+    properties: {
+      target_directory: {
+        type: "string",
+        description: "Absolute path to the target directory for the patch"
+      },
+      patch: {
+        type: "string",
+        description: "Unified diff patch in ---/+++/@@ format. Multi-line."
+      }
+    },
+    required: ["target_directory", "patch"]
+  };
+}
+
+function isCodexApplyPatchFormat(tool) {
+  const def = getToolFunction(tool);
+  const name = getToolName(tool);
+  if (name !== "apply_patch" && name !== "ApplyPatch") return false;
+  const props = def?.parameters?.properties ?? {};
+  return "input" in props && !("patch" in props);
+}
+
 function formatToolSchema(tool) {
   const definition = getToolFunction(tool);
   const name = getToolName(tool);
@@ -271,7 +299,12 @@ function formatToolSchema(tool) {
     ? fullDesc.slice(0, config.maxToolDescChars) + "..."
     : fullDesc;
 
-  const params = definition?.parameters;
+  let params = definition?.parameters;
+
+  if (name === "apply_patch" || name === "ApplyPatch") {
+    params = normalizeApplyPatchParams(params);
+  }
+
   let paramSummary = "";
   if (params && typeof params === "object") {
     const required = Array.isArray(params.required) ? params.required : [];
@@ -308,6 +341,47 @@ function buildToolPrompt(policy, tools) {
   if (!toolSchemas.length) {
     return "";
   }
+
+  const patchTool = tools.find(t => {
+    const n = getToolName(t);
+    return n === "apply_patch" || n === "ApplyPatch";
+  });
+  const isCodexPatch = patchTool && isCodexApplyPatchFormat(patchTool);
+  const patchExample = isCodexPatch
+    ? [
+        "ApplyPatch — Codex format (input param + *** markers):",
+        "<function_calls>",
+        "  <invoke name=\"apply_patch\">",
+        "    <parameter name=\"input\" string=\"true\"><![CDATA[*** Begin Patch",
+        "*** Update File: src/main.py",
+        "-import os",
+        "+import sys",
+        "*** Add File: src/new.py",
+        "+def hello(): print(\"hi\")",
+        "*** Delete File: src/old.py",
+        "*** End Patch]]></parameter>",
+        "  </invoke>",
+        "</function_calls>",
+        "",
+        "Format: *** Begin Patch / *** End Patch wraps all operations.",
+        "  Paths relative to workspace root. -old / +new pairs. NO @@ headers.",
+        "  *** Update File: {path}  |  *** Add File: {path}  |  *** Delete File: {path}",
+      ]
+    : [
+        "ApplyPatch — Cursor format (patch param + unified diff):",
+        "<function_calls>",
+        "  <invoke name=\"ApplyPatch\">",
+        "    <parameter name=\"target_directory\" string=\"true\">/project</parameter>",
+        "    <parameter name=\"patch\" string=\"true\"><![CDATA[--- a/src/main.py",
+        "+++ b/src/main.py",
+        "@@ -1,3 +1,4 @@",
+        " import os",
+        "+import sys",
+        " ",
+        " def main():]]></parameter>",
+        "  </invoke>",
+        "</function_calls>",
+      ];
 
   let prompt = [
     "!!! CRITICAL: TOOL CALLING IS YOUR PRIMARY FUNCTION !!!",
@@ -367,8 +441,30 @@ function buildToolPrompt(policy, tools) {
     "   -old",
     "   +new]]></parameter>",
     "6. Tag names are literal: function_calls, invoke, parameter. NO variation.",
-    "7. NEVER use *** Begin Patch / *** End Patch wrappers — only standard unified diff.",
+    isCodexPatch
+    ? "7. ApplyPatch: input param, *** Begin Patch / *** End Patch, -old/+new pairs (NO @@). Paths relative to workspace root."
+    : "7. ApplyPatch: use target_directory + patch param with standard unified diff (---/+++/@@). NO *** Begin Patch.",
     "8. NEVER wrap the XML in markdown code fences (```).",
+    "",
+    "=== FEW-SHOT: Complete multi-tool example ===",
+    "Study this exact format — it is the ONLY correct output structure:",
+    "",
+    "<function_calls>",
+    "  <invoke name=\"Grep\">",
+    "    <parameter name=\"pattern\" string=\"true\">handleChat</parameter>",
+    "    <parameter name=\"path\" string=\"true\">/project/src</parameter>",
+    "  </invoke>",
+    "  <invoke name=\"Read\">",
+    "    <parameter name=\"file_path\" string=\"true\">/project/src/routes.js</parameter>",
+    "    <parameter name=\"offset\" string=\"false\">40</parameter>",
+    "    <parameter name=\"limit\" string=\"false\">30</parameter>",
+    "  </invoke>",
+    "</function_calls>",
+    "",
+    "Key points from above:",
+    "  • ONE <function_calls> block for ALL tool calls",
+    "  • string=\"true\" for text, string=\"false\" for numbers/arrays",
+    "  • NO markdown fences, NO tag name prefixes (DSML|, tool_call_)",
     "",
     "=== EXAMPLES ===",
     "",
@@ -386,19 +482,7 @@ function buildToolPrompt(policy, tools) {
     "  </invoke>",
     "</function_calls>",
     "",
-    "ApplyPatch (note CDATA for multi-line patch):",
-    "<function_calls>",
-    "  <invoke name=\"ApplyPatch\">",
-    "    <parameter name=\"target_directory\" string=\"true\">/project</parameter>",
-    "    <parameter name=\"patch\" string=\"true\"><![CDATA[--- a/src/main.py",
-    "+++ b/src/main.py",
-    "@@ -1,3 +1,4 @@",
-    " import os",
-    "+import sys",
-    " ",
-    " def main():]]></parameter>",
-    "  </invoke>",
-    "</function_calls>",
+    ...patchExample,
     "",
     "Multiple tools:",
     "<function_calls>",
@@ -418,7 +502,9 @@ function buildToolPrompt(policy, tools) {
     "4. After tools return results, fix bugs directly.",
     "5. If you do NOT need a tool, answer normally without ANY XML.",
     "6. Text before/after the <function_calls> block is allowed for natural flow.",
-    "7. ApplyPatch patch MUST be standard unified diff (---/+++/@@). NO *** Begin Patch.",
+    isCodexPatch
+    ? "7. ApplyPatch: input param, *** Begin Patch / *** End Patch, -/+ pairs, NO @@."
+    : "7. ApplyPatch: target_directory + patch, unified diff (---/+++/@@), NO *** Begin Patch.",
     "8. NEVER echo <tool_result> content in your visible output — it's internal context only."
   ].join("\n");
 

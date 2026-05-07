@@ -417,14 +417,21 @@ function truncatePrompt(messages, maxBudget, measure) {
 }
 
 const ANTHROPIC_MODEL_ALIASES = Object.freeze({
-  "claude-sonnet-4-6": "deepseek-chat-expert",
-  "claude-opus-4-7": "deepseek-reasoner-expert",
+  // Chat (default)
   "claude-haiku-4-5": "deepseek-chat-fast",
-  "claude-sonnet-4-5": "deepseek-chat-fast",
+  "claude-3-5-haiku": "deepseek-chat-fast",
+  // Chat (expert)
+  "claude-sonnet-4-6": "deepseek-chat-expert",
+  "claude-sonnet-4-5": "deepseek-chat-expert",
+  "claude-3-5-sonnet": "deepseek-chat-expert",
+  // Reasoner (default)
   "claude-opus-4-5": "deepseek-reasoner-fast",
   "claude-opus-4": "deepseek-reasoner-fast",
-  "claude-3-5-sonnet": "deepseek-chat-fast",
-  "claude-3-5-haiku": "deepseek-chat-fast"
+  // Reasoner (expert)
+  "claude-opus-4-7": "deepseek-reasoner-expert",
+  // Vision
+  "claude-opus-4-7-vision": "deepseek-vision",
+  "claude-opus-4-7-vision-fast": "deepseek-vision-fast"
 });
 
 export function resolveAnthropicModel(modelId) {

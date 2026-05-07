@@ -7,7 +7,7 @@ import { parseToolCallsFromText } from "./openai-tool-parser.js";
 import { buildOpenAiPrompt } from "./openai-tool-prompt.js";
 import { ensureToolChoiceSatisfied, hasChatToolingRequest } from "./openai-tool-policy.js";
 import { createOpenAiError } from "./openai-error.js";
-import { stripLeakedMarkers } from "../utils/strip-markers.js";
+import { stripLeakedMarkers, createStreamTextStripper } from "../utils/strip-markers.js";
 import { isRefusal, CLAUDE_IDENTITY_RESPONSE } from "./openai-refusal-detector.js";
 import { createRequestLogger } from "./request-logger.js";
 import { log } from "../utils/log.js";
@@ -257,9 +257,10 @@ export async function streamOpenAiResponse(options) {
   };
 
   let streamChars = 0;
+  const textStripper = createStreamTextStripper();
 
   const emitTextEvent = (text, kind, skipStrip = false) => {
-    const cleaned = skipStrip ? text : stripLeakedMarkers(text);
+    const cleaned = skipStrip ? text : textStripper.push(text);
     if (!cleaned) return;
     streamChars += cleaned.length;
     if (streamChars > 0 && streamChars <= cleaned.length) {
@@ -314,6 +315,19 @@ export async function streamOpenAiResponse(options) {
         emitToolCalls(fallbackCalls);
       }
     }
+  }
+
+  // Flush any remaining buffered text from the stream stripper
+  // before sending finish_reason — catches TOOL: patterns that
+  // were held across the final chunk boundary.
+  const trailingText = textStripper.flush();
+  if (trailingText) {
+    streamChars += trailingText.length;
+    writeSseChunk(response, buildChunkPayload(
+      completionId,
+      requestOptions.model.id,
+      { content: trailingText }
+    ));
   }
 
   writeSseChunk(response, buildChunkPayload(

@@ -5,26 +5,35 @@ const SEARCH_MODEL_SUFFIX = "-search";
 
 // Map OpenAI model names (sent by Warp client) to DeepSeek equivalents.
 const MODEL_ALIASES = Object.freeze({
-  "gpt-5.5": "deepseek-reasoner-expert",
-  "gpt-5": "deepseek-reasoner-expert",
-  "gpt-4o": "deepseek-chat-expert",
-  "gpt-4.1": "deepseek-chat-expert",
+  // Chat (default)
   "gpt-4": "deepseek-chat-fast",
   "gpt-4-turbo": "deepseek-chat-fast",
   "gpt-3.5-turbo": "deepseek-chat-fast",
   "gpt-4o-mini": "deepseek-chat-fast",
-  o1: "deepseek-chat-fast",
-  o3: "deepseek-chat-fast",
+  // Chat (expert)
+  "gpt-4o": "deepseek-chat-expert",
+  "gpt-4.1": "deepseek-chat-expert",
+  // Reasoner (default)
+  o1: "deepseek-reasoner-fast",
+  o3: "deepseek-reasoner-fast",
+  // Reasoner (expert)
+  "gpt-5.5": "deepseek-reasoner-expert",
+  "gpt-5": "deepseek-reasoner-expert",
   "o4-mini": "deepseek-reasoner-expert",
   "o3-mini": "deepseek-reasoner-expert",
-  "o1-mini": "deepseek-reasoner-expert"
+  "o1-mini": "deepseek-reasoner-expert",
+  // Vision
+  "gpt-5.5-vision": "deepseek-vision",
+  "gpt-5.5-vision-fast": "deepseek-vision-fast"
 });
 
 const BASE_OPENAI_MODELS = Object.freeze([
   Object.freeze({ id: "deepseek-chat-fast", modelType: "default", thinkingEnabled: false }),
   Object.freeze({ id: "deepseek-reasoner-fast", modelType: "default", thinkingEnabled: true }),
   Object.freeze({ id: "deepseek-chat-expert", modelType: "expert", thinkingEnabled: false }),
-  Object.freeze({ id: "deepseek-reasoner-expert", modelType: "expert", thinkingEnabled: true })
+  Object.freeze({ id: "deepseek-reasoner-expert", modelType: "expert", thinkingEnabled: true }),
+  Object.freeze({ id: "deepseek-vision", modelType: "vision", thinkingEnabled: true }),
+  Object.freeze({ id: "deepseek-vision-fast", modelType: "vision", thinkingEnabled: false })
 ]);
 
 function createModelVariant(baseModel, searchEnabled) {

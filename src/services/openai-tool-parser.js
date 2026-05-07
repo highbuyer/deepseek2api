@@ -111,13 +111,28 @@ function findAllowedName(name, allowedToolNames) {
  */
 function buildAllowedLookup(allowedToolNames) {
   const map = new Map();
+  const prefixes = [];
   for (const n of (allowedToolNames ?? [])) {
     const trimmed = toStringSafe(n).trim();
-    if (trimmed) map.set(trimmed.toLowerCase(), trimmed);
+    if (trimmed) {
+      map.set(trimmed.toLowerCase(), trimmed);
+      // Collect names ending with "__" as namespace prefixes
+      // (e.g. mcp__gitnexus__ → matches mcp__gitnexus__gitnexus_query)
+      if (trimmed.endsWith("__")) {
+        prefixes.push(trimmed.toLowerCase());
+      }
+    }
   }
   return {
-    has: (name) => map.has(toStringSafe(name).trim().toLowerCase()),
-    get: (name) => map.get(toStringSafe(name).trim().toLowerCase()) ?? null,
+    has: (name) => {
+      const key = toStringSafe(name).trim().toLowerCase();
+      if (map.has(key)) return true;
+      return prefixes.some(p => key.startsWith(p));
+    },
+    get: (name) => {
+      const key = toStringSafe(name).trim().toLowerCase();
+      return map.get(key) ?? null;
+    },
     size: map.size
   };
 }
@@ -677,8 +692,57 @@ function resolveApplyPatchName(allowedToolNames) {
   return null;
 }
 
+// Strip DeepSeek's *** Begin Patch / *** End Patch wrappers and extract
+// unified diff blocks. Used for both Cursor and Codex CLI parameter formats.
+function cleanDeepSeekPatchFormat(patchText) {
+  if (!patchText.includes("*** Begin Patch")) return patchText;
+
+  const sections = patchText.split(/(?=\*{3} Begin Patch)/);
+  const blocks = [];
+
+  for (const section of sections) {
+    // Extract unified diff block (---/+++/@@)
+    const diffMatch = section.match(/(--- [^\n]+\n\+{3} [^\n]+\n@@ [\s\S]*?)(?=\*{3} End Patch|\*{3} Begin Patch|$)/i);
+    if (diffMatch) {
+      blocks.push(diffMatch[1].trim());
+      continue;
+    }
+
+    // Old format: *** Content: section
+    const contentMatch = section.match(/\*{3} Content:\s*\n?([\s\S]*?)(?=\*{3} End Patch|$)/i);
+    const fileMatch = section.match(/\*{3} (?:Add|Edit)(?:\s+File:)?\s*(\S+)/i);
+    if (contentMatch && fileMatch) {
+      const content = contentMatch[1].trim();
+      const filePath = fileMatch[1];
+      const relPath = filePath.replace(/^\//, "");
+      const lines = content.split("\n");
+      blocks.push(`--- a/${relPath}\n+++ b/${relPath}\n@@ -1,0 +1,${lines.length} @@\n+${lines.join("\n+")}`);
+    }
+
+    // Edit+Replace format
+    const repMatch = section.match(/\*{3} Replace:\s*\n?([\s\S]*?)\*{3} With:\s*\n?([\s\S]*?)(?=\*{3} End Patch|$)/i);
+    if (repMatch && fileMatch) {
+      const oldLines = repMatch[1].trim().split("\n");
+      const newLines = repMatch[2].trim().split("\n");
+      const filePath = fileMatch[1];
+      const relPath = filePath.replace(/^\//, "");
+      blocks.push(`--- a/${relPath}\n+++ b/${relPath}\n@@ -1,${oldLines.length} +1,${newLines.length} @@\n${oldLines.map(l => `-${l}`).join("\n")}\n${newLines.map(l => `+${l}`).join("\n")}`);
+    }
+  }
+
+  return blocks.length ? blocks.join("\n") : patchText;
+}
+
 function fixApplyPatchArgs(input) {
   if (!input || typeof input !== "object") return input;
+
+  // Codex CLI format: { input: "*** Begin Patch\n..." }
+  // Codex uses a native format (*** Update File / *** Add File / @@ hunks) that
+  // is NOT unified diff. Preserve it as-is — do NOT convert through cleanDeepSeekPatchFormat
+  // which would destroy *** wrappers and inject ---/+++ headers.
+  if (!input.patch && typeof input.input === "string" && input.input.trim()) {
+    return { ...input, input: input.input.trim() };
+  }
 
   const hasTargetDir = typeof input.target_directory === "string" && input.target_directory.trim();
   const patch = input.patch;
@@ -1846,10 +1910,9 @@ function filterAllowedToolCalls(calls, allowedToolNames) {
   const rejected = [];
 
   for (const call of calls) {
-    // Case-insensitive match — normalize name to allowed list's original casing
-    const allowedName = allowedLookup.get(call.name);
-    if (allowedName) {
-      call.name = allowedName; // Normalize casing
+    if (allowedLookup.has(call.name)) {
+      // Normalize casing if an exact match exists, otherwise keep original
+      call.name = allowedLookup.get(call.name) ?? call.name;
       filtered.push(call);
     } else {
       rejected.push(call.name);
