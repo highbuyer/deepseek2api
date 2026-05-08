@@ -1992,10 +1992,33 @@ function parseJsonFenceToolCalls(text, allowedToolNames) {
         return calls;
       }
     } catch (_2) {
-      // Still invalid — fall through to XML parsing
+      // Still invalid — try tolerantParse as third fallback (handles
+      // unescaped quotes inside string values and other edge cases).
+      try {
+        const tolerantResult = tolerantParse(jsonText);
+        if (tolerantResult) {
+          const items = Array.isArray(tolerantResult) ? tolerantResult : [tolerantResult];
+          const tCalls = [];
+          for (const item of items) {
+            if (!item || typeof item !== "object") continue;
+            const tName = item.tool || item.name || "";
+            if (!tName) continue;
+            const resolvedName = findAllowedName(tName, allowedToolNames) || tName;
+            const tArgs = item.arguments || item.parameters || item.input || item.args || {};
+            tCalls.push(buildParsedToolCall(resolvedName, typeof tArgs === "string" ? tArgs : JSON.stringify(tArgs)));
+          }
+          if (tCalls.length) {
+            log.debug("parser", `JSON fence fast-path (after tolerantParse): ${tCalls.length} call(s) parsed`);
+            return tCalls;
+          }
+        }
+      } catch (_3) {
+        // All fallbacks exhausted — fall through to XML parsing
+      }
     }
   }
 
+  log.debug("parser", `JSON fence fast-path: failed to parse (${jsonText.length} chars), preview="${jsonText.slice(0, 200)}"`);
   return null;
 }
 

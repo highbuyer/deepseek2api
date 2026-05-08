@@ -103,8 +103,16 @@ export function createToolSieve(allowedToolNames = []) {
     emittedText: "",
     hold: "",      // small lookbehind for chunk-boundary detection
     lastKind: "response",
-    inCodeFence: false  // true when text is inside a ``` fenced code block (non-json)
+    inCodeFence: false,  // true when text is inside a ``` fenced code block (non-json)
+    formatErrorEmitted: false  // only emit one format_error per stream
   };
+
+  /* ── Detect empty nested tool container tags (model glitch: repeated <tool_calls>
+     with no actual tool invocations inside, just more nested containers + whitespace) ── */
+  function isEffectivelyEmptyToolBlock(text) {
+    const noTags = text.replace(/<[^>]*>/g, "");
+    return noTags.trim().length === 0;
+  }
 
   function pushTextEvent(events, text, kind) {
     if (!text) return;
@@ -149,9 +157,11 @@ export function createToolSieve(allowedToolNames = []) {
             const jsonBlock = state.capture.slice(prefixLen, closeIdx).trim();
             const suffix = state.capture.slice(closeIdx + 3);
             const calls = jsonBlock ? parseToolCallsFromText(jsonBlock, state.allowedToolNames) : [];
+            log.debug("sieve", `JSON drain: jsonBlock=${jsonBlock.length} chars, calls=${calls.length}, preview="${jsonBlock.slice(0, 200)}"`);
             if (calls.length) {
               events.push({ type: "tool_calls", calls });
             } else if (jsonBlock) {
+              log.debug("sieve", `JSON drain: parse returned 0 calls, emitting as text (${state.capture.slice(0, closeIdx + 3).length} chars)`);
               pushTextEvent(events, state.capture.slice(0, closeIdx + 3), state.lastKind);
             }
             state.capture = "";
@@ -199,6 +209,7 @@ export function createToolSieve(allowedToolNames = []) {
       // Drop <tool_result> blocks — they are echoed prompt content, never valid tool calls.
       // Without this, large tool results overflow and leak file content into the SSE stream.
       const captureLower = state.capture.toLowerCase();
+      log.debug("sieve", `XML capture drain: len=${state.capture.length} kind=${state.captureKind} closeEnd=${findCloseEnd(captureLower, state.closes)} preview="${state.capture.slice(0, 80)}"`);
       if (captureLower.indexOf("<tool_result") >= 0) {
         const closeEnd = captureLower.lastIndexOf("</tool_result>");
         if (closeEnd >= 0) {
@@ -221,12 +232,16 @@ export function createToolSieve(allowedToolNames = []) {
         const calls = parseToolCallsFromText(block, state.allowedToolNames);
         if (calls.length) {
           events.push({ type: "tool_calls", calls });
+        } else if (!state.formatErrorEmitted && isEffectivelyEmptyToolBlock(block)) {
+          // Empty nested container tags with no actual tool content —
+          // emit FORMAT_ERROR to steer model toward ```json fence format.
+          log.debug("sieve", `Drain: empty tool tags detected (block=${block.length} chars), emitting format_error`);
+          state.formatErrorEmitted = true;
+          events.push({ type: "format_error", block });
         } else {
-          // Parse returned nothing — replay as text so the model stays
-          // in its normal flow.  Previously we tried to detect "real attempts"
-          // and emit a FORMAT_ERROR, but isRealAttempt heuristics caused false
-          // positives on valid tool calls (tool name filtered, parse edge case,
-          // etc.), confusing the model.
+          // Parse returned nothing but block has real text content —
+          // replay as text so the model stays in its normal flow.
+          log.debug("sieve", `Drain: parse returned 0 calls, isEmpty=${isEffectivelyEmptyToolBlock(block)}, blockPreview="${block.slice(0, 100)}"`);
           pushTextEvent(events, block, state.lastKind);
         }
         state.capture = "";
@@ -361,6 +376,8 @@ export function createToolSieve(allowedToolNames = []) {
 
     const open = findFirstOpen(text.toLowerCase(), state.opens);
     if (open) {
+      const matchedTag = state.opens.find(t => text.toLowerCase().indexOf(t) === open.index) || "?";
+      log.debug("sieve", `Capture start: tag="${matchedTag}" at pos=${open.index}, kind=${state.lastKind}, textPreview="${text.slice(0, 100)}"`);
       if (open.index > 0) {
         pushTextEvent(events, text.slice(0, open.index), state.lastKind);
       }
@@ -390,7 +407,32 @@ export function createToolSieve(allowedToolNames = []) {
   return Object.freeze({
     push(chunk, kind) {
       const text = toStringSafe(chunk);
+      const prevKind = state.lastKind;
       if (kind) state.lastKind = kind;
+
+      // When switching from thinking to response, force-flush any open
+      // XML capture.  Models often mention tool names during reasoning,
+      // which triggers capture that spans both think and response blocks.
+      // The captured thinking text defeats isEmpty checks, preventing
+      // format_error emission for empty response <tool_calls> blocks.
+      if (prevKind === "thinking" && kind === "response" && state.capturing && state.captureKind === "xml") {
+        log.debug("sieve", `Kind switch thinking→response, flushing capture (${state.capture.length} chars) as text`);
+        const events = [];
+        pushTextEvent(events, state.capture, prevKind);
+        state.capture = "";
+        state.capturing = false;
+        state.captureKind = null;
+        // Also flush any held text before this chunk
+        if (state.hold) {
+          pushTextEvent(events, state.hold, prevKind);
+          state.hold = "";
+        }
+        state.hold = text;
+        const more = drain();
+        events.push(...more);
+        return events;
+      }
+
       state.hold += text;
       return drain();
     },
@@ -421,7 +463,13 @@ export function createToolSieve(allowedToolNames = []) {
         const calls = parseToolCallsFromText(parseText, state.allowedToolNames);
         if (calls.length) {
           events.push({ type: "tool_calls", calls });
+        } else if (!state.formatErrorEmitted && state.captureKind === "xml" && isEffectivelyEmptyToolBlock(state.capture)) {
+          // Stream ended with empty nested tool tags — correct the model
+          log.debug("sieve", `Flush: empty tool tags detected (capture=${state.capture.length} chars), emitting format_error`);
+          state.formatErrorEmitted = true;
+          events.push({ type: "format_error", block: state.capture });
         } else {
+          log.debug("sieve", `Flush: parse returned 0 calls, captureKind=${state.captureKind}, formatErrorEmitted=${state.formatErrorEmitted}, isEmpty=${isEffectivelyEmptyToolBlock(state.capture)}, capturePreview="${state.capture.slice(0, 100)}"`);
           pushTextEvent(events, state.capture, state.lastKind);
         }
         state.capture = "";
