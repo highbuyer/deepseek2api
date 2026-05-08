@@ -160,6 +160,21 @@ describe("Malformed tag preprocessing", () => {
     const call = parseOne(text);
     assert.equal(call.name, "WebSearch");
   });
+
+  it("fixes fused name attr + </parameter: name value unclosed and param split", () => {
+    // Real DeepSeek output: tool_name name= value leaks into </parameter name="url">
+    const text = `<tool_calls>
+  <tool_call>
+    <tool_name name="cursor-ide-browser-browser_navigate</parameter name="url">https://github.com/Hmbown/DeepSeek-TUI</parameter>
+    </tool_calls>`;
+    const calls = parseToolCallsFromText(text, [
+      "Shell", "Glob", "rg", "AwaitShell", "ReadFile", "Delete", "ApplyPatch",
+      "cursor-ide-browser-browser_navigate"
+    ]);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].name, "cursor-ide-browser-browser_navigate");
+    assert.equal(calls[0].input.url, "https://github.com/Hmbown/DeepSeek-TUI");
+  });
 });
 
 /* ═══════════════════════════════════════════════════

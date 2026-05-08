@@ -2070,6 +2070,19 @@ export function parseToolCallsFromText(text, allowedToolNames = []) {
     log.debug("parser", `Preprocessed unclosed name attr tags (e.g. <tool_name name="WebSearch</tool_name> → <tool_name>WebSearch</tool_name>)`);
   }
 
+  // Step 1.61: Fix <tool_name name="X</parameter name="Y">V</parameter>
+  // — model fused tool_name name attr + first <parameter> into one malformed tag.
+  // The name= value is unclosed (missing ">), followed by </parameter instead of
+  // <parameter, creating a hybrid tag. Split back into proper tags.
+  const beforeFusedParam = fixed;
+  fixed = fixed.replace(
+    /<((?:[a-z0-9_:-]+:)?(?:tool_name|tool|function_name|function|invoke))\s+name="([a-zA-Z0-9_.\-]+)<\/parameter\s+name="([a-zA-Z0-9_.\-]+)"\s*>([\s\S]*?)<\/parameter\s*>/gi,
+    '<$1>$2</$1><parameter name="$3">$4</parameter>'
+  );
+  if (fixed !== beforeFusedParam) {
+    log.debug("parser", `Preprocessed fused <tool_name name="X</parameter name="Y">V</parameter> → split tags`);
+  }
+
   // Step 1.55: Fix <tool_name name="X"></parameter> — model closed tool_name
   // with </parameter> instead of </tool_name>.  Extract name attr and fix.
   const beforeParamClose = fixed;
