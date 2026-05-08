@@ -85,8 +85,13 @@ APP_ADMIN_PASSWORD=
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `PORT` | `3000` | 服务监听端口 |
+| `DEBUG` | `0` | 开启调试日志（设为 `1` 生效） |
 | `APP_ADMIN_USERNAME` | 空 | 管理员用户名 |
 | `APP_ADMIN_PASSWORD` | 空 | 管理员密码 |
+| `MAX_PROMPT_CHARS` | `128000` | 字符级 fallback 上限（仅当 `MAX_PROMPT_TOKENS` 未设时启用） |
+| `MAX_PROMPT_TOKENS` | `32000` | token 感知上限。V4 专家模式实测窗口 ~38K real tokens（三种变体共享），默认留 6K buffer。遇 `input_exceeds_limit` 报错调低此值 |
+| `MAX_TOOL_DESC_CHARS` | `200` | 工具描述最大字符数 |
+| `PROXY` | — | HTTP 代理地址（如 `http://127.0.0.1:10808`） |
 
 只有同时设置 `APP_ADMIN_USERNAME` 和 `APP_ADMIN_PASSWORD` 时，管理员入口才会启用。
 
@@ -130,16 +135,50 @@ APP_ADMIN_PASSWORD=
 - 联网能力通过模型后缀 `-search` 控制
 - 不支持 `web_search_options`，请改用 `*-search` 模型
 
-支持的模型 ID：
+支持的模型 ID（12 个）：
 
-- `deepseek-chat-fast`
-- `deepseek-chat-fast-search`
-- `deepseek-reasoner-fast`
-- `deepseek-reasoner-fast-search`
-- `deepseek-chat-expert`
-- `deepseek-chat-expert-search`
-- `deepseek-reasoner-expert`
-- `deepseek-reasoner-expert-search`
+| 模型 | model_type | thinking |
+|------|-----------|----------|
+| `deepseek-chat-fast` | default | off |
+| `deepseek-chat-fast-search` | default | off |
+| `deepseek-reasoner-fast` | default | on |
+| `deepseek-reasoner-fast-search` | default | on |
+| `deepseek-chat-expert` | expert | off |
+| `deepseek-chat-expert-search` | expert | off |
+| `deepseek-reasoner-expert` | expert | on |
+| `deepseek-reasoner-expert-search` | expert | on |
+| `deepseek-vision` | vision | on |
+| `deepseek-vision-search` | vision | on |
+| `deepseek-vision-fast` | vision | off |
+| `deepseek-vision-fast-search` | vision | off |
+
+#### GPT 别名（MODEL_ALIASES）
+
+`/v1/chat/completions` 和 `/v1/responses` 支持用 GPT 模型名，自动映射到 DeepSeek：
+
+| GPT 别名 | DeepSeek 模型 |
+|----------|-------------|
+| `gpt-4` `gpt-4-turbo` `gpt-3.5-turbo` `gpt-4o-mini` | `deepseek-chat-fast` |
+| `gpt-4o` `gpt-4.1` | `deepseek-chat-expert` |
+| `o1` `o3` | `deepseek-reasoner-fast` |
+| `gpt-5.5` `gpt-5` `o4-mini` `o3-mini` `o1-mini` | `deepseek-reasoner-expert` |
+| `gpt-5.5-vision` | `deepseek-vision` |
+| `gpt-5.5-vision-fast` | `deepseek-vision-fast` |
+
+#### Claude 别名（ANTHROPIC_MODEL_ALIASES）
+
+`/v1/messages` 支持用 Claude 模型名：
+
+| Claude 别名 | DeepSeek 模型 |
+|------------|-------------|
+| `claude-haiku-4-5` `claude-3-5-haiku` | `deepseek-chat-fast` |
+| `claude-sonnet-4-6` `claude-sonnet-4-5` `claude-3-5-sonnet` | `deepseek-chat-expert` |
+| `claude-opus-4-5` `claude-opus-4` | `deepseek-reasoner-fast` |
+| `claude-opus-4-7` | `deepseek-reasoner-expert` |
+| `claude-opus-4-7-vision` | `deepseek-vision` |
+| `claude-opus-4-7-vision-fast` | `deepseek-vision-fast` |
+
+> `-search` 变体没有别名，用原生名直接调用。
 
 ### `chat/completions` 示例
 
@@ -254,33 +293,65 @@ curl http://127.0.0.1:3000/v1/responses \
 
 ### 公共接口
 
-- `GET /api/me`
-- `GET /api/discovery`
-- `POST /api/auth/login`
-- `POST /api/auth/register`
-- `POST /api/auth/logout`
+| Method | Path | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/api/me` | 无 | 返回当前会话；未登录时返回匿名态 |
+| `GET` | `/api/discovery` | 无 | 返回允许的 `/proxy/*` 白名单路径 |
+| `POST` | `/api/auth/login` | 无 | 本地用户登录 |
+| `POST` | `/api/auth/register` | 无 | 本地用户注册 |
+| `POST` | `/api/auth/logout` | 无 | 清理本地登录态 |
 
 ### 登录后接口
 
-- `GET /api/accounts`
-- `POST /api/accounts`
-- `DELETE /api/accounts/:id`
-- `POST /api/incognito`
-- `GET /api/api-keys`
-- `POST /api/api-keys`
-- `PATCH /api/api-keys/:id`
-- `DELETE /api/api-keys/:id`
+| Method | Path | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/api/accounts` | Session | 列出当前用户可见账号 |
+| `POST` | `/api/accounts` | Session | 创建并绑定 DeepSeek 账号 |
+| `DELETE` | `/api/accounts/:id` | Session | 删除账号 |
+| `POST` | `/api/incognito` | Session | 更新当前用户无痕配置 |
+| `GET` | `/api/api-keys` | Session | 列出当前用户 API Key |
+| `POST` | `/api/api-keys` | Session | 创建 API Key |
+| `PATCH` | `/api/api-keys/:id` | Session | 更新 API Key 开关 |
+| `DELETE` | `/api/api-keys/:id` | Session | 删除 API Key |
 
 ### 管理接口
 
-- `POST /api/admin/registration`
-- `POST /api/admin/invites`
-- `POST /api/admin/invites/batch-delete`
-- `DELETE /api/admin/invites/:id`
-- `PATCH /api/admin/users/:id`
-- `DELETE /api/admin/users/:id`
-- `POST /api/admin/users/batch-disable`
-- `POST /api/admin/users/batch-delete`
+| Method | Path | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| `POST` | `/api/admin/registration` | Admin | 更新注册开关和邀请码要求 |
+| `POST` | `/api/admin/invites` | Admin | 创建邀请码 |
+| `POST` | `/api/admin/invites/batch-delete` | Admin | 批量删除邀请码 |
+| `DELETE` | `/api/admin/invites/:id` | Admin | 删除单个邀请码 |
+| `PATCH` | `/api/admin/users/:id` | Admin | 更新用户状态和限流参数 |
+| `DELETE` | `/api/admin/users/:id` | Admin | 删除单个用户 |
+| `POST` | `/api/admin/users/batch-disable` | Admin | 批量启用或禁用用户 |
+| `POST` | `/api/admin/users/batch-delete` | Admin | 批量删除用户 |
+
+### OpenAI 兼容接口
+
+| Method | Path | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/v1/models` | API Key | 返回兼容模型列表 |
+| `POST` | `/v1/messages` | API Key | Anthropic 风格 messages 接口 |
+| `POST` | `/v1/chat/completions` | API Key | Chat Completions |
+| `POST` | `/v1/embeddings` | API Key | Embeddings；缺少 API Key 时会尝试使用本地第一个 key 兜底 |
+| `POST` | `/v1/responses` | API Key | Responses API |
+| `GET` | `/v1/responses/:id` | API Key | 读取已缓存的 response |
+
+### 原生代理接口
+
+| Method | Path | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/proxy/<allowed-path>` | Session | 将白名单路径转发到 DeepSeek Web 接口 |
+| `POST` | `/proxy/<allowed-path>` | Session | 将白名单路径转发到 DeepSeek Web 接口 |
+| `HEAD` | `/proxy/<allowed-path>` | Session | 代码路径支持透传；仅对白名单路径生效 |
+
+补充说明：
+
+- `/proxy/*` 使用登录态会话，不使用 API Key
+- `/proxy/<allowed-path>` 中的 `<allowed-path>` 必须来自上面的白名单列表
+- `POST /proxy/api/v0/chat/completion` 会在本地做额外处理，以兼容流式 / 非流式和无痕清理
+- 全局 `OPTIONS` 预检请求直接返回 `204`
 
 ## 项目结构
 
@@ -297,6 +368,99 @@ curl http://127.0.0.1:3000/v1/responses \
 ├─ package.json
 └─ README.md
 ```
+
+## Codex 当前会话工具实测
+
+以下内容仅适用于 **Codex 在本次会话中的实际运行环境**。
+**不代表 Cursor、Claude Code 或其他客户端的工具能力与行为。**
+
+### 已实测可调用并返回有效结果
+
+- `functions.exec_command`
+- `functions.write_stdin`
+- `functions.list_mcp_resources`
+- `functions.list_mcp_resource_templates`
+- `functions.read_mcp_resource`
+- `functions.update_plan`
+- `functions.apply_patch`
+- `functions.view_image`
+- `functions.spawn_agent`
+- `functions.send_input`
+- `functions.resume_agent`
+- `functions.wait_agent`
+- `functions.close_agent`
+- `functions.request_user_input`
+- `multi_tool_use.parallel`
+
+- `mcp__gitnexus__.list_repos`
+- `mcp__gitnexus__.query`
+- `mcp__gitnexus__.context`
+- `mcp__gitnexus__.impact`
+- `mcp__gitnexus__.detect_changes`
+- `mcp__gitnexus__.cypher`
+- `mcp__gitnexus__.rename`
+
+- `web.run`
+  本次会话中已实测通过的子操作：
+  `search_query`、`open`、`click`、`find`、`screenshot`、`finance`、`weather`、`sports`、`time`
+
+- `mcp__ChromeDevTools__.list_pages`
+- `mcp__ChromeDevTools__.select_page`
+- `mcp__ChromeDevTools__.new_page`
+- `mcp__ChromeDevTools__.close_page`
+- `mcp__ChromeDevTools__.navigate_page`
+- `mcp__ChromeDevTools__.take_snapshot`
+- `mcp__ChromeDevTools__.take_screenshot`
+- `mcp__ChromeDevTools__.click`
+- `mcp__ChromeDevTools__.hover`
+- `mcp__ChromeDevTools__.drag`
+- `mcp__ChromeDevTools__.fill`
+- `mcp__ChromeDevTools__.fill_form`
+- `mcp__ChromeDevTools__.type_text`
+- `mcp__ChromeDevTools__.press_key`
+- `mcp__ChromeDevTools__.upload_file`
+- `mcp__ChromeDevTools__.wait_for`
+- `mcp__ChromeDevTools__.evaluate_script`
+- `mcp__ChromeDevTools__.handle_dialog`
+- `mcp__ChromeDevTools__.list_console_messages`
+- `mcp__ChromeDevTools__.get_console_message`
+- `mcp__ChromeDevTools__.list_network_requests`
+- `mcp__ChromeDevTools__.get_network_request`
+- `mcp__ChromeDevTools__.resize_page`
+- `mcp__ChromeDevTools__.emulate`
+- `mcp__ChromeDevTools__.lighthouse_audit`
+- `mcp__ChromeDevTools__.performance_start_trace`
+- `mcp__ChromeDevTools__.performance_stop_trace`
+- `mcp__ChromeDevTools__.performance_analyze_insight`
+- `mcp__ChromeDevTools__.take_memory_snapshot`
+
+### 可调用，但当前仓库或配置下无匹配数据
+
+- `mcp__gitnexus__.route_map`
+  当前 `deepseek2api` 索引中没有 `Route` 节点，返回空结果
+- `mcp__gitnexus__.shape_check`
+  当前索引中没有可做响应 shape 校验的路由数据，返回空结果
+- `mcp__gitnexus__.tool_map`
+  当前索引中没有 `Tool` 定义节点，返回空结果
+- `mcp__gitnexus__.api_impact`
+  工具本身可执行，但依赖 route 映射；当前仓库未索引出对应 route
+- `mcp__gitnexus__.group_list`
+  当前没有配置任何 GitNexus group，返回空结果
+- `mcp__gitnexus__.group_sync`
+  工具本身可调用，但当前无可同步 group；对不存在的 group 会返回 `Group not found`
+
+### 工具入口存在，但当前后端不支持
+
+- `web.run` 的 `image_query`
+  后端返回：`Search type image is not supported`
+
+### 说明
+
+- 这里的“可用”是指 **Codex 当前会话里实际调用过并得到结果**
+- 这里的结论 **不自动适用于 Cursor**
+- 这里的结论 **也不自动适用于 Claude Code**
+- `web.run` 是顶层工具名；`search_query`、`open` 等是其子操作，不是独立顶层工具
+- `functions.request_user_input` 虽已实测成功，但是否适合使用，仍受 Codex 当前协作模式约束
 
 ## License
 

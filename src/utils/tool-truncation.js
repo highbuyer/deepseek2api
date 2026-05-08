@@ -4,12 +4,14 @@
 import { log } from "./log.js";
 
 /**
- * Rough token estimator: CJK characters ≈ 1 token, everything else ≈ 0.3 token.
- * DeepSeek/Claude use BPE tokenizers where CJK is ~1 token/char and English/code
- * is ~0.25-0.35 token/char.  Using 0.3 is a conservative midpoint.
+ * Rough token estimator: CJK characters ≈ 1 token, everything else ≈ 0.25 token.
+ * DeepSeek V4 expert backend measured 2026-05-08:
+ *   150K chars of repeated English → 34,659 real tokens (ratio ~0.231)
+ *   162K chars of repeated English → 37,429 real tokens (ratio ~0.231)
+ * 0.25 is a slightly conservative midpoint for English/code; CJK stays at 1:1.
  *
- * This is an APPROXIMATION.  Actual token count depends on the specific tokenizer.
- * The goal is to avoid gross under/over-estimation, not perfect accuracy.
+ * This is an APPROXIMATION. Real ratio varies by content type (JSON/URLs/code may
+ * differ ±20%). The goal is to avoid gross under/over-estimation, not perfect accuracy.
  */
 export function estimateTokens(text) {
   let cjk = 0;
@@ -42,7 +44,7 @@ export function estimateTokens(text) {
       other++;
     }
   }
-  return Math.ceil(cjk + other * 0.3);
+  return Math.ceil(cjk + other * 0.25);
 }
 
 export function getToolResultBudget(totalContextChars, modelLimit = 128000) {

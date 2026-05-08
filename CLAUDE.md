@@ -21,6 +21,23 @@ DEBUG=1 npm start  # 带调试日志启动，日志同时写入 data/debug.log
 node --test test/openai-tool-parser.test.js  # 运行工具调用解析器测试（74 个 case）
 ```
 
+## 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `PORT` | `3000` | 服务端口 |
+| `DEBUG` | `0` | 开启调试日志 |
+| `MAX_PROMPT_CHARS` | `128000` | 字符级 fallback 上限。仅当 `MAX_PROMPT_TOKENS` 未设时启用 |
+| `MAX_PROMPT_TOKENS` | `32000` | token 感知上限。**V4 专家模式实测窗口 ~38K real tokens**（2026-05-08 实测，三种变体共享：普通专家 / 思考专家 / 联网搜索思考专家），默认留 6K buffer。`estimateTokens()` 用 BPE 启发式（CJK=1, 其他=0.25），实测对英文重复 pattern 比率 ~0.231；混合代码/JSON 可能 ±20%。遇 `input_exceeds_limit` 报错调低此值 |
+| `MAX_TOOL_DESC_CHARS` | `200` | 工具描述最大字符数 |
+| `PROXY` | — | HTTP 代理地址（如 `http://127.0.0.1:10808`） |
+
+### 长文件处理（四层防线）
+
+L1 单条预算 → L2 头尾截断 → L3 批预算硬顶(100K) → L4 主动提醒 → L5 全局兜底(keepRecentMessages)
+
+详见各层代码: `utils/tool-truncation.js`（共享逻辑），`openai-tool-prompt.js`（OpenAI 通路），`anthropic-prompt.js`（Anthropic 通路）。
+
 ## 工具调用数据流（核心架构）
 
 `src/services/` 中的文件按此顺序构成完整管线：
@@ -93,16 +110,9 @@ DeepSeek SSE 使用 `type` 字段区分内容类型：
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **deepseek2api** (2096 symbols, 4716 relationships, 182 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **deepseek2api** (4051 symbols, 8359 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
-
-## SSE Streaming Constraints
-
-- **`emitToolCalls` MUST keep `id`/`type`/`function.name`/`function.arguments` in ONE delta chunk.** Splitting function fields across chunks causes Cursor's SSE merger to replace `{name}` with `{arguments}` (Cursor does shallow replace, not deep merge). The resulting empty `function.name` manifests as "unsupported local tool."
-- **Fallback tool call detection MUST run BEFORE `finish_reason`.** If `parseToolCallsFromText` finds tool calls the sieve missed, they must be emitted before the final SSE chunk. Sending tool_calls after `finish_reason:"stop"` violates the protocol — clients stop processing after receiving finish_reason.
-- **`getToolName` fallback chain**: `function.name` → `tool.name` → argument-based inference. Cursor clears `function.name` to `""` when reconstructing tool_calls from SSE; the inference layer recovers the tool name from parameter keys (`command`→Shell, `path`→ReadFile, `pattern`+`path`→rg, etc.).
-- **`FORMAT_ERROR_MSG` is the single authoritative correction message** (in `openai-tool-sieve.js`). Do NOT add duplicate hardcoded `[ERROR:]` messages in the bridge — they create inconsistent UI rendering across clients.
 
 ## Always Do
 

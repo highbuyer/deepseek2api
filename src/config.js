@@ -24,10 +24,16 @@ const adminPassword = process.env.APP_ADMIN_PASSWORD ?? "";
 const debugEnv = process.env.DEBUG ?? "";
 const debugEnabled = debugEnv === "1" || debugEnv === "true" || debugEnv.includes("deepseek2api");
 
-// DeepSeek accepts prompts up to ~150K chars; beyond that it returns empty streams.
-// 96K is a safe default that keeps system prompt + recent conversation within limits.
-// Override with MAX_PROMPT_CHARS=128000 etc. if you need larger prompts.
+// maxPromptChars is the character-based fallback prompt limit.
+// Used only when maxPromptTokens is unset (legacy mode).
+// English/code ≈ 0.25 token/char, so 128000 chars ≈ 32K tokens (safe under 38K backend limit).
+// CJK ≈ 1 token/char, so 128000 chars ≈ 128K tokens (WILL EXCEED V4 expert 38K window).
+// Prefer MAX_PROMPT_TOKENS for safety with mixed-language content.
 const maxPromptChars = Number(process.env.MAX_PROMPT_CHARS ?? 128000);
+// Token-aware prompt limit. Default 32000 = V4 expert real window 38K - 6K buffer
+// (response/thinking output). Backed by 2026-05-08 measurements against
+// chat.deepseek.com expert mode (all 3 variants share the same input window).
+const maxPromptTokens = Number(process.env.MAX_PROMPT_TOKENS) || 32000;
 const maxToolDescChars = Number(process.env.MAX_TOOL_DESC_CHARS ?? 200);
 
 export const config = Object.freeze({
@@ -37,6 +43,7 @@ export const config = Object.freeze({
   httpsKeyFile: certKeyPath,
   httpsCertFile: certCrtPath,
   maxPromptChars,
+  maxPromptTokens,
   maxToolDescChars,
   dataFile: join(dataDirectory, "app.json"),
   sessionCookieName: "ds_reverse_session",
