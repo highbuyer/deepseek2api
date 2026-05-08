@@ -51,7 +51,7 @@ function inferToolNameFromArguments(args) {
   if (keys.has("pattern")) return "Glob";
   if (keys.has("query")) return "WebSearch";
   if (keys.has("url")) return "WebFetch";
-  if (keys.has("patch")) return "ApplyPatch";
+  if (keys.has("patchText") || keys.has("patch")) return "ApplyPatch";
   if (keys.has("new_str") || keys.has("old_str")) return "Edit";
   if (keys.has("name") && keys.has("repo")) return ""; // MCP tool — can't infer which
   if (keys.has("paths")) return "ReadLints";

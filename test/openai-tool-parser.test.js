@@ -1161,3 +1161,138 @@ describe("Sieve+strip: orphan close tags split across chunks", () => {
     assert.ok(text.includes("for the response container."), "trailing prose should be present");
   });
 });
+
+/* ═══════════════════════════════════════════════════
+   JSON fence format (direction B migration)
+   ```json
+   [{"tool": "...", "arguments": {...}}]
+   ```
+   ═══════════════════════════════════════════════════ */
+
+describe("JSON fence format: parser fast path", () => {
+  it("parses a single tool call from ```json fence", () => {
+    const text = '```json\n[{"tool": "ReadFile", "arguments": {"file_path": "/src/main.py"}}]\n```';
+    const calls = parseToolCallsFromText(text, ALL_TOOLS);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].name, "ReadFile");
+    assert.equal(calls[0].input.file_path, "/src/main.py");
+  });
+
+  it("parses multiple tool calls from ```json fence", () => {
+    const text = '```json\n[\n  {"tool": "rg", "arguments": {"pattern": "handleChat", "path": "/project/src"}},\n  {"tool": "ReadFile", "arguments": {"file_path": "/project/src/routes.js", "offset": 40, "limit": 30}}\n]\n```';
+    const calls = parseToolCallsFromText(text, ALL_TOOLS);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].name, "rg");
+    assert.equal(calls[1].name, "ReadFile");
+    assert.equal(calls[0].input.pattern, "handleChat");
+    assert.equal(calls[1].input.offset, 40);
+  });
+
+  it("parses JSON fence without backtick fence (bare JSON array)", () => {
+    const text = '[{"tool": "Shell", "arguments": {"command": "npm test"}}]';
+    const calls = parseToolCallsFromText(text, ALL_TOOLS);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].name, "Shell");
+    assert.equal(calls[0].input.command, "npm test");
+  });
+
+  it("falls back to XML when JSON is invalid", () => {
+    // Invalid JSON but valid XML tool call
+    const text = '<tool_call name="Shell"><parameter name="command" string="true">ls</parameter></tool_call_name>';
+    const calls = parseToolCallsFromText(text, ALL_TOOLS);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].name, "Shell");
+  });
+
+  it("handles JSON with string arguments value", () => {
+    const text = '[{"tool": "Shell", "arguments": "{\\"command\\": \\"ls\\"}"}]';
+    const calls = parseToolCallsFromText(text, ALL_TOOLS);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].name, "Shell");
+  });
+
+  it("handles escaped newlines in JSON arguments", () => {
+    const text = '```json\n[{"tool": "ApplyPatch", "arguments": {"target_directory": "/project", "patchText": "--- a/src/main.py\\n+++ b/src/main.py\\n@@ -1,3 +1,4 @@\\n import os\\n+import sys"}}]\n```';
+    const calls = parseToolCallsFromText(text, ALL_TOOLS);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].name, "ApplyPatch");
+    assert.equal(calls[0].input.target_directory, "/project");
+    assert.ok(calls[0].input.patchText.includes("--- a/src/main.py"));
+  });
+
+  it("ignores non-tool JSON that lacks tool/arguments keys", () => {
+    const text = '```json\n{"message": "hello", "status": "ok"}\n```';
+    const calls = parseToolCallsFromText(text, ALL_TOOLS);
+    assert.equal(calls.length, 0);
+  });
+
+  it("passes through tools not in allowed list (model may have learned from conversation)", () => {
+    const text = '```json\n[{"tool": "UnknownTool", "arguments": {"x": 1}}]\n```';
+    const calls = parseToolCallsFromText(text, ALL_TOOLS);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].name, "UnknownTool");
+  });
+});
+
+describe("JSON fence format: sieve streaming", () => {
+  it("captures and parses JSON fence block from stream chunks", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    const events = [
+      ...sieve.push("Let me read the file.\n"),
+      ...sieve.push("```json\n[\n"),
+      ...sieve.push('  {"tool": "ReadFile", "arguments": {"file_path": "/src/main.py"}}\n'),
+      ...sieve.push("]\n"),
+      ...sieve.push("```"),
+      ...sieve.flush(),
+    ];
+    const toolEvents = events.filter(e => e.type === "tool_calls");
+    assert.equal(toolEvents.length, 1, `Expected 1 tool_calls event, got ${toolEvents.length}`);
+    assert.equal(toolEvents[0].calls.length, 1);
+    assert.equal(toolEvents[0].calls[0].name, "ReadFile");
+  });
+
+  it("does not capture non-json code fences as tool calls", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    const events = [
+      ...sieve.push("Here is some code:\n```python\nprint('hello')\n```\n"),
+      ...sieve.push("And now a tool call:\n```json\n"),
+      ...sieve.push('[{"tool": "Shell", "arguments": {"command": "ls"}}]\n'),
+      ...sieve.push("```"),
+      ...sieve.flush(),
+    ];
+    const toolEvents = events.filter(e => e.type === "tool_calls");
+    assert.equal(toolEvents.length, 1, "should only capture the json fence, not python fence");
+    assert.equal(toolEvents[0].calls[0].name, "Shell");
+  });
+
+  it("streams text before and after json fence block", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    const events = [
+      ...sieve.push("I'll search for the function.\n"),
+      ...sieve.push("```json\n[{"),
+      ...sieve.push('"tool": "rg", "arguments": {"pattern": "handle"}}]\n'),
+      ...sieve.push("```\n"),
+      ...sieve.push("Found it!"),
+      ...sieve.flush(),
+    ];
+    const text = events.filter(e => e.type === "text").map(e => e.text).join("");
+    assert.ok(text.includes("I'll search for the function."));
+    assert.ok(text.includes("Found it!"));
+    const toolEvents = events.filter(e => e.type === "tool_calls");
+    assert.equal(toolEvents.length, 1);
+  });
+
+  it("handles JSON fence split across many small chunks", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    const raw = '```json\n[{"tool": "Shell", "arguments": {"command": "echo hello"}}]\n```';
+    const events = [];
+    // Split into 5-character chunks
+    for (let i = 0; i < raw.length; i += 5) {
+      events.push(...sieve.push(raw.slice(i, i + 5)));
+    }
+    events.push(...sieve.flush());
+    const toolEvents = events.filter(e => e.type === "tool_calls");
+    assert.equal(toolEvents.length, 1, "should parse even when split across tiny chunks");
+    assert.equal(toolEvents[0].calls[0].name, "Shell");
+  });
+});

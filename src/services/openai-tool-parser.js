@@ -736,17 +736,19 @@ function cleanDeepSeekPatchFormat(patchText) {
 function fixApplyPatchArgs(input) {
   if (!input || typeof input !== "object") return input;
 
-  // Codex CLI format: { input: "*** Begin Patch\n..." }
-  // Codex uses a native format (*** Update File / *** Add File / @@ hunks) that
-  // is NOT unified diff. Preserve it as-is — do NOT convert through cleanDeepSeekPatchFormat
-  // which would destroy *** wrappers and inject ---/+++ headers.
-  if (!input.patch && typeof input.input === "string" && input.input.trim()) {
-    return { ...input, input: input.input.trim() };
-  }
+  // Determine which key holds the patch content — different clients use
+  // different names (patchText, patch, input).  Preserve the original key.
+  const patchKey = input.patchText ? "patchText"
+    : input.patch ? "patch"
+    : input.input ? "input"
+    : null;
+  const rawPatch = patchKey ? input[patchKey] : null;
+
+  if (!rawPatch && !patchKey) return input;
 
   const hasTargetDir = typeof input.target_directory === "string" && input.target_directory.trim();
-  const patch = input.patch;
-  if (typeof patch !== "string" || !patch.trim()) return input;
+  const patch = typeof rawPatch === "string" ? rawPatch : "";
+  if (!patch.trim()) return input;
 
   let targetDir = hasTargetDir ? input.target_directory.trim().replace(/\/$/, "") : "";
   let convertedPatch = patch;
@@ -837,7 +839,7 @@ function fixApplyPatchArgs(input) {
   return {
     ...input,
     target_directory: targetDir || input.target_directory || "",
-    patch: convertedPatch
+    [patchKey]: convertedPatch
   };
 }
 
@@ -1268,6 +1270,7 @@ function inferToolNameFromParams(params, allowedToolNames) {
   // Parameter name → candidate tool names (ordered by specificity)
   const HINTS = [
     { param: "command", tools: ["Shell", "Bash"] },
+    { param: "patchText", tools: ["ApplyPatch", "apply_patch"] },
     { param: "patch", tools: ["ApplyPatch", "apply_patch"] },
     { param: "pattern", tools: ["Glob"] },
     { param: "path", tools: ["ReadFile", "Read"] },
@@ -1925,6 +1928,77 @@ function filterAllowedToolCalls(calls, allowedToolNames) {
   return filtered;
 }
 
+/* ── JSON fence fast path ──
+ * Parses ```json [{tool: ..., arguments: ...}] ``` blocks.
+ * This is the PREFERRED format — the model already knows JSON from training.
+ * Returns null if the text doesn't look like a JSON tool call block. */
+function parseJsonFenceToolCalls(text, allowedToolNames) {
+  if (!text || !allowedToolNames?.length) return null;
+
+  // Extract JSON from optional ```json fence
+  let jsonText = text.trim();
+
+  // Strip ```json / ```JSON prefix
+  const fenceMatch = jsonText.match(/^```(?:json|JSON)\b\s*/);
+  if (fenceMatch) {
+    jsonText = jsonText.slice(fenceMatch[0].length);
+    // Strip trailing ```
+    const closeIdx = jsonText.lastIndexOf("```");
+    if (closeIdx >= 0) jsonText = jsonText.slice(0, closeIdx);
+  }
+
+  jsonText = jsonText.trim();
+  if (!jsonText.startsWith("[") && !jsonText.startsWith("{")) return null;
+
+  try {
+    const parsed = JSON.parse(jsonText);
+    const items = Array.isArray(parsed) ? parsed : [parsed];
+
+    const calls = [];
+    for (const item of items) {
+      if (!item || typeof item !== "object") continue;
+      const name = item.tool || item.name || "";
+      if (!name) continue;
+      // Prefer the exact casing from the allowed list, but still accept the
+      // call even if not found (model may have learned it from conversation
+      // history, and the outer filterAllowedToolCalls will handle it).
+      const resolvedName = findAllowedName(name, allowedToolNames) || name;
+      const args = item.arguments || item.input || item.args || {};
+      calls.push(buildParsedToolCall(resolvedName, typeof args === "string" ? args : JSON.stringify(args)));
+    }
+
+    if (calls.length) {
+      log.debug("parser", `JSON fence fast-path: ${calls.length} call(s) parsed`);
+      return calls;
+    }
+  } catch (_) {
+    // JSON.parse failed — likely unescaped literal newlines inside strings.
+    // fixJsonControlChars escapes \n \r \t inside JSON strings.
+    try {
+      const fixed = fixJsonControlChars(jsonText);
+      const parsed = JSON.parse(fixed);
+      const items = Array.isArray(parsed) ? parsed : [parsed];
+      const calls = [];
+      for (const item of items) {
+        if (!item || typeof item !== "object") continue;
+        const name = item.tool || item.name || "";
+        if (!name) continue;
+        const resolvedName = findAllowedName(name, allowedToolNames) || name;
+        const args = item.arguments || item.input || item.args || {};
+        calls.push(buildParsedToolCall(resolvedName, typeof args === "string" ? args : JSON.stringify(args)));
+      }
+      if (calls.length) {
+        log.debug("parser", `JSON fence fast-path (after fixJsonControlChars): ${calls.length} call(s) parsed`);
+        return calls;
+      }
+    } catch (_2) {
+      // Still invalid — fall through to XML parsing
+    }
+  }
+
+  return null;
+}
+
 export function parseToolCallsFromText(text, allowedToolNames = []) {
   const rawSource = toStringSafe(text);
   if (!rawSource.trim()) {
@@ -1953,6 +2027,10 @@ export function parseToolCallsFromText(text, allowedToolNames = []) {
     .replace(/<\/?think\b[^>]*>/gi, '')
     .replace(/<\/?thinking\b[^>]*>/gi, '')
     .replace(/\[proxy\]<\/think\s*>/gi, '');
+
+  // JSON fence fast path — try before XML parsing (the model knows JSON natively)
+  const jsonCalls = parseJsonFenceToolCalls(thinkStripped, allowedToolNames);
+  if (jsonCalls) return jsonCalls;
 
   // Fast-path: if the think-stripped text has none of the known garbled XML
   // patterns that Steps 1.5–1.7 fix, parse directly and skip 7 string.replace

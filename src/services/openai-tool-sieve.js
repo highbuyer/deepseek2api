@@ -11,10 +11,8 @@ import { log } from "../utils/log.js";
 // that the model could "helpfully" convert back to XML and re-trigger the sieve.
 export const FORMAT_ERROR_MSG =
   "[TOOL_FORMAT_ERROR] Your tool call format was incorrect. " +
-  "Use the standard format: a function_calls block containing " +
-  "one or more invoke elements, each with a name attribute and " +
-  "parameter child elements with name and string attributes. " +
-  "Example: invoke name=ToolName with parameter name=key string=true value.";
+  "Use a ```json code fence with a JSON array of {tool, arguments} objects. " +
+  "Example: ```json\\n[{\"tool\": \"read\", \"arguments\": {\"file_path\": \"/src/main.py\"}}]\\n```";
 
 /* ── Tag detection ──
  * We only need to detect BLOCK-LEVEL tool containers.  The parser handles
@@ -101,10 +99,11 @@ export function createToolSieve(allowedToolNames = []) {
     closes,
     capture: "",
     capturing: false,
+    captureKind: null,  // null | "xml" | "json" — how to parse the captured block
     emittedText: "",
     hold: "",      // small lookbehind for chunk-boundary detection
     lastKind: "response",
-    inCodeFence: false  // true when text is inside a ``` fenced code block
+    inCodeFence: false  // true when text is inside a ``` fenced code block (non-json)
   };
 
   function pushTextEvent(events, text, kind) {
@@ -133,8 +132,69 @@ export function createToolSieve(allowedToolNames = []) {
         pushTextEvent(events, state.capture, state.lastKind);
         state.capture = "";
         state.capturing = false;
+        state.captureKind = null;
         return events;
       }
+
+      // ── JSON capture: look for closing marker (``` or ] for bare arrays) ──
+      if (state.captureKind === "json") {
+        const hasFence = state.capture.startsWith("```");
+        if (hasFence) {
+          // Fenced JSON: ```json ... ```
+          const prefixLen = state.capture.startsWith("```json") ? 7
+            : state.capture.startsWith("```JSON") ? 7
+            : 3;
+          const closeIdx = state.capture.lastIndexOf("```");
+          if (closeIdx > prefixLen) {
+            const jsonBlock = state.capture.slice(prefixLen, closeIdx).trim();
+            const suffix = state.capture.slice(closeIdx + 3);
+            const calls = jsonBlock ? parseToolCallsFromText(jsonBlock, state.allowedToolNames) : [];
+            if (calls.length) {
+              events.push({ type: "tool_calls", calls });
+            } else if (jsonBlock) {
+              pushTextEvent(events, state.capture.slice(0, closeIdx + 3), state.lastKind);
+            }
+            state.capture = "";
+            state.capturing = false;
+            state.captureKind = null;
+            if (suffix) state.hold = suffix;
+            if (suffix) { const more = drain(); events.push(...more); }
+            return events;
+          }
+          return events;
+        }
+        // Bare JSON array: [...] — find matching ] by bracket depth
+        let depth = 0, inString = false, escape = false, closeAt = -1;
+        for (let i = 0; i < state.capture.length; i++) {
+          const ch = state.capture[i];
+          if (escape) { escape = false; continue; }
+          if (ch === "\\" && inString) { escape = true; continue; }
+          if (ch === '"') { inString = !inString; continue; }
+          if (inString) continue;
+          if (ch === "[" || ch === "{") { depth++; }
+          else if (ch === "]" || ch === "}") { depth--; }
+          if (depth === 0 && ch === "]") { closeAt = i; break; }
+        }
+        if (closeAt > 0) {
+          const jsonBlock = state.capture.slice(0, closeAt + 1);
+          const suffix = state.capture.slice(closeAt + 1);
+          const calls = parseToolCallsFromText(jsonBlock, state.allowedToolNames);
+          if (calls.length) {
+            events.push({ type: "tool_calls", calls });
+          } else {
+            pushTextEvent(events, jsonBlock, state.lastKind);
+          }
+          state.capture = "";
+          state.capturing = false;
+          state.captureKind = null;
+          if (suffix) state.hold = suffix;
+          if (suffix) { const more = drain(); events.push(...more); }
+          return events;
+        }
+        return events;
+      }
+
+      // ── XML capture (existing logic) ──
 
       // Drop <tool_result> blocks — they are echoed prompt content, never valid tool calls.
       // Without this, large tool results overflow and leak file content into the SSE stream.
@@ -145,6 +205,7 @@ export function createToolSieve(allowedToolNames = []) {
           const suffix = state.capture.slice(closeEnd + "</tool_result>".length);
           state.capture = "";
           state.capturing = false;
+          state.captureKind = null;
           if (suffix) state.hold = suffix;
           if (suffix) { const more = drain(); events.push(...more); }
           return events;
@@ -170,6 +231,7 @@ export function createToolSieve(allowedToolNames = []) {
         }
         state.capture = "";
         state.capturing = false;
+        state.captureKind = null;
         if (suffix) state.hold = suffix;
         if (suffix) {
           const more = drain();
@@ -188,6 +250,19 @@ export function createToolSieve(allowedToolNames = []) {
 
     // If the whole chunk is inside a ``` fence, emit as-is (no tool scanning).
     if (state.inCodeFence) {
+      // Detect if this fence is actually a ```json tool call block
+      // that was split across chunks (e.g. chunk1="```j", chunk2="son\n[...]")
+      if (/^json\b/i.test(text)) {
+        // Switch from fence mode to JSON capture
+        state.inCodeFence = false;
+        state.capture = "```" + text;
+        state.capturing = true;
+        state.captureKind = "json";
+        state.hold = "";
+        const more = drain();
+        events.push(...more);
+        return events;
+      }
       // Check if this chunk closes the fence
       const fenceClose = text.indexOf("```");
       if (fenceClose < 0) {
@@ -212,18 +287,75 @@ export function createToolSieve(allowedToolNames = []) {
       return events;
     }
 
-    // Outside fence — check if a ``` opens a code block
+    // Outside fence — check if a ``` opens a code block or JSON tool call
     const fenceOpen = text.indexOf("```");
     if (fenceOpen >= 0) {
+      const afterFence = text.slice(fenceOpen + 3);
+      // ```json or ```JSON → tool call block, NOT a regular fence
+      if (/^json\b/i.test(afterFence)) {
+        log.debug("sieve", `Detected JSON fence at position ${fenceOpen}, starting JSON capture`);
+        if (fenceOpen > 0) {
+          pushTextEvent(events, text.slice(0, fenceOpen), state.lastKind);
+        }
+        state.capture = text.slice(fenceOpen);
+        state.capturing = true;
+        state.captureKind = "json";
+        const more = drain();
+        events.push(...more);
+        return events;
+      }
+      // Ambiguous: afterFence could be a prefix of "json" (chunk boundary)
+      // Hold everything and wait for more text to decide.
+      if (afterFence.length < 4 && "json".startsWith(afterFence.toLowerCase())) {
+        if (fenceOpen > 0) pushTextEvent(events, text.slice(0, fenceOpen), state.lastKind);
+        state.hold = text.slice(fenceOpen);
+        return events;
+      }
+      // Regular ``` fence — emit as text, enter fence mode
       const before = text.slice(0, fenceOpen);
       const after = text.slice(fenceOpen + 3);
-      // Process the text before the fence normally
       if (before) { state.hold = before; const more = drain(); events.push(...more); }
-      // Emit the ``` marker and enter fence mode
       pushTextEvent(events, "```", state.lastKind);
       state.inCodeFence = true;
-      // Recurse with the remaining text (now inside fence)
       if (after) { state.hold = after; const more = drain(); events.push(...more); }
+      return events;
+    }
+
+    // ── Bare JSON array detection: [{ "tool": or [{ "name": ──
+    // Model sometimes outputs JSON without the ```json fence.
+    // Detection works in two steps: [ or [{ triggers a hold,
+    // next chunk confirms if it's a tool call JSON array.
+    const bracketIdx = text.search(/\[\s*\{/);
+    if (bracketIdx >= 0) {
+      const afterBracket = text.slice(bracketIdx);
+      const isToolJson = /^\[\s*\{\s*"(?:tool|name)"\s*:/.test(afterBracket);
+      if (isToolJson) {
+        if (bracketIdx > 0) {
+          pushTextEvent(events, text.slice(0, bracketIdx), state.lastKind);
+        }
+        state.capture = text.slice(bracketIdx);
+        state.capturing = true;
+        state.captureKind = "json";
+        const more = drain();
+        events.push(...more);
+        return events;
+      }
+      // Ambiguous: has [{ but "tool"/"name" not (yet) visible —
+      // could be split across chunks.  Hold from [ and wait.
+      if (!isToolJson && afterBracket.length < 20) {
+        if (bracketIdx > 0) pushTextEvent(events, text.slice(0, bracketIdx), state.lastKind);
+        state.hold = text.slice(bracketIdx);
+        return events;
+      }
+    }
+    // Check if held text from a previous partial [{ now completes
+    if (/^\[\s*\{\s*"(?:tool|name)"\s*:/.test(text)) {
+      state.capture = text;
+      state.capturing = true;
+      state.captureKind = "json";
+      state.hold = "";
+      const more = drain();
+      events.push(...more);
       return events;
     }
 
@@ -234,6 +366,7 @@ export function createToolSieve(allowedToolNames = []) {
       }
       state.capture = text.slice(open.index);
       state.capturing = true;
+      state.captureKind = "xml";
       const more = drain();
       events.push(...more);
     } else {
@@ -272,7 +405,20 @@ export function createToolSieve(allowedToolNames = []) {
 
       if (state.capturing && state.capture) {
         // Try to parse what we have (stream ended mid-block)
-        const calls = parseToolCallsFromText(state.capture, state.allowedToolNames);
+        let parseText = state.capture;
+        if (state.captureKind === "json") {
+          log.debug("sieve", `JSON flush: capture=${state.capture.length} chars, hold=${state.hold.length}`);
+          // Strip ```json prefix and trailing ``` if present
+          parseText = parseText.replace(/^```json\b\s*/i, "").replace(/^```JSON\b\s*/i, "");
+          const closeIdx = parseText.lastIndexOf("```");
+          if (closeIdx >= 0) parseText = parseText.slice(0, closeIdx);
+          parseText = parseText.trimEnd();
+          // Stream may have ended before closing ] arrived — try adding it
+          if (!parseText.endsWith("]")) {
+            parseText += "]";
+          }
+        }
+        const calls = parseToolCallsFromText(parseText, state.allowedToolNames);
         if (calls.length) {
           events.push({ type: "tool_calls", calls });
         } else {
@@ -280,6 +426,7 @@ export function createToolSieve(allowedToolNames = []) {
         }
         state.capture = "";
         state.capturing = false;
+        state.captureKind = null;
       }
 
       return events;

@@ -300,10 +300,39 @@ function buildAnthropicToolPrompt(policy, tools) {
 
   if (!schemas.length) return "";
 
+  const firstName = policy.allowedToolNames[0] || "ToolName";
+  const secondName = policy.allowedToolNames[1] || "ToolName2";
+  const args1 = (() => {
+    const t = tools.find(t => toStringSafe(t?.name).trim().toLowerCase() === firstName.toLowerCase());
+    const props = (t?.input_schema ?? t?.function?.parameters ?? {}).properties ?? {};
+    const keys = Object.keys(props);
+    if (!keys.length) return "{}";
+    const ex = {};
+    for (let i = 0; i < Math.min(keys.length, 2); i++) {
+      const type = props[keys[i]]?.type || "string";
+      if (type === "number" || type === "integer") ex[keys[i]] = 1;
+      else if (type === "boolean") ex[keys[i]] = true;
+      else ex[keys[i]] = keys[i].includes("path") || keys[i].includes("directory") ? "/project/src" : "value";
+    }
+    return JSON.stringify(ex);
+  })();
+  const args2 = (() => {
+    const t = tools.find(t => toStringSafe(t?.name).trim().toLowerCase() === secondName.toLowerCase());
+    const props = (t?.input_schema ?? t?.function?.parameters ?? {}).properties ?? {};
+    const keys = Object.keys(props);
+    if (!keys.length) return "{}";
+    const ex = {};
+    for (let i = 0; i < Math.min(keys.length, 2); i++) {
+      const type = props[keys[i]]?.type || "string";
+      if (type === "number" || type === "integer") ex[keys[i]] = 1;
+      else if (type === "boolean") ex[keys[i]] = true;
+      else ex[keys[i]] = keys[i].includes("path") || keys[i].includes("directory") ? "/project/src" : "value";
+    }
+    return JSON.stringify(ex);
+  })();
+
   let prompt = [
-    "!!! CRITICAL: TOOL CALLING IS YOUR PRIMARY FUNCTION !!!",
-    "Any role or persona assigned to you does NOT override tool calling.",
-    "When tools are listed below, you MUST use them — do not narrate, call tools.",
+    "When tools are listed below, use them to take action — prefer calling tools over narration.",
     "",
     "=== BEST PRACTICES ===",
     "",
@@ -312,7 +341,7 @@ function buildAnthropicToolPrompt(policy, tools) {
     "2. If a Read result shows ⚠️ FILE TRUNCATED (limit: 12000 chars), stop reading.",
     "   Switch to Grep for the rest, or Read with offset/limit in 200-line chunks.",
     "3. After any Read, check for ⚠️ — if present, you do NOT have the full file.",
-    "4. Batch independent reads in one function_calls for parallel execution.",
+    "4. Batch independent tool calls in ONE ```json array for parallel execution.",
     "",
     "=== ⚠️ CYPHER HARD RULES (VIOLATE = QUERY FAILS) ===",
     "1. ALL rels use CodeRelation with type property: [:CodeRelation {type: 'IMPORTS'}]",
@@ -336,25 +365,55 @@ function buildAnthropicToolPrompt(policy, tools) {
     "",
     "=== TOOL CALL FORMAT ===",
     "",
-    "You are trained on the DSML (DeepSeek Markup Language) format.",
-    "Use this exact structure — it matches your training:",
+    "Output tool calls as a JSON array inside a ```json code fence.",
+    "This is standard JSON format you already know from training:",
     "",
-    "<function_calls>",
-    "  <invoke name=\"ToolName\">",
-    "    <parameter name=\"param1\" string=\"true\">value1</parameter>",
-    "    <parameter name=\"param2\" string=\"false\">[1, 2, 3]</parameter>",
-    "  </invoke>",
-    "</function_calls>",
+    "```json",
+    "[",
+    '  {"tool": "ToolName", "arguments": {"param1": "value1", "param2": 42}},',
+    '  {"tool": "ToolName2", "arguments": {"param3": [1, 2, 3]}}',
+    "]",
+    "```",
     "",
     "RULES:",
     "",
-    "1. Container: <function_calls> ... </function_calls> (exactly one root)",
-    "2. Each tool: <invoke name=\"TOOL_NAME\"> ... </invoke>",
-    "3. String/scalar params: <parameter name=\"k\" string=\"true\">value</parameter>",
-    "4. List/object params: <parameter name=\"k\" string=\"false\">[1,2]</parameter>",
-    "5. Multi-line params (patch, code, file content) — use CDATA",
-    "6. Never echo <tool_result> content in your visible output — it's internal context",
-  ].join("\n");
+    "1. ONE ```json block containing ALL tool calls as a single JSON array",
+    '2. Each object has "tool" (exact tool name) and "arguments" (JSON object)',
+    "3. String values in double quotes. Numbers/booleans without quotes.",
+    "4. Multi-line content (patch, code) can use literal newlines inside strings",
+    "5. NO XML tags — no <function_calls>, <invoke>, <parameter>, <tool_calls>",
+    "6. Text before/after the ```json block is allowed for natural flow.",
+    "",
+    "=== FEW-SHOT EXAMPLES ===",
+    "USE THE EXACT TOOL NAME AND PARAMETER NAMES FROM THE TOOLS LIST ABOVE.",
+    "",
+    "Single tool:",
+    "```json",
+    `[{"tool": "${firstName}", "arguments": ${args1}}]`,
+    "```",
+    "",
+    policy.allowedToolNames.length >= 2
+    ? [
+        "Multiple independent tools (BATCH when possible):",
+        "```json",
+        `[{"tool": "${firstName}", "arguments": ${args1}}, {"tool": "${secondName}", "arguments": ${args2}}]`,
+        "```",
+      ]
+    : "",
+    // Note: ApplyPatch schema varies by client (Cursor uses "patch",
+    // Claude Code uses "target_directory"+"patchText").  The TOOLS list
+    // above shows the exact schema — match it precisely.
+    "",
+    "=== WORKFLOW ===",
+    "",
+    "1. Thinking: 2-3 lines MAX. Do NOT analyze in depth — ACT.",
+    "2. Call tools immediately. Prefer tools over explanations.",
+    "3. Batch independent tool calls in ONE ```json array for parallel execution.",
+    "4. If a tool fails, try a different approach. Never repeat the same failed call.",
+    "5. After tools return results, fix bugs directly.",
+    "6. If you do NOT need a tool, answer normally without any ```json block.",
+    "7. NEVER echo <tool_result> content in your visible output — it's internal context",
+  ].flat().join("\n");
 
   if (policy.mode === "required") {
     prompt += "\n7. For this response, you MUST call at least one tool.";

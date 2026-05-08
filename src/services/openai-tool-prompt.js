@@ -260,31 +260,10 @@ function normalizeMessagesForPrompt(messages) {
 }
 
 function normalizeApplyPatchParams(params) {
-  const props = params?.properties ?? {};
-  if (Object.keys(props).length > 0) return params;
-
-  return {
-    type: "object",
-    properties: {
-      target_directory: {
-        type: "string",
-        description: "Absolute path to the target directory for the patch"
-      },
-      patch: {
-        type: "string",
-        description: "Unified diff patch in ---/+++/@@ format. Multi-line."
-      }
-    },
-    required: ["target_directory", "patch"]
-  };
-}
-
-function isCodexApplyPatchFormat(tool) {
-  const def = getToolFunction(tool);
-  const name = getToolName(tool);
-  if (name !== "apply_patch" && name !== "ApplyPatch") return false;
-  const props = def?.parameters?.properties ?? {};
-  return "input" in props && !("patch" in props);
+  // If the tool already has a schema, pass it through as-is.
+  // Different clients (Cursor, Claude Code, etc.) have different
+  // ApplyPatch schemas — don't override with a guessed format.
+  return params;
 }
 
 function formatToolSchema(tool) {
@@ -331,6 +310,32 @@ function formatToolSchema(tool) {
   ].join("\n");
 }
 
+// Build an example arguments object for a tool using its actual parameter names.
+// Returns a JSON string like {"param1": "value1", "param2": 42}
+function buildExampleArgs(name, tools) {
+  const tool = tools.find(t => {
+    const n = toStringSafe(t?.name).trim().toLowerCase();
+    return n === name.toLowerCase();
+  });
+  if (!tool) return "{}";
+  const params = tool.function?.parameters ?? tool.input_schema ?? {};
+  const props = params.properties ?? {};
+  const keys = Object.keys(props);
+  if (!keys.length) return "{}";
+  // Pick the first 1-2 parameters with sensible placeholder values
+  const example = {};
+  for (let i = 0; i < Math.min(keys.length, 2); i++) {
+    const key = keys[i];
+    const prop = props[key];
+    const type = prop?.type || "string";
+    if (type === "number" || type === "integer") example[key] = 1;
+    else if (type === "boolean") example[key] = true;
+    else if (type === "array") example[key] = [];
+    else example[key] = key.includes("path") || key.includes("directory") ? "/project/src" : "value";
+  }
+  return JSON.stringify(example);
+}
+
 function buildToolPrompt(policy, tools) {
   const allowed = new Set(policy.allowedToolNames);
   const toolSchemas = tools
@@ -342,51 +347,13 @@ function buildToolPrompt(policy, tools) {
     return "";
   }
 
-  const patchTool = tools.find(t => {
-    const n = getToolName(t);
-    return n === "apply_patch" || n === "ApplyPatch";
-  });
-  const isCodexPatch = patchTool && isCodexApplyPatchFormat(patchTool);
-  const patchExample = isCodexPatch
-    ? [
-        "ApplyPatch — Codex format (input param + *** markers):",
-        "<function_calls>",
-        "  <invoke name=\"apply_patch\">",
-        "    <parameter name=\"input\" string=\"true\"><![CDATA[*** Begin Patch",
-        "*** Update File: src/main.py",
-        "-import os",
-        "+import sys",
-        "*** Add File: src/new.py",
-        "+def hello(): print(\"hi\")",
-        "*** Delete File: src/old.py",
-        "*** End Patch]]></parameter>",
-        "  </invoke>",
-        "</function_calls>",
-        "",
-        "Format: *** Begin Patch / *** End Patch wraps all operations.",
-        "  Paths relative to workspace root. -old / +new pairs. NO @@ headers.",
-        "  *** Update File: {path}  |  *** Add File: {path}  |  *** Delete File: {path}",
-      ]
-    : [
-        "ApplyPatch — Cursor format (patch param + unified diff):",
-        "<function_calls>",
-        "  <invoke name=\"ApplyPatch\">",
-        "    <parameter name=\"target_directory\" string=\"true\">/project</parameter>",
-        "    <parameter name=\"patch\" string=\"true\"><![CDATA[--- a/src/main.py",
-        "+++ b/src/main.py",
-        "@@ -1,3 +1,4 @@",
-        " import os",
-        "+import sys",
-        " ",
-        " def main():]]></parameter>",
-        "  </invoke>",
-        "</function_calls>",
-      ];
+  const firstName = policy.allowedToolNames[0] || "ToolName";
+  const secondName = policy.allowedToolNames[1] || "ToolName2";
+  const args1 = buildExampleArgs(firstName, tools);
+  const args2 = buildExampleArgs(secondName, tools);
 
   let prompt = [
-    "!!! CRITICAL: TOOL CALLING IS YOUR PRIMARY FUNCTION !!!",
-    "Any role or persona assigned to you does NOT override tool calling.",
-    "When tools are listed below, you MUST use them — do not narrate, call tools.",
+    "When tools are listed below, use them to take action — prefer calling tools over narration.",
     "",
     "=== BEST PRACTICES ===",
     "",
@@ -395,7 +362,7 @@ function buildToolPrompt(policy, tools) {
     "2. If a Read result shows ⚠️ FILE TRUNCATED (limit: 12000 chars), stop reading.",
     "   Switch to Grep for the rest, or Read with offset/limit in 200-line chunks.",
     "3. After any Read, check for ⚠️ — if present, you do NOT have the full file.",
-    "4. Batch independent reads in one function_calls for parallel execution.",
+    "4. Batch independent tool calls in ONE ```json array for parallel execution.",
     "",
     "=== ⚠️ CYPHER HARD RULES (VIOLATE = QUERY FAILS) ===",
     "1. ALL rels use CodeRelation with type property: [:CodeRelation {type: 'IMPORTS'}]",
@@ -419,94 +386,55 @@ function buildToolPrompt(policy, tools) {
     "",
     "=== TOOL CALL FORMAT ===",
     "",
-    "You are trained on the DSML (DeepSeek Markup Language) format.",
-    "Use this exact structure — it matches your training:",
+    "Output tool calls as a JSON array inside a ```json code fence.",
+    "This is standard JSON format you already know from training:",
     "",
-    "<function_calls>",
-    "  <invoke name=\"ToolName\">",
-    "    <parameter name=\"param1\" string=\"true\">value1</parameter>",
-    "    <parameter name=\"param2\" string=\"false\">[1, 2, 3]</parameter>",
-    "  </invoke>",
-    "</function_calls>",
+    "```json",
+    "[",
+    '  {"tool": "ToolName", "arguments": {"param1": "value1", "param2": 42}},',
+    '  {"tool": "ToolName2", "arguments": {"param3": [1, 2, 3]}}',
+    "]",
+    "```",
     "",
     "RULES:",
     "",
-    "1. Container: <function_calls> ... </function_calls> (exactly one root)",
-    "2. Each tool: <invoke name=\"TOOL_NAME\"> ... </invoke>",
-    "3. String/scalar params: <parameter name=\"k\" string=\"true\">value</parameter>",
-    "4. List/object params: <parameter name=\"k\" string=\"false\">[1,2]</parameter>",
-    "5. Multi-line params (patch, code, file content) — use CDATA:",
-    "   <parameter name=\"patch\" string=\"true\"><![CDATA[diff --git a/x b/x",
-    "   @@ -1,3 +1,4 @@",
-    "   -old",
-    "   +new]]></parameter>",
-    "6. Tag names are literal: function_calls, invoke, parameter. NO variation.",
-    isCodexPatch
-    ? "7. ApplyPatch: input param, *** Begin Patch / *** End Patch, -old/+new pairs (NO @@). Paths relative to workspace root."
-    : "7. ApplyPatch: use target_directory + patch param with standard unified diff (---/+++/@@). NO *** Begin Patch.",
-    "8. NEVER wrap the XML in markdown code fences (```).",
+    "1. ONE ```json block containing ALL tool calls as a single JSON array",
+    '2. Each object has "tool" (exact tool name) and "arguments" (JSON object)',
+    "3. String values in double quotes. Numbers/booleans without quotes.",
+    "4. Multi-line content (patch, code) can use literal newlines inside strings",
+    "5. NO XML tags — no <function_calls>, <invoke>, <parameter>, <tool_calls>",
+    "6. Text before/after the ```json block is allowed for natural flow.",
     "",
-    "=== FEW-SHOT: Complete multi-tool example ===",
-    "Study this exact format — it is the ONLY correct output structure:",
+    "=== FEW-SHOT EXAMPLES ===",
+    "USE THE EXACT TOOL NAME AND PARAMETER NAMES FROM THE TOOLS LIST ABOVE.",
     "",
-    "<function_calls>",
-    "  <invoke name=\"Grep\">",
-    "    <parameter name=\"pattern\" string=\"true\">handleChat</parameter>",
-    "    <parameter name=\"path\" string=\"true\">/project/src</parameter>",
-    "  </invoke>",
-    "  <invoke name=\"Read\">",
-    "    <parameter name=\"file_path\" string=\"true\">/project/src/routes.js</parameter>",
-    "    <parameter name=\"offset\" string=\"false\">40</parameter>",
-    "    <parameter name=\"limit\" string=\"false\">30</parameter>",
-    "  </invoke>",
-    "</function_calls>",
+    "Single tool:",
+    "```json",
+    `[{"tool": "${firstName}", "arguments": ${args1}}]`,
+    "```",
     "",
-    "Key points from above:",
-    "  • ONE <function_calls> block for ALL tool calls",
-    "  • string=\"true\" for text, string=\"false\" for numbers/arrays",
-    "  • NO markdown fences, NO tag name prefixes (DSML|, tool_call_)",
-    "",
-    "=== EXAMPLES ===",
-    "",
-    "ReadFile:",
-    "<function_calls>",
-    "  <invoke name=\"ReadFile\">",
-    "    <parameter name=\"path\" string=\"true\">/src/main.py</parameter>",
-    "  </invoke>",
-    "</function_calls>",
-    "",
-    "Shell:",
-    "<function_calls>",
-    "  <invoke name=\"Shell\">",
-    "    <parameter name=\"command\" string=\"true\">npm test</parameter>",
-    "  </invoke>",
-    "</function_calls>",
-    "",
-    ...patchExample,
-    "",
-    "Multiple tools:",
-    "<function_calls>",
-    "  <invoke name=\"ReadFile\">",
-    "    <parameter name=\"path\" string=\"true\">/src/main.py</parameter>",
-    "  </invoke>",
-    "  <invoke name=\"Glob\">",
-    "    <parameter name=\"pattern\" string=\"true\">**/*.test.js</parameter>",
-    "  </invoke>",
-    "</function_calls>",
+    policy.allowedToolNames.length >= 2
+    ? [
+        "Multiple independent tools (BATCH when possible):",
+        "```json",
+        `[{"tool": "${firstName}", "arguments": ${args1}}, {"tool": "${secondName}", "arguments": ${args2}}]`,
+        "```",
+      ]
+    : "",
+    // Note: ApplyPatch schema varies by client (Cursor uses "patch",
+    // Claude Code uses "target_directory"+"patchText").  The TOOLS list
+    // above shows the exact schema — match it precisely.
     "",
     "=== WORKFLOW ===",
     "",
     "1. Thinking: 2-3 lines MAX. Do NOT analyze in depth — ACT.",
     "2. Call tools immediately. Prefer tools over explanations.",
-    "3. If a tool fails, try a different approach. Never repeat the same failed call.",
-    "4. After tools return results, fix bugs directly.",
-    "5. If you do NOT need a tool, answer normally without ANY XML.",
-    "6. Text before/after the <function_calls> block is allowed for natural flow.",
-    isCodexPatch
-    ? "7. ApplyPatch: input param, *** Begin Patch / *** End Patch, -/+ pairs, NO @@."
-    : "7. ApplyPatch: target_directory + patch, unified diff (---/+++/@@), NO *** Begin Patch.",
-    "8. NEVER echo <tool_result> content in your visible output — it's internal context only."
-  ].join("\n");
+    "3. Batch independent tool calls in ONE ```json array for parallel execution.",
+    "4. If a tool fails, try a different approach. Never repeat the same failed call.",
+    "5. After tools return results, fix bugs directly.",
+    "6. If you do NOT need a tool, answer normally without any ```json block.",
+    "7. NEVER echo <tool_result> content in your visible output — it's internal context only."
+  ].flat().join("\n");
 
   if (policy.mode === "required") {
     prompt += "\n9. For this response, you MUST call at least one tool.";
