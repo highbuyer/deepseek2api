@@ -1310,4 +1310,75 @@ describe("JSON fence format: sieve streaming", () => {
     assert.equal(toolEvents.length, 1, "should parse even when split across tiny chunks");
     assert.equal(toolEvents[0].calls[0].name, "Shell");
   });
+
+  it("emits format_error for empty nested <tool_calls> tags", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    const events = [
+      ...sieve.push("Let me do the task.\n"),
+      ...sieve.push("<tool_calls>\n<tool_calls>\n  <tool_calls>\n    <tool_calls>\n"),
+      ...sieve.push("</tool_calls>"),
+      ...sieve.flush(),
+    ];
+    const formatErrors = events.filter(e => e.type === "format_error");
+    assert.equal(formatErrors.length, 1, "should emit exactly one format_error for empty nested tags");
+    const toolEvents = events.filter(e => e.type === "tool_calls");
+    assert.equal(toolEvents.length, 0, "should not emit tool_calls for empty nested tags");
+    // Text before the empty tags should still be emitted
+    const text = events.filter(e => e.type === "text").map(e => e.text).join("");
+    assert.ok(text.includes("Let me do the task."));
+  });
+
+  it("does NOT emit format_error when tags contain real content", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    const events = [
+      ...sieve.push("<tool_calls>\n<invoke name=\"Shell\">\n<parameter name=\"command\">echo hi</parameter>\n</invoke>\n</tool_calls>"),
+      ...sieve.flush(),
+    ];
+    const formatErrors = events.filter(e => e.type === "format_error");
+    assert.equal(formatErrors.length, 0, "should not emit format_error for valid tool calls");
+    const toolEvents = events.filter(e => e.type === "tool_calls");
+    assert.equal(toolEvents.length, 1, "should parse valid tool calls correctly");
+  });
+
+  it("emits only one format_error per stream (formatErrorEmitted flag)", () => {
+    const sieve = createToolSieve(ALL_TOOLS);
+    let events = [];
+    // Simulate two separate garbled tool blocks (model keeps retrying)
+    events.push(...sieve.push("<tool_calls>\n<tool_calls>\n</tool_calls>"));
+    events.push(...sieve.push("Let me try again.\n"));
+    events.push(...sieve.push("<tool_calls>\n<tool_calls>\n</tool_calls>"));
+    events.push(...sieve.flush());
+    const formatErrors = events.filter(e => e.type === "format_error");
+    assert.equal(formatErrors.length, 1, "should emit only one format_error per stream");
+  });
+
+  it("flushes thinking-phase capture on kind switch to response", () => {
+    // Simulates: model mentions a tool name during reasoning (e.g. "<bash"),
+    // which starts XML capture.  Response then outputs empty <tool_calls>.
+    // The kind-switch should flush the thinking capture so the response
+    // <tool_calls> is detected independently.
+    const sieve = createToolSieve(ALL_TOOLS);
+    let events = [];
+
+    // Thinking phase: model mentions "I'll use <bash tool to check"
+    // The "<bash" triggers capture
+    events.push(...sieve.push("<think>\n", "thinking"));
+    events.push(...sieve.push("I'll use the bash tool to check.\n", "thinking"));
+    events.push(...sieve.push("</think>", "thinking"));
+
+    // Switch to response — this should flush the thinking capture
+    // and start fresh for response text
+    events.push(...sieve.push("\n<tool_calls>\n<tool_calls>\n</tool_calls>", "response"));
+
+    events.push(...sieve.flush());
+
+    // Should emit format_error for the response's empty <tool_calls>
+    const formatErrors = events.filter(e => e.type === "format_error");
+    assert.equal(formatErrors.length, 1, "should emit format_error for response empty tags after kind switch");
+
+    // Thinking text (including the captured <bash fragment) should be in text output
+    const text = events.filter(e => e.type === "text").map(e => e.text).join("");
+    assert.ok(text.includes("I'll use the bash tool"));
+    assert.ok(text.includes("<think>"));
+  });
 });

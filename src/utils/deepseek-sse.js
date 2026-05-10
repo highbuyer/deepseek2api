@@ -103,14 +103,15 @@ function extractFragmentText(payload) {
 }
 
 export function createDeepseekDeltaDecoder() {
-  let currentKind = "response";
+  let currentKind = "thinking";
 
   return {
     consume(payloadText) {
       const payload = JSON.parse(payloadText);
-      currentKind = resolveCurrentKind(payload, currentKind);
+      const resolved = resolveCurrentKind(payload, currentKind);
       const text = extractFragmentText(payload);
-      return { kind: currentKind, text };
+      currentKind = resolved;
+      return { kind: resolved, text };
     }
   };
 }

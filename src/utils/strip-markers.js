@@ -40,6 +40,12 @@ const BLOCK_STRIP_PATTERNS = Object.freeze([
   /<(?:think|thinking)\b[^>]*>[\s\S]*?<\/(?:think|thinking)\s*>/gi,
   /<(?:tool_calls)\b[^>]*>[\s\S]*?<\/(?:tool_calls)\s*>/gi,
   /<(?:function_calls)\b[^>]*>[\s\S]*?<\/(?:function_calls)\s*>/gi,
+  // Individual tool-call blocks: when the sieve replays a failed parse as
+  // text, invoke/tool_call/function_call must be STRIPPED ENTIRELY (tag +
+  // content), not just tag-stripped.  Tag-only removal leaves parameter
+  // values (file paths, search patterns) visible to the user.
+  /<(?:invoke|tool_use)\b[^>]*>[\s\S]*?<\/(?:invoke|tool_use)\s*>/gi,
+  /<(?:tool_call|function_call)\b[^>]*>[\s\S]*?<\/(?:tool_call|function_call)\s*>/gi,
 ]);
 
 /* Substrings that hint at any leak token.  Keeps the fast-path cheap:
@@ -47,7 +53,7 @@ const BLOCK_STRIP_PATTERNS = Object.freeze([
  * names above — anything addable to LEAK_TAG_NAMES that doesn't
  * include "tool_"/"function_"/"think>"/"invoke>"/"apply_patch"/
  * "parameter" needs a new sentinel here. */
-const FAST_PATH_SENTINELS = ["think>", "tool_", "function_", "invoke", "apply_patch", "parameter", "TOOL:"];
+const FAST_PATH_SENTINELS = ["think>", "tool_", "function_", "invoke", "apply_patch", "parameter", "TOOL:", "</calls", "</function_ca", "</tool_ca"];
 
 export function stripLeakedMarkers(text) {
   if (!FAST_PATH_SENTINELS.some(s => text.includes(s))) {
@@ -58,7 +64,7 @@ export function stripLeakedMarkers(text) {
   }
 
   let result = text
-    .replace(/^\[proxy\]<\/think\s*>/i, "");
+    .replace(/\[proxy\]<\/think\s*>/gi, "");
 
   // First pass: strip ENTIRE blocks (tag + content) for tags whose
   // inner text must never be visible (tool_result, think, tool_calls, etc.)
@@ -70,8 +76,15 @@ export function stripLeakedMarkers(text) {
   // through as orphans or partials (opening/closing without a matching pair)
   result = result.replace(LEAK_TAG_REGEX, "");
 
+  // Third pass: strip close-tag fragments that LEAK_TAG_REGEX misses
+  // because they lack the closing ">", or lack the proper prefix.
+  // strip them literally — these fragments never appear in valid user text.
+  for (const frag of ["</calls", "</function_calls", "</tool_calls"]) {
+    result = result.replaceAll(frag, "");
+  }
+
   // Strip leaked role markers — anywhere in text
-  result = result.replace(/^(?:USER|ASSISTANT|TOOL):[^\n]*/gmi, "");
+  result = result.replace(/^\s*(?:USER|ASSISTANT|TOOL):[^\n]*/gmi, "");
   result = result.replace(/\b(?:USER|ASSISTANT|TOOL):\s*/gmi, "");
 
   return result;
@@ -88,14 +101,61 @@ export function finalStrip(text) {
   // that leaked because the close tag arrived in a separate chunk
   result = result.replace(/<(?:function_calls|tool_calls|tool_call|function_call|invoke|tool_use|tool_name)\b[^>]*\/?\s*>/gi, "");
 
-  // Strip orphan close tags
-  result = result.replace(/<\/(?:function_calls|tool_calls|tool_call|function_call|invoke|tool_use|tool_name|tool_call_name|function_call_name)\s*>/gi, "");
+  // Strip orphan close tags (including malformed/truncated ones without ">")
+  result = result.replace(/<\/(?:function_calls|tool_calls|tool_call|function_call|invoke|tool_use|tool_name|tool_call_name|function_call_name)\b[^>]*>?/gi, "");
+  // Bare "</calls" — no function_/tool_ prefix.  Strip literally because
+  // \b fails when it runs into adjacent letters (e.g. "</callsvalue").
+  result = result.replaceAll("</calls", "");
+
+  // Strip any remaining unclosed/open tool tags without matching close
+  result = result.replace(/<(?:function_calls|tool_calls|tool_call|function_call|invoke|tool_use|tool_name|parameter|parameters)\b[^>]*\/?\s*>?/gi, "");
 
   // Strip leaked CDATA wrappers
   result = result.replace(/<!\[CDATA\[|\]\]>/gi, "");
+
+  // Strip leaked role markers that may have crossed chunk boundaries
+  result = result.replace(/^\s*(?:USER|ASSISTANT|TOOL):[^\n]*/gmi, "");
+  result = result.replace(/\b(?:USER|ASSISTANT|TOOL):\s*/gmi, "");
 
   // Collapse multiple blank lines from stripping
   result = result.replace(/\n{3,}/g, "\n\n");
 
   return result.trim();
+}
+
+// Streaming text buffer that prevents TOOL:/USER:/ASSISTANT: role-marker
+// leaks across SSE chunk boundaries.  Only holds back the suffix when it
+// looks like a partial marker prefix (e.g. "TO" before "OL:" arrives),
+// so normal text is emitted immediately without fragmentation.
+const MARKER_PREFIXES = ["T","TO","TOO","TOOL","U","US","USE","USER","A","AS","ASS","ASSI","ASSIS","ASSIST","ASSISTA","ASSISTAN","[","[p","[pr","[pro","[prox","[proxy"];
+const MAX_MARKER_PREFIX = 10;
+
+export function createStreamTextStripper() {
+  let buffer = "";
+
+  return {
+    push(text) {
+      if (!text) return "";
+      buffer += text;
+      const cleaned = stripLeakedMarkers(buffer);
+      // Find the shortest tail that could be a marker prefix
+      let hold = 0;
+      for (let n = Math.min(MAX_MARKER_PREFIX, cleaned.length); n > 0; n--) {
+        const tail = cleaned.slice(-n);
+        if (MARKER_PREFIXES.includes(tail)) {
+          hold = n;
+          break;
+        }
+      }
+      const safeLen = cleaned.length - hold;
+      const emit = cleaned.slice(0, safeLen);
+      buffer = cleaned.slice(safeLen);
+      return emit;
+    },
+    flush() {
+      const result = stripLeakedMarkers(buffer);
+      buffer = "";
+      return result;
+    }
+  };
 }

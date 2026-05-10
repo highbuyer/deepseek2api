@@ -63,6 +63,32 @@ export function getToolTruncationCategory(toolName) {
   return "default";
 }
 
+/**
+ * Web content tools (browser snapshot, web fetch, web search) produce
+ * HTML/XML-laden output that pollutes the prompt with angle brackets.
+ * When the model sees these in context, it confuses JSON fence format
+ * with XML format, causing degenerate tool call output.
+ */
+export function isWebContentTool(toolName) {
+  const lower = (toolName || "").toLowerCase();
+  return /browser_|cursor-ide-browser|webfetch|websearch|web_fetch|web_search|fetch_url/i.test(lower);
+}
+
+/**
+ * Budget for web content tool results — much tighter than the default
+ * 20000 chars to minimize angle-bracket pollution in the prompt.
+ */
+export const WEB_TOOL_RESULT_BUDGET = 4000;
+
+/**
+ * Sanitize web content to prevent angle bracket leakage into the prompt.
+ * Replaces < and > with fullwidth angle brackets so the content doesn't
+ * look like tool call XML tags to the model.
+ */
+export function sanitizeWebContent(content) {
+  return content.replace(/</g, "＜").replace(/>/g, "＞");
+}
+
 export const TOOL_TRUNCATION_STRATEGY = {
   read:    { headRatio: 0.3, tailRatio: 0.3 },
   bash:    { headRatio: 0.2, tailRatio: 0.6 },

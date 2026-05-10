@@ -5,11 +5,18 @@ import { config } from "../config.js";
 const LEVELS = Object.freeze({ debug: 0, info: 1, warn: 2, error: 3 });
 
 function timestamp() {
-  return new Date().toISOString();
+  const d = new Date();
+  const p = (n, w = 2) => String(n).padStart(w, '0');
+  const off = -d.getTimezoneOffset();
+  const s = off >= 0 ? '+' : '-';
+  const a = Math.abs(off);
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}${s}${p(Math.floor(a / 60))}:${p(a % 60)}`;
 }
 
 const logDir = join(process.cwd(), "data");
-const logFile = config.debug ? join(logDir, "debug.log") : null;
+// Each restart gets a new timestamped file so no evidence is lost
+const sessionTs = timestamp().replace(/[:.]/g, "-");
+const logFile = config.debug ? join(logDir, `debug-${sessionTs}.log`) : null;
 if (logFile) {
   mkdirSync(logDir, { recursive: true });
   writeFileSync(logFile, `=== deepseek2api started at ${timestamp()} ===\n`);

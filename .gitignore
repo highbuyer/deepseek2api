@@ -8,3 +8,4 @@ release/
 Thumbs.db
 .gitnexus
 data/windsurf-accounts.json
+.debug_request.jsonl

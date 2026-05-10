@@ -18,11 +18,23 @@ preloadEmbeddingModel().catch((err) => {
   console.warn("Embedding model preload failed:", err.message);
 });
 
-// Node.js fetch doesn't respect system proxy — wire it up manually
-const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
+// Node.js fetch doesn't respect system proxy — wire it up manually.
+// Prefer the dedicated PROXY env var (documented), fall back to system proxy vars.
+// NO_PROXY can exclude hosts (e.g. NO_PROXY=chat.deepseek.com to bypass proxy).
+const proxyUrl = process.env.PROXY || process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
 if (proxyUrl) {
-  setGlobalDispatcher(new ProxyAgent(proxyUrl));
-  console.log(`Proxy: ${proxyUrl}`);
+  try {
+    const noProxy = (process.env.NO_PROXY || process.env.no_proxy || "").split(",").map(s => s.trim());
+    const deepseekHost = new URL(config.deepseekBaseUrl).host;
+    if (noProxy.includes(deepseekHost) || noProxy.includes("*")) {
+      console.log(`Proxy: ${proxyUrl} (skipped for ${deepseekHost} via NO_PROXY)`);
+    } else {
+      setGlobalDispatcher(new ProxyAgent(proxyUrl));
+      console.log(`Proxy: ${proxyUrl}`);
+    }
+  } catch (err) {
+    console.warn(`Proxy setup failed (${err.message}), continuing without proxy. Check PROXY env var.`);
+  }
 }
 import { handleApiRequest } from "./routes/api-routes.js";
 import { handleOpenAiRequest } from "./routes/openai-routes.js";

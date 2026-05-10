@@ -17,7 +17,9 @@ import { log } from "../utils/log.js";
 
 function getBearerToken(request) {
   const value = request.headers.authorization ?? "";
-  return value.startsWith("Bearer ") ? value.slice(7) : "";
+  if (value.startsWith("Bearer ")) return value.slice(7);
+  // Cursor Anthropic provider sends key via x-api-key header
+  return (request.headers["x-api-key"] ?? "").trim();
 }
 
 function handleOpenAiError(response, error) {
@@ -62,6 +64,7 @@ async function handleChatCompletionsRequest(request, response, apiKeyRecord) {
     }
 
     const deleteAfterFinish = isIncognitoEnabledForOwner(apiKeyRecord.ownerId);
+    log.debug("route", `[chat] BODY_KEYS: [${Object.keys(body).join(",")}], tools_type=${typeof body.tools}, tools_len=${Array.isArray(body.tools) ? body.tools.length : 'N/A'}, tools=${JSON.stringify(body.tools)?.slice(0, 300)}`);
     log.info("route", `[chat] stream=${!!body.stream} model=${body.model || "default"} toolCalls=${apiKeyRecord.toolCallsEnabled} accountId=${account.id}`);
     if (body.stream) {
       await streamOpenAiResponse({
@@ -182,6 +185,8 @@ export async function handleOpenAiRequest(request, response, url) {
   const apiKeyRecord = apiKey ? getApiKeyRecord(apiKey) : null;
 
   if (!apiKeyRecord) {
+    // DEBUG: dump headers to diagnose Cursor Anthropic auth
+    log.debug("route", `[auth-debug] pathname=${url.pathname} auth_header="${(request.headers.authorization ?? "").slice(0, 60)}" x_api_key="${(request.headers["x-api-key"] ?? "").slice(0, 60)}" apiKey_len=${apiKey.length}`);
     // Allow embedding requests without API key (used by GitNexus analyze --embeddings)
     if (url.pathname === "/v1/embeddings") {
       const { readStore } = await import("../storage/store.js");

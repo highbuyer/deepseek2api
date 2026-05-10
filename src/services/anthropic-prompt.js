@@ -9,7 +9,8 @@ import {
   formatTruncationHint, truncateToolResult,
   PER_MESSAGE_TOOL_RESULT_BUDGET, BUDGET_PREVIEW_CHARS, buildBudgetPreview,
   keepRecentMessages, injectReadBloatHint, estimateTokens,
-  detectRepeatedToolFailures
+  detectRepeatedToolFailures,
+  isWebContentTool, WEB_TOOL_RESULT_BUDGET, sanitizeWebContent
 } from "../utils/tool-truncation.js";
 
 /* ── Anthropic → DeepSeek prompt conversion ── */
@@ -128,11 +129,13 @@ function contentBlockToText(block, toolNameById, _ctxChars = 0) {
     // Strip line-number prefixes (Claude Code Read format: "  1→code")
     // so the model doesn't learn to echo file content with line numbers
     content = content.replace(/^\s*\d+→/gm, "");
-    // Dynamic budget + head-tail truncation with category-aware strategy
     const toolName = toolNameById?.get(toStringSafe(block.tool_use_id)) || "";
-    const budget = getToolResultBudget(_ctxChars ?? 0, config.maxPromptChars);
-    const { text: truncated, truncated: wasTruncated } = truncateToolResult(content, budget, toolName);
-    content = truncated;
+    const isWeb = isWebContentTool(toolName);
+    // Web content tools get a much tighter budget + angle-bracket sanitization
+    // to prevent HTML/XML pollution from confusing tool call format selection
+    const budget = isWeb ? WEB_TOOL_RESULT_BUDGET : getToolResultBudget(_ctxChars ?? 0, config.maxPromptChars);
+    const { text: truncated } = truncateToolResult(content, budget, toolName);
+    content = isWeb ? sanitizeWebContent(truncated) : truncated;
     // Use tool name as id so injectReadBloatHint / repeated-read regexes can match
     const name = toolName || toStringSafe(block.tool_use_id).slice(-20);
     return `<tool_result id="${name}">\n${content}\n</tool_result>`;
