@@ -366,7 +366,7 @@ function buildAnthropicToolPrompt(policy, tools) {
   })();
 
   let prompt = [
-    "When tools are listed below, use them to take action — prefer calling tools over narration.",
+    "When tools are listed below, you MUST call them for tasks needing real-time info (weather, news, prices), file ops, code execution, or any external data. Do NOT describe what you would search using markdown or prose — emit the actual tool call. Narrating instead of calling is wrong here.",
     "",
     "=== BEST PRACTICES ===",
     "",
@@ -444,8 +444,7 @@ function buildAnthropicToolPrompt(policy, tools) {
     "3. Batch independent tool calls in ONE ```json array for parallel execution.",
     "4. If a tool fails, try a different approach. Never repeat the same failed call.",
     "5. After tools return results, fix bugs directly.",
-    "6. If you do NOT need a tool, answer normally without any ```json block.",
-    "7. NEVER echo <tool_result> content in your visible output — it's internal context",
+    "6. NEVER echo <tool_result> content in your visible output — it's internal context",
   ].flat().join("\n");
 
   if (policy.mode === "required") {
