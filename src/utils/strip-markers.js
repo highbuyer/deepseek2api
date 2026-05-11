@@ -57,8 +57,9 @@ const FAST_PATH_SENTINELS = ["think>", "tool_", "function_", "invoke", "apply_pa
 
 export function stripLeakedMarkers(text) {
   if (!FAST_PATH_SENTINELS.some(s => text.includes(s))) {
-    // Still check for echoed conversation markers
-    if (!text.includes("USER:") && !text.includes("ASSISTANT:")) {
+    // Check for echoed conversation markers (with or without colon — model
+    // sometimes writes "ASSISTANT\n\n" as a role banner without trailing :)
+    if (!text.includes("ASSISTANT") && !text.includes("USER") && !text.includes("TOOL")) {
       return text;
     }
   }
@@ -86,6 +87,8 @@ export function stripLeakedMarkers(text) {
   // Strip leaked role markers — anywhere in text
   result = result.replace(/^\s*(?:USER|ASSISTANT|TOOL):[^\n]*/gmi, "");
   result = result.replace(/\b(?:USER|ASSISTANT|TOOL):\s*/gmi, "");
+  // Strip bare role banners (no colon — model writes "ASSISTANT\n\n" alone on a line)
+  result = result.replace(/^\s*(?:USER|ASSISTANT|TOOL)\s*$/gmi, "");
 
   return result;
 }
@@ -116,6 +119,8 @@ export function finalStrip(text) {
   // Strip leaked role markers that may have crossed chunk boundaries
   result = result.replace(/^\s*(?:USER|ASSISTANT|TOOL):[^\n]*/gmi, "");
   result = result.replace(/\b(?:USER|ASSISTANT|TOOL):\s*/gmi, "");
+  // Strip bare role banners (no colon — model writes "ASSISTANT\n\n" alone on a line)
+  result = result.replace(/^\s*(?:USER|ASSISTANT|TOOL)\s*$/gmi, "");
 
   // Collapse multiple blank lines from stripping
   result = result.replace(/\n{3,}/g, "\n\n");
