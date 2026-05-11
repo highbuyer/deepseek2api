@@ -71,7 +71,7 @@ function formatPromptToolCalls(toolCalls, toolNameById) {
       let input = {};
       try { input = JSON.parse(argumentsText); } catch { /* keep {} */ }
 
-      return `  ${JSON.stringify({ tool: name, arguments: input })}`;
+      return `  ${JSON.stringify({ name, input })}`;
     })
     .filter(Boolean);
 
@@ -380,23 +380,22 @@ function buildToolPrompt(policy, tools) {
     "",
     "=== TOOL CALL FORMAT ===",
     "",
-    "Output tool calls as a JSON array inside a ```json code fence.",
-    "This is standard JSON format you already know from training:",
+    "Output tool calls using the standard tool_use JSON format inside a ```json fence:",
     "",
     "```json",
     "[",
-    '  {"tool": "ToolName", "arguments": {"param1": "value1", "param2": 42}},',
-    '  {"tool": "ToolName2", "arguments": {"param3": [1, 2, 3]}}',
+    '  {"name": "ToolName", "input": {"param1": "value1", "param2": 42}},',
+    '  {"name": "ToolName2", "input": {"param3": [1, 2, 3]}}',
     "]",
     "```",
     "",
     "RULES:",
     "",
     "1. ONE ```json block containing ALL tool calls as a single JSON array",
-    '2. Each object has "tool" (exact tool name) and "arguments" (JSON object)',
+    '2. Each object has "name" (exact tool name) and "input" (JSON object with parameters)',
     "3. String values in double quotes. Numbers/booleans without quotes.",
     "4. Multi-line content (patch, code) can use literal newlines inside strings",
-    "5. Do NOT wrap JSON in XML tags — no function_calls, invoke, parameter, or tool_calls tags",
+    "5. No XML wrapper tags. No fake-code or pseudocode. Pure JSON inside the fence.",
     "6. Text before/after the ```json block is allowed for natural flow.",
     "",
     "=== FEW-SHOT EXAMPLES ===",
@@ -404,14 +403,14 @@ function buildToolPrompt(policy, tools) {
     "",
     "Single tool:",
     "```json",
-    `[{"tool": "${firstName}", "arguments": ${args1}}]`,
+    `[{"name": "${firstName}", "input": ${args1}}]`,
     "```",
     "",
     policy.allowedToolNames.length >= 2
     ? [
         "Multiple independent tools (BATCH when possible):",
         "```json",
-        `[{"tool": "${firstName}", "arguments": ${args1}}, {"tool": "${secondName}", "arguments": ${args2}}]`,
+        `[{"name": "${firstName}", "input": ${args1}}, {"name": "${secondName}", "input": ${args2}}]`,
         "```",
       ]
     : "",

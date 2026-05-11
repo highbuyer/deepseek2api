@@ -11,8 +11,8 @@ import { log } from "../utils/log.js";
 // that the model could "helpfully" convert back to XML and re-trigger the sieve.
 export const FORMAT_ERROR_MSG =
   "[TOOL_FORMAT_ERROR] Your tool call format was incorrect. " +
-  "Use a ```json code fence with a JSON array of {tool, arguments} objects. " +
-  "Example: ```json\\n[{\"tool\": \"read\", \"arguments\": {\"file_path\": \"/src/main.py\"}}]\\n```";
+  "Use the standard tool_use JSON format inside a ```json code fence. " +
+  "Example: ```json\\n[{\"name\": \"read\", \"input\": {\"file_path\": \"/src/main.py\"}}]\\n```";
 
 /* ── Tag detection ──
  * We only need to detect BLOCK-LEVEL tool containers.  The parser handles
