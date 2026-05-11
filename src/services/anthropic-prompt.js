@@ -520,18 +520,11 @@ export function buildAnthropicPrompt({ messages, system, tools, toolChoice }) {
     }
   }
 
-  // Route slash commands to Skill tool (deepseek models may not follow system prompt)
+  // Route slash commands to Skill tool via prompt hint (deepseek models may not follow system prompt).
+  // Do NOT force tool_choice to Skill — unverifiable server-side whether a command is a real skill;
+  // forcing on unknown commands produces "Unknown skill" errors with no recovery path.
   const skillCommand = injectSkillRoutingHint(allMessages, tools ?? []);
-
-  // Force tool_choice to Skill when slash command detected,
-  // otherwise deepseek models will manually simulate the skill instead of delegating
-  const effectiveToolChoice = skillCommand
-    ? { type: "function", function: { name: "Skill" } }
-    : toolChoice;
-
-  if (skillCommand) {
-    log.debug("prompt", `[anthropic] Overriding tool_choice to force Skill tool for /${skillCommand}`);
-  }
+  const effectiveToolChoice = toolChoice;
 
   const anthropicTools = (tools ?? []).map((t) => ({
     ...t,
