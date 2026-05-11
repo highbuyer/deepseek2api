@@ -84,11 +84,17 @@ export function stripLeakedMarkers(text) {
     result = result.replaceAll(frag, "");
   }
 
-  // Strip leaked role markers — anywhere in text
-  result = result.replace(/^\s*(?:USER|ASSISTANT|TOOL):[^\n]*/gmi, "");
+  // Strip leaked role markers — covers all banner variants:
+  //   "MARKER: content"         (colon separator)
+  //   "MARKER content"          (space separator — model uses MARKER as heading)
+  //   "MARKER\n\n"              (alone on line, no separator content)
+  //   "MARKER `code`"           (space + markdown)
+  // Line-start marker + any separator (colon/whitespace/end). Strips only
+  // marker + separator; preserves following content (which is model's real
+  // response, not part of the role banner).
+  result = result.replace(/^\s*(?:USER|ASSISTANT|TOOL)(?:[\s:]+|$)/gmi, "");
+  // Inline marker + colon (mid-line, after word boundary)
   result = result.replace(/\b(?:USER|ASSISTANT|TOOL):\s*/gmi, "");
-  // Strip bare role banners (no colon — model writes "ASSISTANT\n\n" alone on a line)
-  result = result.replace(/^\s*(?:USER|ASSISTANT|TOOL)\s*$/gmi, "");
 
   return result;
 }
@@ -116,11 +122,9 @@ export function finalStrip(text) {
   // Strip leaked CDATA wrappers
   result = result.replace(/<!\[CDATA\[|\]\]>/gi, "");
 
-  // Strip leaked role markers that may have crossed chunk boundaries
-  result = result.replace(/^\s*(?:USER|ASSISTANT|TOOL):[^\n]*/gmi, "");
+  // Strip leaked role markers (any separator: colon/space/end-of-line)
+  result = result.replace(/^\s*(?:USER|ASSISTANT|TOOL)(?:[\s:]+|$)/gmi, "");
   result = result.replace(/\b(?:USER|ASSISTANT|TOOL):\s*/gmi, "");
-  // Strip bare role banners (no colon — model writes "ASSISTANT\n\n" alone on a line)
-  result = result.replace(/^\s*(?:USER|ASSISTANT|TOOL)\s*$/gmi, "");
 
   // Collapse multiple blank lines from stripping
   result = result.replace(/\n{3,}/g, "\n\n");
