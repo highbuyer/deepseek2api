@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { buildAnthropicPrompt, resolveAnthropicModel } from "./anthropic-prompt.js";
 import { collectCompletionContent, streamCompletionContent } from "./openai-completion-runner.js";
-import { createToolSieve, extractToolAwareOutput, FORMAT_ERROR_MSG } from "./openai-tool-sieve.js";
+import { createToolSieve, extractToolAwareOutput } from "./openai-tool-sieve.js";
 import { parseToolCallsFromText } from "./openai-tool-parser.js";
 import { ensureToolChoiceSatisfied } from "./openai-tool-policy.js";
 import { stripLeakedMarkers, createStreamTextStripper } from "../utils/strip-markers.js";
@@ -162,6 +162,20 @@ export async function streamAnthropicMessage(options) {
 
   /* ── Tool call emission ── */
 
+  const emitFormatError = () => {
+    log.warn("bridge", `[stream] Format error detected, sending correction as tool_use block`);
+    finishCurrentBlock();
+    const errorId = `toolu_${randomUUID()}`;
+    startBlock("tool_use", { id: errorId, name: "format_error", input: {} });
+    emitDelta("input_json_delta", "partial_json", JSON.stringify({
+      error: "tool_call_format_incorrect",
+      message: "Your tool call format was incorrect.",
+      guidance: "Use a ```json code fence with a JSON array of {tool, arguments} objects.",
+      example: '[{"tool": "read", "arguments": {"file_path": "/src/main.py"}}]'
+    }));
+    finishCurrentBlock();
+  };
+
   const emitToolCalls = (calls) => {
     if (!calls.length) return;
 
@@ -231,8 +245,7 @@ export async function streamAnthropicMessage(options) {
       if (event.type === "tool_calls") {
         emitToolCalls(event.calls ?? []);
       } else if (event.type === "format_error") {
-        log.warn("bridge", `[stream] Format error detected, sending correction immediately`);
-        emitTextEvent(FORMAT_ERROR_MSG, "thinking", true);
+        emitFormatError();
       } else if (event.type === "text") {
         emitTextEvent(event.text, event.kind ?? fallbackKind);
       }
