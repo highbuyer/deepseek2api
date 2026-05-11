@@ -93,6 +93,36 @@ function injectSkillRoutingHint(allMessages, tools) {
   return command;
 }
 
+/* ── Client-side reminder stripping ── */
+
+// Strip Claude Code's <system-reminder> blocks from user-role text content.
+// DeepSeek lacks Claude's SFT training to treat these as out-of-band metadata
+// and treats the block as the main conversation topic, causing derail where
+// the model ignores the actual user query and "answers" the reminder instead.
+//
+// Also strip <local-command-caveat> blocks: their content ("DO NOT respond to
+// these messages") is meant as guidance to Claude about Claude Code's local
+// command history; DeepSeek reads it as a top-level instruction and refuses to
+// answer anything. Orphan </system-reminder> close tags appear when the
+// reminder body literally contains the string "</system-reminder>" (e.g., a
+// reminder describing the reminder mechanism); the non-greedy match closes
+// early inside, leaving the real close tag as an orphan.
+const SYSTEM_REMINDER_RE = /<system-reminder>[\s\S]*?<\/system-reminder>\s*/g;
+const ORPHAN_REMINDER_CLOSE_RE = /<\/system-reminder>\s*/g;
+const COMMAND_CAVEAT_RE = /<local-command-caveat>[\s\S]*?<\/local-command-caveat>\s*/g;
+
+function stripClientReminders(text) {
+  if (typeof text !== "string" || !text) return text;
+  const cleaned = text
+    .replace(SYSTEM_REMINDER_RE, "")
+    .replace(ORPHAN_REMINDER_CLOSE_RE, "")
+    .replace(COMMAND_CAVEAT_RE, "");
+  if (cleaned.length < text.length) {
+    log.debug("prompt", `[anthropic] Stripped ${text.length - cleaned.length} chars of client metadata from user message`);
+  }
+  return cleaned;
+}
+
 /* ── Prompt normalization ── */
 
 function normalizeSystemPrompt(system) {
@@ -173,9 +203,10 @@ function normalizeAnthropicMessages(messages) {
 
     const content = message?.content;
     if (typeof content === "string") {
-      totalChars += content.length;
-      rawTotalChars += content.length;
-      return [{ role, content }];
+      const cleaned = role === "user" ? stripClientReminders(content) : content;
+      totalChars += cleaned.length;
+      rawTotalChars += cleaned.length;
+      return [{ role, content: cleaned }];
     }
     if (!Array.isArray(content)) return [];
 
@@ -235,7 +266,8 @@ function normalizeAnthropicMessages(messages) {
 
     if (role === "user") {
       const combined = textBlocks.join("\n") || " ";
-      return [{ role: "user", content: combined }];
+      const cleaned = stripClientReminders(combined) || " ";
+      return [{ role: "user", content: cleaned }];
     }
 
     // assistant: keep tool calls as structured info
@@ -479,10 +511,12 @@ function truncatePrompt(messages, maxBudget, measure) {
 const ANTHROPIC_MODEL_ALIASES = Object.freeze({
   // Chat (default)
   "claude-haiku-4-5": "deepseek-chat-fast",
+  "claude-haiku-4-5-20251001": "deepseek-chat-fast",
   "claude-3-5-haiku": "deepseek-chat-fast",
   // Chat (expert)
   "claude-sonnet-4-6": "deepseek-chat-expert",
   "claude-sonnet-4-5": "deepseek-chat-expert",
+  "claude-sonnet-4-5-20250929": "deepseek-chat-expert",
   "claude-3-5-sonnet": "deepseek-chat-expert",
   // Reasoner (default)
   "claude-opus-4-5": "deepseek-reasoner-fast",
