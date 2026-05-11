@@ -299,8 +299,11 @@ function buildAnthropicToolPrompt(policy, tools) {
 
   if (!schemas.length) return "";
 
-  const firstName = policy.allowedToolNames[0] || "ToolName";
-  const secondName = policy.allowedToolNames[1] || "ToolName2";
+  // Pick concrete tools for few-shot — abstract tools like Agent confuse the model.
+  // Bash and Read are always present and give the most practical examples.
+  const concreteTools = policy.allowedToolNames.filter(n => n === "Bash" || n === "Read");
+  const firstName = concreteTools[0] || policy.allowedToolNames[0] || "Bash";
+  const secondName = concreteTools[1] || policy.allowedToolNames[1] || "Read";
   const args1 = (() => {
     const t = tools.find(t => toStringSafe(t?.name).trim().toLowerCase() === firstName.toLowerCase());
     const props = (t?.input_schema ?? t?.function?.parameters ?? {}).properties ?? {};

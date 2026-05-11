@@ -340,8 +340,9 @@ function buildToolPrompt(policy, tools) {
     return "";
   }
 
-  const firstName = policy.allowedToolNames[0] || "ToolName";
-  const secondName = policy.allowedToolNames[1] || "ToolName2";
+  const concreteTools = policy.allowedToolNames.filter(n => n === "Bash" || n === "Read");
+  const firstName = concreteTools[0] || policy.allowedToolNames[0] || "Bash";
+  const secondName = concreteTools[1] || policy.allowedToolNames[1] || "Read";
   const args1 = buildExampleArgs(firstName, tools);
   const args2 = buildExampleArgs(secondName, tools);
 
