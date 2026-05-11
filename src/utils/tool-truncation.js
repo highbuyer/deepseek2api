@@ -271,7 +271,7 @@ function groupMessagesByRound(msgs) {
 
     if (msg.role === "assistant") {
       const tcXml = msg.content ?? "";
-      if (tcXml.includes("<tool_calls>") || tcXml.includes("<invoke name=")) {
+      if (tcXml.includes("<tool_calls>") || tcXml.includes("<invoke name=") || /\[\s*\{\s*"(?:tool|name)"\s*:/.test(tcXml)) {
         current.hasToolCalls = true;
       }
     }

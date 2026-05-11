@@ -114,6 +114,12 @@ export function createToolSieve(allowedToolNames = []) {
     return noTags.trim().length === 0;
   }
 
+  // Check if a block contains inner tool call structure tags (beyond just
+  // the outer container) — signals the model genuinely tried a tool call.
+  function hasToolCallStructure(text) {
+    return /<(?:tool_call\b(?!s)|invoke\b|function_call\b|tool_name\b|function_name\b)/i.test(text);
+  }
+
   function pushTextEvent(events, text, kind) {
     if (!text) return;
     state.emittedText += text;
@@ -232,10 +238,10 @@ export function createToolSieve(allowedToolNames = []) {
         const calls = parseToolCallsFromText(block, state.allowedToolNames);
         if (calls.length) {
           events.push({ type: "tool_calls", calls });
-        } else if (!state.formatErrorEmitted && isEffectivelyEmptyToolBlock(block)) {
-          // Empty nested container tags with no actual tool content —
-          // emit FORMAT_ERROR to steer model toward ```json fence format.
-          log.debug("sieve", `Drain: empty tool tags detected (block=${block.length} chars), emitting format_error`);
+        } else if (!state.formatErrorEmitted && (isEffectivelyEmptyToolBlock(block) || hasToolCallStructure(block))) {
+          // Block has tool call markers but parser found no valid calls.
+          // Emit FORMAT_ERROR to steer model toward ```json fence format.
+          log.debug("sieve", `Drain: unparseable tool block (block=${block.length} chars, isEmpty=${isEffectivelyEmptyToolBlock(block)}, hasStructure=${hasToolCallStructure(block)}), emitting format_error`);
           state.formatErrorEmitted = true;
           events.push({ type: "format_error", block });
         } else {

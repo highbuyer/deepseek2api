@@ -2,7 +2,7 @@ import { buildPromptFromMessages } from "../utils/prompt.js";
 import { getToolFunction, getToolName, resolveToolChoicePolicy } from "./openai-tool-policy.js";
 import { config } from "../config.js";
 import { log } from "../utils/log.js";
-import { toStringSafe, toJsonText } from "../utils/safe-string.js";
+import { toStringSafe } from "../utils/safe-string.js";
 import { resolveOpenAiModel } from "./openai-request.js";
 import {
   getToolResultBudget, getToolTruncationCategory, TOOL_TRUNCATION_STRATEGY,
@@ -115,13 +115,8 @@ function contentBlockToText(block, toolNameById, _ctxChars = 0) {
   if (block.type === "thinking") return ""; //  thinking content removed from prompt to save budget
   if (block.type === "tool_use") {
     const name = toStringSafe(block.name);
-    const args = toJsonText(block.input);
-    return [
-      "  <tool_call>",
-      `    <tool_name>${name}</tool_name>`,
-      `    <parameters><![CDATA[${args.replaceAll("]]>", "]]]]><![CDATA[>")}]]></parameters>`,
-      "  </tool_call>"
-    ].join("\n");
+    const input = typeof block.input === "object" && block.input !== null ? block.input : {};
+    return `  ${JSON.stringify({ tool: name, arguments: input })}`;
   }
   if (block.type === "tool_result") {
     let content = typeof block.content === "string"
@@ -252,7 +247,7 @@ function normalizeAnthropicMessages(messages) {
       .join("\n");
 
     const toolHistory = toolCalls.length
-      ? `<tool_calls>\n${toolCalls.map(b => contentBlockToText(b, toolNameById)).filter(Boolean).join("\n")}\n</tool_calls>`
+      ? `[\n${toolCalls.map(b => contentBlockToText(b, toolNameById)).filter(Boolean).join(",\n")}\n]`
       : "";
 
     const combined = [textContent, toolHistory].filter(Boolean).join("\n\n");
@@ -385,7 +380,7 @@ function buildAnthropicToolPrompt(policy, tools) {
     '2. Each object has "tool" (exact tool name) and "arguments" (JSON object)',
     "3. String values in double quotes. Numbers/booleans without quotes.",
     "4. Multi-line content (patch, code) can use literal newlines inside strings",
-    "5. NO XML tags — no <function_calls>, <invoke>, <parameter>, <tool_calls>",
+    "5. Do NOT wrap JSON in XML tags — no function_calls, invoke, parameter, or tool_calls tags",
     "6. Text before/after the ```json block is allowed for natural flow.",
     "",
     "=== FEW-SHOT EXAMPLES ===",

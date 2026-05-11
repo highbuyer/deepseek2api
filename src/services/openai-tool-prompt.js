@@ -11,11 +11,6 @@ import {
   detectRepeatedToolFailures
 } from "../utils/tool-truncation.js";
 
-function toCdata(text) {
-  const value = toStringSafe(text);
-  return value.replaceAll("]]>", "]]]]><![CDATA[>");
-}
-
 function normalizeContentText(content) {
   if (typeof content === "string") {
     return content;
@@ -73,16 +68,14 @@ function formatPromptToolCalls(toolCalls, toolNameById) {
         toolNameById.set(callId, name);
       }
 
-      return [
-        "  <tool_call>",
-        `    <tool_name>${name}</tool_name>`,
-        `    <parameters><![CDATA[${toCdata(argumentsText)}]]></parameters>`,
-        "  </tool_call>"
-      ].join("\n");
+      let input = {};
+      try { input = JSON.parse(argumentsText); } catch { /* keep {} */ }
+
+      return `  ${JSON.stringify({ tool: name, arguments: input })}`;
     })
     .filter(Boolean);
 
-  return blocks.length ? `<tool_calls>\n${blocks.join("\n")}\n</tool_calls>` : "";
+  return blocks.length ? `[\n${blocks.join(",\n")}\n]` : "";
 }
 
 function normalizeAssistantPromptContent(message, toolNameById) {
@@ -402,7 +395,7 @@ function buildToolPrompt(policy, tools) {
     '2. Each object has "tool" (exact tool name) and "arguments" (JSON object)',
     "3. String values in double quotes. Numbers/booleans without quotes.",
     "4. Multi-line content (patch, code) can use literal newlines inside strings",
-    "5. NO XML tags — no <function_calls>, <invoke>, <parameter>, <tool_calls>",
+    "5. Do NOT wrap JSON in XML tags — no function_calls, invoke, parameter, or tool_calls tags",
     "6. Text before/after the ```json block is allowed for natural flow.",
     "",
     "=== FEW-SHOT EXAMPLES ===",

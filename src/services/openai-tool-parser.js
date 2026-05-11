@@ -860,6 +860,16 @@ function buildParsedToolCall(name, argumentsText) {
   let fixed = isApplyPatchTool(name) ? fixApplyPatchArgs(input) : input;
   // cursor2api port: repair smart quotes + fuzzy old_string matching
   fixed = fixToolCallArguments(name, fixed);
+  if (!fixed || typeof fixed !== "object" || Array.isArray(fixed)) {
+    log.debug("parser", `[buildParsedToolCall] Invalid arguments for "${name}": all fix attempts failed, argumentsText="${previewForLog(argumentsText, 200)}"`);
+    return null;
+  }
+  // Detect XML fragments in object keys — sign of garbled tool call where
+  // the model embedded XML tag content into argument key names
+  if (Object.keys(fixed).some(k => /[<>]/.test(k))) {
+    log.debug("parser", `[buildParsedToolCall] Arguments keys contain XML fragments for "${name}": ${JSON.stringify(Object.keys(fixed))}`);
+    return null;
+  }
   return {
     id: `call_${randomUUID().replaceAll("-", "")}`,
     name,
@@ -1904,6 +1914,10 @@ function tryParseRawPatchFormat(text, allowedToolNames) {
 }
 
 function filterAllowedToolCalls(calls, allowedToolNames) {
+  // Drop null entries from upstream parse failures (e.g. buildParsedToolCall
+  // returning null when all argument fix attempts fail)
+  calls = calls.filter(c => c != null);
+
   if (!allowedToolNames?.length) {
     return calls;
   }
