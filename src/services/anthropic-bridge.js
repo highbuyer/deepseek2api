@@ -231,13 +231,9 @@ export async function streamAnthropicMessage(options) {
       if (event.type === "tool_calls") {
         emitToolCalls(event.calls ?? []);
       } else if (event.type === "format_error") {
-        log.warn("bridge", `[stream] Format error detected, sending correction as system text`);
-        const systemPrefix = "══════ SYSTEM: Tool Format Correction ══════\n";
-        const systemSuffix = "\n══════════════════════════════════════════";
+        log.warn("bridge", `[stream] Format error detected, sending inline correction note`);
         startBlock("text", { text: "" });
-        emitDelta("text_delta", "text", systemPrefix);
-        emitDelta("text_delta", "text", FORMAT_ERROR_MSG);
-        emitDelta("text_delta", "text", systemSuffix);
+        emitDelta("text_delta", "text", `\n${FORMAT_ERROR_MSG}\n`);
         finishCurrentBlock();
       } else if (event.type === "text") {
         emitTextEvent(event.text, event.kind ?? fallbackKind);
