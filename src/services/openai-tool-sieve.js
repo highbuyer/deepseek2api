@@ -403,12 +403,16 @@ export function createToolSieve(allowedToolNames = []) {
       const idx = text.search(matched[0]);
       if (idx > 0) pushTextEvent(events, text.slice(0, idx), state.lastKind);
     } else {
+      // Hold partial XML tags (<) and JSON array starts ([) at chunk
+      // boundaries so the next chunk can complete the detection pattern.
       const lastLt = text.lastIndexOf("<");
-      if (lastLt >= 0 && !text.slice(lastLt).includes(">")) {
-        const partialLen = text.length - lastLt;
+      const lastBracket = text.lastIndexOf("[");
+      const partialAt = Math.max(lastLt, lastBracket);
+      if (partialAt >= 0) {
+        const partialLen = text.length - partialAt;
         if (partialLen <= LOOKBEHIND) {
-          if (lastLt > 0) pushTextEvent(events, text.slice(0, lastLt), state.lastKind);
-          state.hold = text.slice(lastLt);
+          if (partialAt > 0) pushTextEvent(events, text.slice(0, partialAt), state.lastKind);
+          state.hold = text.slice(partialAt);
         } else {
           pushTextEvent(events, text, state.lastKind);
         }
