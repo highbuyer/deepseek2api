@@ -392,15 +392,16 @@ export function createToolSieve(allowedToolNames = []) {
       state.captureKind = "xml";
       const more = drain();
       events.push(...more);
-    } else if (!state.formatErrorEmitted && /\[调用\s+\w+\]/.test(text)) {
-      // Model invented [调用 ToolName] format instead of ```json fence.
-      const m = text.match(/\[调用\s+\w+\]/);
-      log.debug("sieve", `Drain: detected [调用] pattern "${m[0]}", emitting format_error`);
+    } else if (!state.formatErrorEmitted && /(?:\[调用\s+\w+\]|●\s*\w+\()/.test(text)) {
+      // Model invented its own tool call format instead of ```json fence:
+      // [调用 Bash] or ● Bash(...) — Claude Code UI mimic, not a real tool call.
+      const matched = text.match(/\[调用\s+\w+\]|●\s*\w+\(/);
+      log.debug("sieve", `Drain: detected fake-tool-call pattern "${matched[0]}", emitting format_error`);
       state.formatErrorEmitted = true;
       events.push({ type: "format_error", block: text });
-      // Emit any text before the [ marker as clean text
-      const bracketIdx = text.indexOf("[调用");
-      if (bracketIdx > 0) pushTextEvent(events, text.slice(0, bracketIdx), state.lastKind);
+      // Emit any text before the marker as clean text
+      const idx = text.search(matched[0]);
+      if (idx > 0) pushTextEvent(events, text.slice(0, idx), state.lastKind);
     } else {
       const lastLt = text.lastIndexOf("<");
       if (lastLt >= 0 && !text.slice(lastLt).includes(">")) {
