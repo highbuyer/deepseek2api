@@ -20,7 +20,8 @@ import {
 const CLI_BUILTINS = new Set([
   "clear", "help", "config", "compact", "login", "logout", "fast",
   "worktree", "tasks", "doctor", "status", "ide", "theme", "model",
-  "agents", "hooks", "mcp", "context", "workspace", "terminal-setup"
+  "agents", "hooks", "mcp", "context", "workspace", "terminal-setup",
+  "effort"
 ]);
 
 function detectSkillSlashCommand(messages) {
