@@ -232,7 +232,7 @@ export async function streamAnthropicMessage(options) {
         emitToolCalls(event.calls ?? []);
       } else if (event.type === "format_error") {
         log.warn("bridge", `[stream] Format error detected, sending correction immediately`);
-        emitTextEvent(FORMAT_ERROR_MSG, "response", true);
+        emitTextEvent(FORMAT_ERROR_MSG, "thinking", true);
       } else if (event.type === "text") {
         emitTextEvent(event.text, event.kind ?? fallbackKind);
       }
