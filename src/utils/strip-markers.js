@@ -127,7 +127,7 @@ export function finalStrip(text) {
 // leaks across SSE chunk boundaries.  Only holds back the suffix when it
 // looks like a partial marker prefix (e.g. "TO" before "OL:" arrives),
 // so normal text is emitted immediately without fragmentation.
-const MARKER_PREFIXES = ["T","TO","TOO","TOOL","U","US","USE","USER","A","AS","ASS","ASSI","ASSIS","ASSIST","ASSISTA","ASSISTAN","[","[p","[pr","[pro","[prox","[proxy"];
+const MARKER_PREFIXES = ["T","TO","TOO","TOOL","U","US","USE","USER","A","AS","ASS","ASSI","ASSIS","ASSIST","ASSISTA","ASSISTAN","ASSISTANT","[","[p","[pr","[pro","[prox","[proxy"];
 const MAX_MARKER_PREFIX = 10;
 
 export function createStreamTextStripper() {
