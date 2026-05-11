@@ -303,32 +303,6 @@ function formatToolSchema(tool) {
   ].join("\n");
 }
 
-// Build an example arguments object for a tool using its actual parameter names.
-// Returns a JSON string like {"param1": "value1", "param2": 42}
-function buildExampleArgs(name, tools) {
-  const tool = tools.find(t => {
-    const n = toStringSafe(t?.name).trim().toLowerCase();
-    return n === name.toLowerCase();
-  });
-  if (!tool) return "{}";
-  const params = tool.function?.parameters ?? tool.input_schema ?? {};
-  const props = params.properties ?? {};
-  const keys = Object.keys(props);
-  if (!keys.length) return "{}";
-  // Pick the first 1-2 parameters with sensible placeholder values
-  const example = {};
-  for (let i = 0; i < Math.min(keys.length, 2); i++) {
-    const key = keys[i];
-    const prop = props[key];
-    const type = prop?.type || "string";
-    if (type === "number" || type === "integer") example[key] = 1;
-    else if (type === "boolean") example[key] = true;
-    else if (type === "array") example[key] = [];
-    else example[key] = key.includes("path") || key.includes("directory") ? "/project/src" : "value";
-  }
-  return JSON.stringify(example);
-}
-
 function buildToolPrompt(policy, tools) {
   const allowed = new Set(policy.allowedToolNames);
   const toolSchemas = tools
@@ -340,101 +314,29 @@ function buildToolPrompt(policy, tools) {
     return "";
   }
 
-  const concreteTools = policy.allowedToolNames.filter(n => n === "Bash" || n === "Read");
-  const firstName = concreteTools[0] || policy.allowedToolNames[0] || "Bash";
-  const secondName = concreteTools[1] || policy.allowedToolNames[1] || "Read";
-  const args1 = buildExampleArgs(firstName, tools);
-  const args2 = buildExampleArgs(secondName, tools);
-
   let prompt = [
-    "When tools are listed below, use them to take action — prefer calling tools over narration.",
+    "You may call tools listed below. When calling a tool, output exactly:",
     "",
-    "=== BEST PRACTICES ===",
+    "```json",
+    '[{"name": "tool_name", "input": {"arg": "value"}}]',
+    "```",
     "",
-    "1. !!! GREP FIRST !!! For code analysis, ALWAYS use Grep/Search BEFORE Read.",
-    "   Grep finds patterns across all files instantly; Read only gets one file at a time.",
-    "2. If a Read result shows ⚠️ FILE TRUNCATED (limit: 12000 chars), stop reading.",
-    "   Switch to Grep for the rest, or Read with offset/limit in 200-line chunks.",
-    "3. After any Read, check for ⚠️ — if present, you do NOT have the full file.",
-    "4. Batch independent tool calls in ONE ```json array for parallel execution.",
-    "",
-    "=== ⚠️ CYPHER HARD RULES (VIOLATE = QUERY FAILS) ===",
-    "1. ALL rels use CodeRelation with type property: [:CodeRelation {type: 'IMPORTS'}]",
-    "   NEVER use [r:IMPORTS] or [:IMPORTS] — these do NOT exist.",
-    "2. Variable-length paths MUST have range: *1..5 (NEVER * alone).",
-    "3. Every RETURN with multiple rows MUST have LIMIT 50.",
-    "4. ORDER BY uses PROPERTIES (fn.name), NOT node refs (fn).",
-    "5. Node labels: File,Folder,Function,Class,Interface,Method,CodeElement,Community,Process",
-    "6. Process/Community use heuristicLabel NOT name:",
-    "   - Process: p.heuristicLabel, p.processType, p.stepCount (NO p.name)",
-    "   - Community: c.heuristicLabel, c.cohesion (NO c.name)",
-    "   - All others (File,Function,Class,etc.): use name, filePath",
-    "7. Node properties reference:",
-    "   - Common: name (STRING), filePath (STRING), startLine (INT32), endLine (INT32)",
-    "   - Process: heuristicLabel, processType, stepCount, communities, entryPointId, terminalId",
-    "   - Community: heuristicLabel, cohesion, symbolCount, keywords, description",
+    "Multiple parallel calls: put multiple objects in the array.",
+    "Text before/after the fence is fine. Inside the fence must be pure JSON.",
+    "Do not invent other tag styles like <invoke>, <function_call>, or <###tool###> — only the ```json fence above is recognized.",
+    "Never echo <tool_result>, <system-reminder>, or other bracketed internal blocks in your visible output.",
     "",
     "=== TOOLS ===",
     "",
-    toolSchemas.join("\n\n"),
-    "",
-    "=== TOOL CALL FORMAT ===",
-    "",
-    "Output tool calls using the standard tool_use JSON format inside a ```json fence:",
-    "",
-    "```json",
-    "[",
-    '  {"name": "ToolName", "input": {"param1": "value1", "param2": 42}},',
-    '  {"name": "ToolName2", "input": {"param3": [1, 2, 3]}}',
-    "]",
-    "```",
-    "",
-    "RULES:",
-    "",
-    "1. ONE ```json block containing ALL tool calls as a single JSON array",
-    '2. Each object has "name" (exact tool name) and "input" (JSON object with parameters)',
-    "3. String values in double quotes. Numbers/booleans without quotes.",
-    "4. Multi-line content (patch, code) can use literal newlines inside strings",
-    "5. No XML wrapper tags. No fake-code or pseudocode. Pure JSON inside the fence.",
-    "6. Text before/after the ```json block is allowed for natural flow.",
-    "",
-    "=== FEW-SHOT EXAMPLES ===",
-    "USE THE EXACT TOOL NAME AND PARAMETER NAMES FROM THE TOOLS LIST ABOVE.",
-    "",
-    "Single tool:",
-    "```json",
-    `[{"name": "${firstName}", "input": ${args1}}]`,
-    "```",
-    "",
-    policy.allowedToolNames.length >= 2
-    ? [
-        "Multiple independent tools (BATCH when possible):",
-        "```json",
-        `[{"name": "${firstName}", "input": ${args1}}, {"name": "${secondName}", "input": ${args2}}]`,
-        "```",
-      ]
-    : "",
-    // Note: ApplyPatch schema varies by client (Cursor uses "patch",
-    // Claude Code uses "target_directory"+"patchText").  The TOOLS list
-    // above shows the exact schema — match it precisely.
-    "",
-    "=== WORKFLOW ===",
-    "",
-    "1. Thinking: 2-3 lines MAX. Do NOT analyze in depth — ACT.",
-    "2. Call tools immediately. Prefer tools over explanations.",
-    "3. Batch independent tool calls in ONE ```json array for parallel execution.",
-    "4. If a tool fails, try a different approach. Never repeat the same failed call.",
-    "5. After tools return results, fix bugs directly.",
-    "6. If you do NOT need a tool, answer normally without any ```json block.",
-    "7. NEVER echo <tool_result> content in your visible output — it's internal context only."
-  ].flat().join("\n");
+    toolSchemas.join("\n\n")
+  ].join("\n");
 
   if (policy.mode === "required") {
-    prompt += "\n9. For this response, you MUST call at least one tool.";
+    prompt += "\n\nFor this response, you must call at least one tool.";
   }
 
   if (policy.mode === "forced") {
-    prompt += `\n9. For this response, you MUST call exactly this tool: ${policy.forcedName}.`;
+    prompt += `\n\nFor this response, you must call exactly this tool: ${policy.forcedName}.`;
   }
 
   return prompt;
