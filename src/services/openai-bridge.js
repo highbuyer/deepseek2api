@@ -259,9 +259,22 @@ export async function streamOpenAiResponse(options) {
   let streamChars = 0;
   const textStripper = createStreamTextStripper();
 
+  // 过滤模型输出的"幽灵文本"：仅由空白和标点组成的无意义文本块。
+  // DeepSeek 在同轮并行输出 text + tool_use 时，text 块可能在冒号处被截断，
+  // 留下 "\n\n: " 这样的残骸，在聊天界面显示为孤零零的 ":"。
+  const isPhantomText = (text) => {
+    const trimmed = text.trim();
+    if (!trimmed) return true;
+    // 包含任何文字字符（字母/数字/CJK/假名/谚文）→ 有实际内容
+    if (/[\w一-鿿぀-ゟ゠-ヿ가-힯]/.test(trimmed)) return false;
+    // 纯标点/空白且非常短 → 幽灵文本
+    return trimmed.length <= 3;
+  };
+
   const emitTextEvent = (text, kind, skipStrip = false) => {
     const cleaned = skipStrip ? text : textStripper.push(text);
     if (!cleaned) return;
+    if (isPhantomText(cleaned)) return;
     streamChars += cleaned.length;
     if (streamChars > 0 && streamChars <= cleaned.length) {
       reqLogger.recordTTFT();

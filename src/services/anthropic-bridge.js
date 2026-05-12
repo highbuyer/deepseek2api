@@ -207,9 +207,17 @@ export async function streamAnthropicMessage(options) {
 
   /* ── Text emission ── */
 
+  const isPhantomText = (text) => {
+    const trimmed = text.trim();
+    if (!trimmed) return true;
+    if (/[\w一-鿿぀-ゟ゠-ヿ가-힯]/.test(trimmed)) return false;
+    return trimmed.length <= 3;
+  };
+
   const emitTextEvent = (text, kind, skipStrip = false) => {
     const cleaned = skipStrip ? text : textStripper.push(text);
     if (!cleaned) return;
+    if (isPhantomText(cleaned)) return;
 
     if (kind === "thinking") {
       startBlock("thinking", { thinking: "" });

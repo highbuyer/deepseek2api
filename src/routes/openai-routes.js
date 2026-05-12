@@ -4,6 +4,7 @@ import { takeRoundRobinAccount } from "../services/account-rotation-service.js";
 import { isIncognitoEnabledForOwner } from "../services/incognito-service.js";
 import { collectOpenAiResponse, streamOpenAiResponse } from "../services/openai-bridge.js";
 import { collectAnthropicMessage, streamAnthropicMessage } from "../services/anthropic-bridge.js";
+import { resolveAnthropicModel } from "../services/anthropic-prompt.js";
 import { listOpenAiModels } from "../services/openai-request.js";
 import { createEmbeddings } from "../services/openai-embeddings.js";
 import {
@@ -144,9 +145,62 @@ async function handleEmbeddingsRequest(request, response, apiKeyRecord) {
   });
 }
 
+function extractSearchQuery(body) {
+  const userMsg = (body?.messages || []).find((m) => m?.role === "user");
+  const content = typeof userMsg?.content === "string" ? userMsg.content : "";
+  const match = content.match(/Perform a web search for the query:\s*(.+)/);
+  return match ? match[1].trim() : content.slice(0, 200);
+}
+
+function hasWebSearch20250305(tools) {
+  if (!Array.isArray(tools)) return false;
+  return tools.some((t) => t?.type === "web_search_20250305");
+}
+
+async function handleWebSearchWithDeepseek(response, body, apiKeyRecord) {
+  // web_search_20250305 是 Anthropic 专用 beta tool type。
+  // DeepSeek 不支持这个 tool type，但支持 search_enabled 搜索。
+  // 用 DeepSeek 的搜索模型替代，搜索结果以文本形式返回。
+  const query = extractSearchQuery(body);
+  const resolvedModel = resolveAnthropicModel(body.model);
+  // Use DeepSeek's search-capable variant (e.g. deepseek-reasoner-expert-search)
+  const searchModelId = resolvedModel.id + "-search";
+  log.info("route", `[messages] web_search_20250305 → DeepSeek ${searchModelId}, query="${query.slice(0, 80)}"`);
+
+  const modifiedBody = {
+    ...body,
+    model: searchModelId,
+    // Strip web_search_20250305 tools — DeepSeek doesn't understand them.
+    // DeepSeek's search_enabled handles the actual search.
+    tools: (body.tools || []).filter((t) => t?.type !== "web_search_20250305"),
+    // Clear Anthropic-format tool_choice (DeepSeek only supports OpenAI format)
+    tool_choice: undefined,
+  };
+  // Add streaming flag if not explicitly set
+  modifiedBody.stream = modifiedBody.stream !== false;
+
+  const account = takeRoundRobinAccount(apiKeyRecord);
+  if (!account) {
+    log.warn("route", "No available account for web search");
+    sendError(response, 404, "Account not found");
+    return;
+  }
+
+  const deleteAfterFinish = isIncognitoEnabledForOwner(apiKeyRecord.ownerId);
+  await streamAnthropicMessage({ response, account, body: modifiedBody, deleteAfterFinish });
+}
+
 async function handleMessagesRequest(request, response, apiKeyRecord) {
   await withOwnerRequestLimit(apiKeyRecord.ownerId, async () => {
-    const body = parseJsonBody(await readRequestBody(request)) ?? {};
+    const rawBody = await readRequestBody(request);
+    const body = parseJsonBody(rawBody) ?? {};
+
+    // web_search_20250305 → use DeepSeek search model instead of Anthropic API
+    if (hasWebSearch20250305(body.tools)) {
+      await handleWebSearchWithDeepseek(response, body, apiKeyRecord);
+      return;
+    }
+
     const account = takeRoundRobinAccount(apiKeyRecord);
     if (!account) {
       log.warn("route", "No available account for messages");
