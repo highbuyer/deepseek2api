@@ -5,6 +5,7 @@ import { isIncognitoEnabledForOwner } from "../services/incognito-service.js";
 import { collectOpenAiResponse, streamOpenAiResponse } from "../services/openai-bridge.js";
 import { collectAnthropicMessage, streamAnthropicMessage } from "../services/anthropic-bridge.js";
 import { resolveAnthropicModel } from "../services/anthropic-prompt.js";
+import { estimateTokens } from "../utils/tool-truncation.js";
 import { listOpenAiModels } from "../services/openai-request.js";
 import { createEmbeddings } from "../services/openai-embeddings.js";
 import {
@@ -43,6 +44,26 @@ function handleOpenAiError(response, error) {
   }
 
   return false;
+}
+
+async function handleCountTokensRequest(request, response) {
+  try {
+    const buf = await readRequestBody(request);
+    const body = parseJsonBody(buf) ?? {};
+    const messages = body?.messages ?? [];
+    const system = body?.system;
+    const tools = body?.tools ?? [];
+    let total = 0;
+    for (const msg of messages) {
+      total += estimateTokens(typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content));
+    }
+    if (system) total += estimateTokens(typeof system === "string" ? system : JSON.stringify(system));
+    for (const tool of tools) total += estimateTokens(JSON.stringify(tool));
+    sendJson(response, 200, { input_tokens: total });
+  } catch (e) {
+    log.warn("route", `count_tokens error: ${e.message}`);
+    sendJson(response, 200, { input_tokens: 0 });
+  }
 }
 
 async function handleModelsRequest(response, apiKeyRecord) {
@@ -258,6 +279,11 @@ export async function handleOpenAiRequest(request, response, url) {
   try {
     if (request.method === "GET" && url.pathname === "/v1/models") {
       await handleModelsRequest(response, apiKeyRecord);
+      return true;
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/messages/count_tokens") {
+      await handleCountTokensRequest(request, response);
       return true;
     }
 

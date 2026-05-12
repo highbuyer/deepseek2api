@@ -569,6 +569,10 @@ export function buildAnthropicPrompt({ messages, system, tools, toolChoice }) {
 
   let prompt = buildPromptFromMessages(hintedMessages);
 
+  // Strip <tool_result> wrapper tags — they're internal markers for
+  // detection logic, not something the model needs to see.
+  prompt = prompt.replace(/<tool_result\b[^>]*>/gi, "").replace(/<\/tool_result>/gi, "");
+
   const promptLen = config.maxPromptTokens ? estimateTokens(prompt) : prompt.length;
   const promptLimit = config.maxPromptTokens || config.maxPromptChars;
   const measure = config.maxPromptTokens ? estimateTokens : undefined;
@@ -576,6 +580,7 @@ export function buildAnthropicPrompt({ messages, system, tools, toolChoice }) {
   if (promptLen > promptLimit) {
     log.warn("prompt", `[anthropic] Prompt too long: ${promptLen} ${config.maxPromptTokens ? "tokens" : "chars"} (limit: ${promptLimit})`);
     prompt = truncatePrompt(hintedMessages, promptLimit, measure);
+    prompt = prompt.replace(/<tool_result\b[^>]*>/gi, "").replace(/<\/tool_result>/gi, "");
   }
 
   log.debug("prompt", `[anthropic] Final prompt length: ${prompt.length} chars, toolNames: [${policy.allowedToolNames.join(",")}]`);
